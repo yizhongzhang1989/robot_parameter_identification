@@ -20,10 +20,6 @@ ARGUMENTS = (
      "/joint_trajectory_controller/follow_joint_trajectory",
      "the only path used to command motion"),
     ("effort_unit", "ampere", "ampere or newton_metre"),
-    ("workspace_limit_deg", "[]",
-     "cap on how far each joint may swing, in degrees; one value or one per "
-     "joint. The URDF describes the arm, not the stand it is bolted to, so set "
-     "this whenever the surroundings are not modelled as obstacles."),
     ("signal.position", "position", "interface carrying joint position"),
     ("signal.velocity", "velocity", "interface carrying joint velocity"),
     ("signal.effort", "current", "interface carrying the measured effort"),

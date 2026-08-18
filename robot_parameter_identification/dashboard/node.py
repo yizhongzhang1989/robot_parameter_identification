@@ -66,7 +66,7 @@ class DashboardNode(Node):
             output_directory=str(get("output_directory",
                                      "identification_results")),
             workspace_limit_deg=tuple(
-                float(v) for v in (get("workspace_limit_deg", []) or [])),
+                self._declare_floats("workspace_limit_deg")),
             telemetry=telemetry, commands=commands)
 
         profile = None
@@ -98,9 +98,22 @@ class DashboardNode(Node):
         for guard in telemetry.signals.missing_guards():
             self.get_logger().warn(f"guard unavailable: {guard}")
 
-    def _declare(self, name: str, default):
-        self.declare_parameter(name, default)
+    def _declare(self, name: str, default, descriptor=None):
+        # An empty list default is inferred as a byte array, which then refuses
+        # the doubles the operator actually passes, so arrays state their type.
+        if descriptor is not None:
+            self.declare_parameter(name, default, descriptor)
+        else:
+            self.declare_parameter(name, default)
         return self.get_parameter(name).value
+
+    def _declare_floats(self, name: str) -> list[float]:
+        from rcl_interfaces.msg import ParameterDescriptor, ParameterType  # noqa: PLC0415
+
+        value = self._declare(
+            name, [], ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))
+        return [float(entry) for entry in (value or [])]
 
     # -- which joints are we identifying ---------------------------------
 
