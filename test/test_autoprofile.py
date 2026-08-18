@@ -75,5 +75,55 @@ class DeriveTest(unittest.TestCase):
             autoprofile.derive_profile(synthetic_urdf(), [])
 
 
+class WorkspaceCapTest(unittest.TestCase):
+    """The URDF describes the arm, not the stand it is bolted to."""
+
+    def test_no_cap_leaves_the_workspace_unset(self):
+        profile = autoprofile.derive_profile(synthetic_urdf(), NAMES)
+        self.assertEqual(profile.workspace_limit_deg, ())
+
+    def test_a_scalar_cap_applies_to_every_joint(self):
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, workspace_limit_deg=45.0)
+        self.assertEqual(list(profile.workspace_limit_deg), [45.0] * 7)
+
+    def test_a_per_joint_cap_is_honoured(self):
+        caps = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, workspace_limit_deg=caps)
+        self.assertEqual(list(profile.workspace_limit_deg), caps)
+
+    def test_a_cap_can_only_tighten_never_loosen(self):
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, workspace_limit_deg=10_000.0)
+        self.assertEqual(list(profile.workspace_limit_deg),
+                         list(profile.position_limit_deg))
+
+    def test_a_wrong_length_cap_is_refused(self):
+        with self.assertRaises(ValueError):
+            autoprofile.derive_profile(synthetic_urdf(), NAMES,
+                                       workspace_limit_deg=[10.0, 20.0])
+
+    def test_a_non_positive_cap_is_refused(self):
+        with self.assertRaises(ValueError):
+            autoprofile.derive_profile(synthetic_urdf(), NAMES,
+                                       workspace_limit_deg=0.0)
+
+    def test_the_cap_says_why_it_is_there(self):
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, workspace_limit_deg=45.0)
+        self.assertIn("workspace", profile.notes)
+
+    def test_the_campaign_plan_inherits_the_cap(self):
+        from robot_parameter_identification import campaign, identification as ident
+
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, workspace_limit_deg=30.0)
+        arm = ident.ArmModel.from_profile(synthetic_urdf(), profile)
+        limits = campaign.default_plan(profile).design_limits(arm)
+        self.assertTrue(all(value <= 30.0 for value in limits.upper_deg))
+        self.assertTrue(all(value >= -30.0 for value in limits.lower_deg))
+
+
 if __name__ == "__main__":
     unittest.main()

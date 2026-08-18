@@ -65,6 +65,8 @@ class DashboardNode(Node):
             profile_path=str(get("profile_path", "")),
             output_directory=str(get("output_directory",
                                      "identification_results")),
+            workspace_limit_deg=tuple(
+                float(v) for v in (get("workspace_limit_deg", []) or [])),
             telemetry=telemetry, commands=commands)
 
         profile = None

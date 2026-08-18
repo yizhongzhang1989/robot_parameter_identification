@@ -45,6 +45,9 @@ class DashboardConfig:
     commands: CommandSpec = field(default_factory=CommandSpec)
     # Frame the 3D view renders in. Empty means the model root.
     display_frame: str = ""
+    # How far the campaign may swing each joint. The URDF describes the arm,
+    # not the stand it is bolted to, so this is often tighter than the URDF.
+    workspace_limit_deg: tuple[float, ...] = ()
 
 
 class IdentificationService:
@@ -109,8 +112,10 @@ class IdentificationService:
         profile, source = self.configured_profile, "configured"
         if profile is None and self.driven_joints:
             try:
+                cap = list(self.config.workspace_limit_deg) or None
                 profile = autoprofile.derive_profile(
-                    self.urdf_text, self.driven_joints)
+                    self.urdf_text, self.driven_joints,
+                    workspace_limit_deg=cap)
                 source = "derived"
             except Exception as error:  # noqa: BLE001
                 self.note(f"profile could not be derived: {error}")
@@ -445,6 +450,9 @@ class IdentificationService:
                     self.profile is not None
                     and autoprofile.current_guard_active(self.profile)),
                 "driven_joints": list(self.driven_joints),
+                "reach_deg": ([round(v, 1) for v in self.plan.design_limits(
+                    self.arm).upper_deg]
+                    if self.plan is not None and self.arm is not None else []),
                 "acknowledgement": ACKNOWLEDGEMENT,
                 "rehearsal_passed": self.rehearsal_passed,
                 "obstacles": self.obstacles(),

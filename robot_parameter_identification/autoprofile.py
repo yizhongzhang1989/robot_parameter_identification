@@ -52,8 +52,14 @@ def joint_limits(urdf_text: str) -> dict[str, dict]:
     return found
 
 
-def derive_profile(urdf_text: str, joint_names, name: str = "derived") -> RobotProfile:
+def derive_profile(urdf_text: str, joint_names, name: str = "derived",
+                   workspace_limit_deg=None) -> RobotProfile:
     """A profile good enough to run, built from the URDF and a joint list.
+
+    ``workspace_limit_deg`` caps how far the campaign may swing each joint,
+    regardless of what the URDF permits. The URDF describes the arm, not the
+    room it stands in: a stand, a bench or a cable tray is invisible to it. Cap
+    the workspace, or model the obstruction as a box, or both.
 
     Raises ``ValueError`` when a named joint has no position limit, because
     guessing a range for a joint we are about to move is not acceptable.
@@ -85,7 +91,8 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived") -> RobotP
             f"cannot be derived: {', '.join(missing)}")
 
     sustained = round(min(speeds), 2) if speeds else MAXIMUM_SPEED_DEG_S
-    return RobotProfile.from_dict({
+    workspace = _workspace(workspace_limit_deg, positions)
+    payload = {
         "schema_version": 1,
         "name": name,
         "joints": {"names": names},
@@ -106,7 +113,30 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived") -> RobotP
                        "current guard is off. Supply a written profile to "
                        "enable it.",
         },
-    }, source="<derived from /robot_description>")
+    }
+    if workspace:
+        payload["limits"]["workspace_deg"] = workspace
+        payload["notes"]["workspace"] = (
+            "Capped by the operator because the URDF does not describe what "
+            "stands around the arm.")
+    return RobotProfile.from_dict(
+        payload, source="<derived from /robot_description>")
+
+
+def _workspace(requested, positions: list[float]) -> list[float]:
+    """The cap, broadcast to every joint, never looser than the URDF allows."""
+    if requested is None:
+        return []
+    values = ([float(requested)] * len(positions)
+              if isinstance(requested, (int, float))
+              else [float(entry) for entry in requested])
+    if len(values) != len(positions):
+        raise ValueError(
+            f"workspace_limit_deg needs 1 or {len(positions)} values, "
+            f"got {len(values)}")
+    if any(value <= 0.0 for value in values):
+        raise ValueError("workspace_limit_deg must be positive")
+    return [round(min(cap, reach), 2) for cap, reach in zip(values, positions)]
 
 
 def current_guard_active(profile: RobotProfile) -> bool:
