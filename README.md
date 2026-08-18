@@ -72,6 +72,40 @@ box on a distal link is a tool or a payload shroud and travels with the arm. You
 place them by dragging in the 3D view; the pose is stored relative to the parent
 frame, so the kinematics do the rest.
 
+## The dashboard
+
+```bash
+ros2 launch robot_parameter_identification dashboard.launch.py \
+    port:=8300 \
+    profile_path:=/path/to/your_arm.yaml \
+    follow_joint_trajectory_action:=/your_controller/follow_joint_trajectory \
+    signal.effort:=current
+```
+
+Then open `http://localhost:8300`.
+
+The left half is the arm, drawn from forward kinematics on the same model the
+collision check and the regression use, so the picture cannot drift from the
+maths. Click a box to select it, drag the gizmo to move, rotate or resize it,
+and pick the frame it is bolted to from the dropdown.
+
+The right half is built around the plots that actually decide whether a fit is
+any good:
+
+- **Fit quality** — training, holdout and validation error side by side per
+  joint. Training error can always be made small; only the third bar counts.
+- **Friction curve** — the fitted curve laid over the samples it was fitted to.
+  A curve on its own looks convincing no matter how wrong it is; this is the
+  view where a reversal model that misses at low speed becomes obvious.
+- **Residual against speed** — structure here is unmodelled physics, not noise.
+- **Excitation** — condition number per joint against its cap, so a parameter
+  the experiment barely moved is visible rather than merely reported.
+- **Parameters** — per joint, badged physical or unphysical.
+
+A hardware run is gated twice: a rehearsal must pass first, and the operator
+must type the acknowledgement. The connection panel names any guard that is dark
+because the robot does not publish its signal.
+
 ## Status
 
 Working and tested:
@@ -82,13 +116,20 @@ Working and tested:
 - the ROS contract above (`interfaces.py`)
 - obstacle scene and collision screening (`obstacles.py`)
 - a dependency-light rehearsal plant for dry runs (`plants/analytic.py`)
+- the dashboard: node, HTTP API, 3D view, obstacle editing, charts
 
-Not yet built:
+`133 passed, 3 skipped`.
 
-- the dashboard: 3D view, obstacle editing UI, parameter visualisation
-- the ROS node entry point and launch files
+Verified against a live 7-DOF arm: all static assets served, 36 link transforms
+and 16 meshes rendered through the mesh proxy, obstacles added over HTTP and
+screened for collision, telemetry and action server both detected.
 
-`107 passed, 3 skipped`. The skips need a robot or a physics engine present.
+Still to do:
+
+- three test modules still import the old MuJoCo plant and are skipped; they
+  need porting to the analytic plant
+- the planned-pose ghost in the 3D view is stubbed, not drawn
+- no campaign has yet been run end to end through this dashboard
 
 ### A caveat worth knowing
 
