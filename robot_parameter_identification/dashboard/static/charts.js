@@ -13,10 +13,19 @@ const SERIES = ['#4da3ff', '#e0b341', '#35c08a', '#e2565a',
 
 function setup(canvas) {
   const ratio = Math.min(devicePixelRatio || 1, 2);
-  const width = canvas.clientWidth || 360;
-  const height = +canvas.getAttribute('height') || 150;
-  canvas.width = width * ratio;
-  canvas.height = height * ratio;
+  // The logical height is stashed on first use. Reading it back from the
+  // height attribute would be self-feeding: assigning canvas.height writes
+  // that same attribute, so every redraw would scale the panel again.
+  if (!canvas.dataset.logicalHeight) {
+    canvas.dataset.logicalHeight = String(+canvas.getAttribute('height') || 150);
+  }
+  const height = +canvas.dataset.logicalHeight;
+  const width = Math.max(120, Math.round(canvas.clientWidth || 360));
+  canvas.style.height = `${height}px`;
+  const backingWidth = Math.round(width * ratio);
+  const backingHeight = Math.round(height * ratio);
+  if (canvas.width !== backingWidth) canvas.width = backingWidth;
+  if (canvas.height !== backingHeight) canvas.height = backingHeight;
   const ctx = canvas.getContext('2d');
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
