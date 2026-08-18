@@ -1,0 +1,37 @@
+schema_version: 1
+
+# Base template for a fixed-base serial manipulator.
+#
+# Point a robot profile at this file and override only what differs:
+#
+#   extends: manipulator
+#   name: my-arm
+#   joints: {prefix: "arm_", count: 6}
+#   limits:
+#     position_deg: [...]
+#     continuous_current_a: [...]
+#     peak_current_a: [...]
+#
+# Mappings merge key by key, so overriding one envelope field keeps the rest.
+# Lists are replaced outright, never concatenated.
+
+envelope:
+  # Deliberately conservative. Raise only against measured evidence, and
+  # record that evidence under notes.
+  temperature_c: 45.0
+  sustained_speed_deg_s: 15.0
+  peak_speed_deg_s: 30.0
+  current_slew_a_s: 4.0
+  sender_gap_s: 0.02
+  telemetry_stale_s: 0.25
+  position_margin_deg: 5.0
+  minimum_voltage_v: 20.0
+  maximum_voltage_v: 30.0
+  sustained_speed_window_s: 0.1
+  sustained_current_window_s: 0.5
+  probe_current_fraction: 0.5
+
+notes:
+  template: >
+    Inherited from the manipulator template. Every envelope value here is a
+    default, not a measurement; replace them once the arm has been characterised.

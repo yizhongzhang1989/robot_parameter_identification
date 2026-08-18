@@ -1,0 +1,29 @@
+extends: manipulator
+
+schema_version: 1
+name: example-6dof
+
+# Copy this file, rename it, and edit. Everything not listed here is inherited
+# from the manipulator template.
+
+joints:
+  # Either list names exactly as they appear in the URDF/MJCF...
+  names: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6]
+  # ...or give a prefix and a count:
+  #   prefix: arm_
+  #   count: 6          ->  arm_joint1 .. arm_joint6
+
+limits:
+  # One value per joint, or a single scalar applied to every joint.
+  position_deg: [170.0, 120.0, 170.0, 170.0, 120.0, 360.0]
+  continuous_current_a: 2.0
+  peak_current_a: 3.0
+
+envelope:
+  # Only what differs from the template; the rest is inherited.
+  temperature_c: 40.0
+
+notes:
+  source: >
+    Record where each number came from. Numbers without a source are the ones
+    that hurt later.
