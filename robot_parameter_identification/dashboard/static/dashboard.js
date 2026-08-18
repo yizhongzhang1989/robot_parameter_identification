@@ -277,6 +277,21 @@ function renderResult(snapshot) {
     `<tr><td>J${i + 1}</td><td class="num ${entry.state === 'pass' ? 'ok' : 'bad'}">`
     + `${entry.state}</td></tr>`).join('');
 
+  const recovery = result?.rehearsal_check;
+  const note = $('recovery');
+  if (!recovery || !recovery.available) {
+    note.textContent = '';
+  } else if (recovery.passed) {
+    note.textContent = `Rehearsal recovered the planted friction to within `
+      + `${recovery.worst_coulomb_error} (tolerance ${recovery.tolerance}).`;
+    note.style.color = 'var(--ok)';
+  } else {
+    note.textContent = `Rehearsal ran but did NOT recover the planted friction: `
+      + `worst error ${recovery.worst_coulomb_error} exceeds `
+      + `${recovery.tolerance}. The hardware button stays locked.`;
+    note.style.color = 'var(--bad)';
+  }
+
   $('params').innerHTML = joints.map((entry, i) => {
     const friction = entry.friction || {};
     const physical = (friction.coulomb ?? 0) >= 0 && (friction.viscous ?? 0) >= 0;

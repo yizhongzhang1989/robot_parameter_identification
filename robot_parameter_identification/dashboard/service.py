@@ -31,6 +31,10 @@ IDLE, RUNNING = "idle", "running"
 # A campaign yields tens of thousands of samples; a scatter plot stops being
 # readable long before a browser stops being able to draw them.
 MAX_PLOT_POINTS = 1500
+# The rehearsal plants known friction and must find it again; a run that merely
+# completes proves the code executes, not that it computes.
+REHEARSAL_NOISE = 0.002
+REHEARSAL_TOLERANCE = 0.02
 
 
 @dataclass
@@ -295,6 +299,9 @@ class IdentificationService:
         payload["mode"] = mode
         payload.update(self._plot_data(payload, observations))
         aborted = payload.get("aborted")
+        recovery = {} if mode == "hardware" else self._check_recovery(payload)
+        if recovery:
+            payload["rehearsal_check"] = recovery
         with self._lock:
             self.result = payload
             # A stopped run that still says "finished" is how a half-measured
@@ -304,9 +311,18 @@ class IdentificationService:
             if aborted:
                 self.progress["error"] = str(aborted)
             if mode != "hardware":
-                self.rehearsal_passed = bool(payload.get("complete"))
+                self.rehearsal_passed = (bool(payload.get("complete"))
+                                         and bool(recovery.get("passed")))
         self._write(payload, mode)
-        self.note(f"{mode} run {'stopped: ' + str(aborted) if aborted else 'complete'}")
+        if aborted:
+            self.note(f"{mode} run stopped: {aborted}")
+        elif recovery.get("available") and not recovery.get("passed"):
+            self.note(f"{mode} completed but did not recover the planted "
+                      f"friction: worst error "
+                      f"{recovery['worst_coulomb_error']} > "
+                      f"{recovery['tolerance']}")
+        else:
+            self.note(f"{mode} run complete")
 
     def _plot_data(self, payload: dict, observations) -> dict:
         """Scatter data for the charts, thinned to something a browser can draw.
@@ -351,8 +367,55 @@ class IdentificationService:
             return self.bridge.hardware_plant(self.profile, self.scene)
         from ..plants.analytic import AnalyticPlant  # noqa: PLC0415
 
-        return AnalyticPlant(self.arm.model, self.profile,
-                             collision_scene=self.scene, noise=0.002)
+        injected = self._rehearsal_friction()
+        self._injected = injected
+        return AnalyticPlant(
+            self.arm.model, self.profile, collision_scene=self.scene,
+            coulomb=injected["coulomb"],
+            viscous_per_deg_s=injected["viscous"],
+            coulomb_transition_deg_s=injected["transition"],
+            noise=REHEARSAL_NOISE)
+
+    def _rehearsal_friction(self) -> dict:
+        """Friction to plant in the rehearsal so the fit has to find something.
+
+        A rehearsal against a frictionless robot recovers zero and reports a
+        tiny residual, which looks like success and proves nothing. Values are
+        arbitrary but plausible, and spread across joints so a fit that mixes
+        joints up cannot pass.
+        """
+        count = self.arm.joint_count
+        return {
+            "coulomb": [round(0.12 + 0.04 * index, 4) for index in range(count)],
+            "viscous": [round(0.006 + 0.002 * index, 5) for index in range(count)],
+            "transition": 1.8,
+        }
+
+    def _check_recovery(self, payload: dict) -> dict:
+        """Did the rehearsal get back what was planted in it?"""
+        injected = getattr(self, "_injected", None)
+        joints = payload.get("joints") or []
+        if not injected or not joints:
+            return {"available": False}
+        errors = []
+        for index, entry in enumerate(joints):
+            friction = entry.get("friction") or {}
+            expected = injected["coulomb"][index]
+            actual = float(friction.get("coulomb") or 0.0)
+            errors.append({
+                "joint": index + 1,
+                "expected": expected,
+                "recovered": round(actual, 4),
+                "error": round(abs(actual - expected), 4),
+            })
+        worst = max((item["error"] for item in errors), default=0.0)
+        return {
+            "available": True,
+            "worst_coulomb_error": round(worst, 4),
+            "tolerance": REHEARSAL_TOLERANCE,
+            "passed": worst <= REHEARSAL_TOLERANCE,
+            "joints": errors,
+        }
 
     def _write(self, payload: dict, mode: str) -> None:
         directory = Path(self.config.output_directory)

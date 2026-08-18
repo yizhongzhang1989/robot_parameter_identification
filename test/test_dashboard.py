@@ -185,6 +185,21 @@ class RehearsalEndToEndTest(unittest.TestCase):
 
     def test_the_injected_friction_is_recovered(self):
         """The rehearsal is only worth running if it can catch a broken fit."""
+        check = self.snapshot["result"]["rehearsal_check"]
+        self.assertTrue(check["available"])
+        self.assertTrue(check["passed"],
+                        msg=f"worst error {check['worst_coulomb_error']} "
+                            f"exceeds {check['tolerance']}: {check['joints']}")
+
+    def test_the_planted_friction_was_not_zero(self):
+        """A frictionless rehearsal recovers zero and proves nothing."""
+        planted = [item["expected"]
+                   for item in self.snapshot["result"]["rehearsal_check"]["joints"]]
+        self.assertTrue(all(value > 0.05 for value in planted), planted)
+        self.assertEqual(len(set(planted)), len(planted),
+                         "joints must differ so a mix-up cannot pass")
+
+    def test_the_coefficients_stay_physical(self):
         for entry in self.snapshot["result"]["joints"]:
             friction = entry["friction"]
             self.assertGreaterEqual(friction["coulomb"], 0.0)
