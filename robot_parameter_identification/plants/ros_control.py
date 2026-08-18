@@ -18,12 +18,9 @@ import time
 
 import numpy as np
 
+from ..interfaces import SignalMap
 from ..profile import RobotProfile
 
-INTERFACES = (
-    "position", "velocity", "current", "temperature", "voltage",
-    "enabled", "fault_code",
-)
 # A quintic zero-velocity endpoint trajectory peaks near 1.875x its average
 # speed, so durations are scaled to keep the measured peak at the request.
 PEAK_TO_AVERAGE = 1.875
@@ -66,6 +63,10 @@ def differentiate(times_s, values, window: int = 5) -> np.ndarray:
 class HardwareConfig:
     action: str = "/joint_trajectory_controller/follow_joint_trajectory"
     state_topic: str = "/dynamic_joint_states"
+    # Which published interface carries each quantity. Naming a fixed set here
+    # is what stopped this plant working on any arm but the one it was written
+    # for: a torque-only drive has no "current", and plenty have no bus voltage.
+    signals: SignalMap = field(default_factory=SignalMap)
     maximum_speed_deg_s: float = 10.0
     settle_s: float = SETTLE_S
     settle_samples: int = 5
@@ -100,6 +101,7 @@ class HardwarePlant:
         self._lock = threading.Lock()
         self._latest: dict | None = None
         self._latest_at = 0.0
+        self._previous_position: tuple[np.ndarray | None, float] = (None, 0.0)
         self._client = None
         self._rclpy = None
         self._context = None
@@ -138,7 +140,8 @@ class HardwarePlant:
         self._spin_for(2.0)
         if self.sample() is None:
             raise TelemetryUnavailable(
-                f"{self.config.state_topic} is not publishing all of {INTERFACES}")
+                f"{self.config.state_topic} is not publishing "
+                f"{self.config.signals.required_interfaces()} for every joint")
         if self.config.require_neutral_start:
             position = np.asarray(self.sample()["position_deg"], dtype=float)
             if np.max(np.abs(position)) > NEUTRAL_TOLERANCE_DEG:
@@ -166,32 +169,67 @@ class HardwarePlant:
     # -- telemetry -------------------------------------------------------
 
     def _on_state(self, message) -> None:
+        signals = self.config.signals
         by_name = dict(zip(message.joint_names, message.interface_values))
-        rows = []
+        required = signals.required_interfaces()
+        optional = signals.optional_interfaces()
+        columns: dict[str, list[float]] = {}
         for name in self.joint_names:
             entry = by_name.get(name)
             if entry is None:
                 return
             values = dict(zip(entry.interface_names, entry.values))
-            if not all(interface in values for interface in INTERFACES):
+            if not all(interface in values for interface in required):
                 return
-            rows.append([values[interface] for interface in INTERFACES])
-        joints = np.asarray(rows, dtype=float)
-        if not np.isfinite(joints).all():
+            columns.setdefault("position", []).append(values[signals.position])
+            columns.setdefault("effort", []).append(values[signals.effort])
+            for role, interface in optional.items():
+                if interface in values:
+                    columns.setdefault(role, []).append(values[interface])
+
+        count = len(self.joint_names)
+        # A channel that is short on any joint is unusable for all of them.
+        columns = {role: values for role, values in columns.items()
+                   if len(values) == count}
+        if not np.isfinite(np.asarray(columns["position"], dtype=float)).all():
             return
+        if not np.isfinite(np.asarray(columns["effort"], dtype=float)).all():
+            return
+
+        position = np.degrees(np.asarray(columns["position"], dtype=float))
         frame = {
-            "position_deg": np.degrees(joints[:, 0]).tolist(),
-            "speed_deg_s": np.degrees(joints[:, 1]).tolist(),
-            "current_a": joints[:, 2].tolist(),
-            "temperature_c": joints[:, 3].tolist(),
-            "voltage_v": joints[:, 4].tolist(),
-            "enabled": [value > 0.999 for value in joints[:, 5]],
-            "fault_code": [int(value) for value in joints[:, 6]],
+            "position_deg": position.tolist(),
+            "speed_deg_s": self._speed(columns, position),
+            "current_a": [float(v) for v in columns["effort"]],
+            "temperature_c": [float(v) for v in columns.get("temperature", [])],
+            "voltage_v": [float(v) for v in columns.get("voltage", [])],
+            "enabled": [v > 0.999 for v in columns.get("enabled", [])],
+            "fault_code": [int(v) for v in columns.get("fault_code", [])],
             "arm_status": None,
         }
+        spare = "torque" if signals.effort_source == "current" else "current"
+        if spare in columns:
+            frame[f"{spare}_measured"] = [float(v) for v in columns[spare]]
         with self._lock:
             self._latest = frame
             self._latest_at = time.monotonic()
+
+    def _speed(self, columns: dict, position_deg: np.ndarray) -> list[float]:
+        """Mapped velocity when the drive publishes one, else differentiated.
+
+        The signal map promises velocity is optional; without this that promise
+        was false, because the fit needs a speed for every frame.
+        """
+        if "velocity" in columns:
+            return np.degrees(
+                np.asarray(columns["velocity"], dtype=float)).tolist()
+        now = time.monotonic()
+        previous, at = self._previous_position
+        self._previous_position = (position_deg, now)
+        gap = now - at
+        if previous is None or gap <= 1e-4 or gap > 0.5:
+            return [0.0] * len(position_deg)
+        return ((position_deg - previous) / gap).tolist()
 
     def _spin_for(self, seconds: float) -> None:
         if self._rclpy is None or self._node is None:
@@ -454,14 +492,15 @@ def _average(frames: list[dict], joint_count: int) -> dict:
     averaged = dict(frames[-1])
     for key in ("position_deg", "speed_deg_s", "current_a",
                 "temperature_c", "voltage_v"):
+        if not all(len(frame.get(key, [])) == joint_count for frame in frames):
+            continue
         stacked = np.asarray([frame[key] for frame in frames], dtype=float)
         averaged[key] = stacked.mean(axis=0).tolist()
-    averaged["enabled"] = [
-        all(frame["enabled"][index] for frame in frames)
-        for index in range(joint_count)
-    ]
-    averaged["fault_code"] = [
-        max(frame["fault_code"][index] for frame in frames)
-        for index in range(joint_count)
-    ]
+    for key, combine in (("enabled", all), ("fault_code", max)):
+        # An arm that publishes no such interface reports it empty, not short.
+        if not all(len(frame.get(key, [])) == joint_count for frame in frames):
+            averaged[key] = []
+            continue
+        averaged[key] = [combine(frame[key][index] for frame in frames)
+                         for index in range(joint_count)]
     return averaged

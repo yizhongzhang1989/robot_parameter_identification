@@ -24,17 +24,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict, replace
 
-# The regression needs a commanded-effort-like measurement per joint. Which
-# physical quantity that is depends on the drive, and it only sets the units of
-# the identified parameters, so the module stays agnostic and just records it.
-EFFORT_UNITS = ("ampere", "newton_metre")
+# The regression needs one effort-like measurement per joint. Drives differ:
+# some report motor current, some joint torque, some both. Both are mapped
+# separately and ``effort_source`` says which one the fit uses, so the unit is
+# derived rather than configured and cannot disagree with the channel read.
+EFFORT_SOURCES = ("current", "torque")
+EFFORT_UNIT_BY_SOURCE = {"current": "ampere", "torque": "newton_metre"}
+EFFORT_UNITS = tuple(EFFORT_UNIT_BY_SOURCE.values())
 
-# Without these two the campaign cannot run at all.
-REQUIRED_SIGNALS = ("position", "effort")
+# Without position and the selected effort channel the campaign cannot run.
+REQUIRED_SIGNALS = ("position",)
 # These improve the fit or the safety envelope but each has a fallback.
 OPTIONAL_SIGNALS = ("velocity", "temperature", "voltage", "enabled",
                     "fault_code")
-SIGNALS = REQUIRED_SIGNALS + OPTIONAL_SIGNALS
+SIGNALS = REQUIRED_SIGNALS + EFFORT_SOURCES + OPTIONAL_SIGNALS
 
 
 @dataclass(frozen=True)
@@ -47,14 +50,16 @@ class SignalMap:
     """
 
     position: str = "position"
-    effort: str = "current"
+    # Map whichever the drive publishes; map both if it publishes both.
+    current: str | None = "current"
+    torque: str | None = None
+    # Which of the two the identification regresses against.
+    effort_source: str = "current"
     velocity: str | None = "velocity"
     temperature: str | None = "temperature"
     voltage: str | None = None
     enabled: str | None = None
     fault_code: str | None = None
-    # Only labels the identified parameters; no arithmetic depends on it.
-    effort_unit: str = "ampere"
     # Angles are radians on every standard ROS topic. A driver that publishes
     # degrees anyway can say so here instead of us guessing from magnitudes.
     position_in_degrees: bool = False
@@ -64,19 +69,40 @@ class SignalMap:
             value = getattr(self, name)
             if not value or not str(value).strip():
                 raise ValueError(f"{name} is required and cannot be blank")
-        if self.effort_unit not in EFFORT_UNITS:
+        if self.effort_source not in EFFORT_SOURCES:
             raise ValueError(
-                f"effort_unit must be one of {EFFORT_UNITS}, "
-                f"got {self.effort_unit!r}")
+                f"effort_source must be one of {EFFORT_SOURCES}, "
+                f"got {self.effort_source!r}")
+        if not getattr(self, self.effort_source):
+            raise ValueError(
+                f"effort_source is {self.effort_source!r} but no "
+                f"{self.effort_source} interface is mapped")
+
+    @property
+    def effort(self) -> str:
+        """The interface the identification actually regresses against."""
+        return getattr(self, self.effort_source)
+
+    @property
+    def effort_unit(self) -> str:
+        return EFFORT_UNIT_BY_SOURCE[self.effort_source]
 
     def required_interfaces(self) -> tuple[str, ...]:
         """Interface names a sample must carry before it is usable."""
-        return tuple(getattr(self, name) for name in REQUIRED_SIGNALS)
+        return (self.position, self.effort)
 
     def optional_interfaces(self) -> dict[str, str]:
-        """Signal -> interface name, for the optional signals that are mapped."""
-        return {name: getattr(self, name) for name in OPTIONAL_SIGNALS
-                if getattr(self, name)}
+        """Signal -> interface name, for the optional signals that are mapped.
+
+        The effort channel that was not selected is included: a drive that
+        reports both is worth recording in full even though only one is fitted.
+        """
+        mapped = {name: getattr(self, name) for name in OPTIONAL_SIGNALS
+                  if getattr(self, name)}
+        spare = "torque" if self.effort_source == "current" else "current"
+        if getattr(self, spare):
+            mapped[spare] = getattr(self, spare)
+        return mapped
 
     def missing_guards(self) -> tuple[str, ...]:
         """Safety guards that cannot run because their signal is unmapped.
@@ -96,7 +122,11 @@ class SignalMap:
         return tuple(absent)
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        # Derived, so they travel with the map instead of being recomputed.
+        payload["effort"] = self.effort
+        payload["effort_unit"] = self.effort_unit
+        return payload
 
     def with_overrides(self, **overrides) -> "SignalMap":
         known = {key: value for key, value in overrides.items()
@@ -108,7 +138,7 @@ class SignalMap:
         data = dict(payload or {})
         known = {key: data[key] for key in cls.__dataclass_fields__
                  if key in data}
-        for name in OPTIONAL_SIGNALS:
+        for name in OPTIONAL_SIGNALS + EFFORT_SOURCES:
             # Explicit "" and "none" both mean "this robot does not have it".
             value = known.get(name)
             if isinstance(value, str) and value.strip().lower() in ("", "none"):
@@ -117,9 +147,10 @@ class SignalMap:
 
 
 JOINT_STATE_MAP = SignalMap(
-    position="position", velocity="velocity", effort="effort",
-    temperature=None, voltage=None, enabled=None, fault_code=None,
-    effort_unit="newton_metre")
+    position="position", velocity="velocity",
+    # JointState.effort is documented as a torque, so that is what it maps to.
+    current=None, torque="effort", effort_source="torque",
+    temperature=None, voltage=None, enabled=None, fault_code=None)
 """Mapping for a robot that only offers ``sensor_msgs/JointState``."""
 
 

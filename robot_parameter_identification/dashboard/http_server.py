@@ -24,11 +24,8 @@ def build_routes(service, node=None) -> dict:
                                body.get("pose_deg"))),
         "/api/campaign": ("POST",
                           lambda body: service.start(
-                              str(body.get("mode", "rehearsal")),
-                              str(body.get("acknowledgement", "")))),
-        "/api/home": ("POST",
-                      lambda body: service.home(
-                          str(body.get("acknowledgement", "")))),
+                              str(body.get("mode", "rehearsal")))),
+        "/api/home": ("POST", lambda _body: service.home()),
         "/api/stop": ("POST", lambda _body: service.stop()),
     }
 

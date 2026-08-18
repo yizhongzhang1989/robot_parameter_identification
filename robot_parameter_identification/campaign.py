@@ -480,7 +480,9 @@ MONITORED_FIELDS = (
 
 
 def _fully_instrumented(sample: dict) -> bool:
-    return all(sample.get(field) is not None for field in MONITORED_FIELDS)
+    # Empty, not just absent: a plant on an arm without a bus-voltage interface
+    # reports the key with nothing in it, and that is not instrumentation.
+    return all(sample.get(field) for field in MONITORED_FIELDS)
 
 
 class Campaign:

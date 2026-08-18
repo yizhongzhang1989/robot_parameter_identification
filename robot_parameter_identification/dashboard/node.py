@@ -48,12 +48,14 @@ class DashboardNode(Node):
             signals=SignalMap(
                 position=str(get("signal.position", "position")),
                 velocity=_optional(get("signal.velocity", "velocity")),
-                effort=str(get("signal.effort", "current")),
+                # Map whichever the drive publishes; map both if it has both.
+                current=_optional(get("signal.current", "current")),
+                torque=_optional(get("signal.torque", "")),
+                effort_source=str(get("effort_source", "current")),
                 temperature=_optional(get("signal.temperature", "temperature")),
                 voltage=_optional(get("signal.voltage", "")),
                 enabled=_optional(get("signal.enabled", "")),
                 fault_code=_optional(get("signal.fault_code", "")),
-                effort_unit=str(get("effort_unit", "ampere")),
             ))
         commands = CommandSpec(
             follow_joint_trajectory_action=str(get(
@@ -65,6 +67,7 @@ class DashboardNode(Node):
             profile_path=str(get("profile_path", "")),
             output_directory=str(get("output_directory",
                                      "identification_results")),
+            obstacle_path=str(get("obstacle_file", "")),
             workspace_limit_deg=tuple(
                 self._declare_floats("workspace_limit_deg")),
             maximum_speed_deg_s=float(get("maximum_speed_deg_s", 0.0)),
@@ -154,17 +157,15 @@ class DashboardNode(Node):
         signals = self._spec.signals
         wanted = self._joint_names()
         by_name = dict(zip(message.joint_names, message.interface_values))
+        roles = {"position": signals.position, "effort": signals.effort}
+        roles.update(signals.optional_interfaces())
         rows: dict[str, list[float]] = {}
         for name in wanted:
             entry = by_name.get(name)
             if entry is None:
                 return
             values = dict(zip(entry.interface_names, entry.values))
-            for role in ("position", "velocity", "effort", "temperature",
-                         "voltage", "enabled", "fault_code"):
-                interface = getattr(signals, role)
-                if not interface:
-                    continue
+            for role, interface in roles.items():
                 if interface not in values:
                     if role in ("position", "effort"):
                         return
@@ -263,6 +264,7 @@ class DashboardNode(Node):
         config = HardwareConfig(
             action=self.service.config.commands.follow_joint_trajectory_action,
             state_topic=self._spec.topic(),
+            signals=self._spec.signals,
             require_neutral_start=require_neutral_start)
         if maximum_speed_deg_s is not None:
             config.maximum_speed_deg_s = float(maximum_speed_deg_s)

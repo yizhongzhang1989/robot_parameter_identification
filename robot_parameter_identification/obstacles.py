@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import itertools
+import json
 import uuid
 
 import numpy as np
@@ -27,6 +28,12 @@ import pinocchio as pin
 # always touching link 6, and often link 5, by construction. Reporting that as a
 # collision would veto every pose.
 NEIGHBOUR_DEPTH = 1
+
+# Written into every saved file. Bump it only when old files stop loading.
+SCHEMA_VERSION = 1
+BOX_SHAPE = "box"
+# Extension point: adding a shape means adding it here and to _geometry_for.
+SHAPES = (BOX_SHAPE,)
 MINIMUM_SIZE_M = 1e-4
 
 
@@ -49,6 +56,10 @@ class Obstacle:
     name: str = ""
     enabled: bool = True
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    # Every stored obstacle names its shape so a file written today still
+    # loads once cylinders or meshes exist; an unknown shape is refused rather
+    # than silently read as a box.
+    shape: str = BOX_SHAPE
 
     def __post_init__(self) -> None:
         self.size_m = tuple(float(value) for value in self.size_m)
@@ -62,6 +73,10 @@ class Obstacle:
                 f"got {self.size_m}")
         if not str(self.parent_frame).strip():
             raise ValueError("an obstacle must name the frame it is bolted to")
+        if self.shape not in SHAPES:
+            raise ValueError(
+                f"unknown obstacle shape {self.shape!r}; this build understands "
+                f"{SHAPES}")
         self.name = self.name or f"box_{self.id}"
 
     def placement(self) -> pin.SE3:
@@ -158,6 +173,55 @@ class ObstacleScene:
 
     def as_list(self) -> list[dict]:
         return [obstacle.as_dict() for obstacle in self._obstacles.values()]
+
+    # -- persistence -----------------------------------------------------
+
+    def as_document(self) -> dict:
+        """The scene in the form written to disk.
+
+        Versioned and shape-tagged so a file saved by this build survives new
+        obstacle kinds, and so a newer file is refused rather than misread.
+        """
+        return {"schema_version": SCHEMA_VERSION,
+                "obstacles": self.as_list()}
+
+    def load_document(self, document: dict) -> list[str]:
+        """Replace the scene from a saved document, reporting what was dropped.
+
+        Obstacles bolted to frames this robot does not have are skipped rather
+        than fatal: the same file may be shared between arms, and losing one
+        box should not cost the operator the rest of the scene.
+        """
+        payload = dict(document or {})
+        version = int(payload.get("schema_version", 0))
+        if version > SCHEMA_VERSION:
+            raise ValueError(
+                f"obstacle file is schema version {version}; this build "
+                f"understands up to {SCHEMA_VERSION}")
+        kept, skipped = {}, []
+        for entry in payload.get("obstacles") or []:
+            try:
+                obstacle = Obstacle.from_dict(entry)
+                self._frame_id(obstacle.parent_frame)
+            except (KeyError, ValueError) as error:
+                skipped.append(str(error))
+                continue
+            kept[obstacle.id] = obstacle
+        self._obstacles = kept
+        self._invalidate()
+        return skipped
+
+    def save(self, path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Write beside the target and rename, so an interrupted save cannot
+        # leave the operator with a truncated scene.
+        scratch = target.with_suffix(target.suffix + ".partial")
+        scratch.write_text(json.dumps(self.as_document(), indent=2) + "\n")
+        scratch.replace(target)
+
+    def load(self, path) -> list[str]:
+        return self.load_document(json.loads(Path(path).read_text()))
 
     def _invalidate(self) -> None:
         self._geometry = None

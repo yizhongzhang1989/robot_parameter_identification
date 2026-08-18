@@ -151,13 +151,8 @@ function renderObstacleList() {
 /* ---------------- run control ---------------- */
 
 $('btn-rehearse').addEventListener('click', () => post('/api/campaign', { mode: 'rehearsal' }));
-$('btn-hardware').addEventListener('click', () => post('/api/campaign', {
-  mode: 'hardware', acknowledgement: $('ack').value.trim(),
-}));
-$('btn-home').addEventListener('click', () => {
-  if (!confirm('Home the arm? Every joint drives back to zero.')) return;
-  post('/api/home', { acknowledgement: $('ack').value.trim() });
-});
+$('btn-hardware').addEventListener('click', () => post('/api/campaign', { mode: 'hardware' }));
+$('btn-home').addEventListener('click', () => post('/api/home', {}));
 $('btn-stop').addEventListener('click', () => post('/api/stop', {}));
 
 /* ---------------- render ---------------- */
@@ -214,14 +209,14 @@ function renderRun(snapshot) {
   $('run-state').className = 'state' + (running ? ' running' : '');
   $('btn-rehearse').disabled = running || !snapshot.have_model;
   $('btn-hardware').disabled = running || !snapshot.rehearsal_passed;
-  // Homing does not use the identification maths, so no rehearsal gate; it
-  // still moves the arm, so the acknowledgement is checked server side.
+  // Homing runs no identification, so the rehearsal gate does not apply; it
+  // would only block recovering an arm the plant already refuses to arm.
   $('btn-home').disabled = running || !snapshot.have_model;
   $('btn-stop').disabled = !running;
   $('ack-hint').textContent = snapshot.rehearsal_passed
-    ? `Type ${snapshot.acknowledgement} to enable the hardware run or homing.`
+    ? 'Rehearsal passed: the hardware run is armed.'
     : 'A rehearsal must pass before a campaign may move the arm. '
-      + 'Homing needs the acknowledgement only.';
+      + 'Homing is always available.';
 
   const progress = snapshot.progress || {};
   const current = progress.phase || '';

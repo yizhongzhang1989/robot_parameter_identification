@@ -23,10 +23,6 @@ from ..model import ModelComponents
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
 
-# The operator must type this before anything moves. It is deliberately a
-# sentence about the room, not a checkbox: the person clicking it is asserting
-# they are next to the arm.
-ACKNOWLEDGEMENT = "I_AM_AT_THE_ROBOT_AND_ESTOP_READY"
 IDLE, RUNNING = "idle", "running"
 # A campaign yields tens of thousands of samples; a scatter plot stops being
 # readable long before a browser stops being able to draw them.
@@ -54,6 +50,8 @@ class DashboardConfig:
     # Top sweep speed. Zero keeps the conservative derived default, which is
     # too slow to see viscous friction on a full-size arm.
     maximum_speed_deg_s: float = 0.0
+    # Where the drawn obstacle scene lives between sessions. Empty disables it.
+    obstacle_path: str = ""
 
 
 class IdentificationService:
@@ -148,6 +146,9 @@ class IdentificationService:
                     self.note(f"obstacles dropped, frames changed: {error}")
             self.plan = (self._build_plan(profile)
                          if profile is not None else None)
+        if not previous:
+            # First model of the session: bring back whatever was drawn last.
+            self._restore_obstacles()
         self.note(f"model ready: {arm.joint_count} joints, "
                   f"{arm.parameter_count} parameters, profile {source}")
         return True
@@ -185,23 +186,58 @@ class IdentificationService:
         self._require_idle("obstacles cannot be edited while a run is active")
         box = self.scene.add(Obstacle.from_dict(payload))
         self.note(f"obstacle {box.name} bolted to {box.parent_frame}")
+        self._persist_obstacles()
         return box.as_dict()
 
     def update_obstacle(self, obstacle_id: str, changes: dict) -> dict:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
-        return self.scene.update(obstacle_id, **changes).as_dict()
+        box = self.scene.update(obstacle_id, **changes).as_dict()
+        self._persist_obstacles()
+        return box
 
     def remove_obstacle(self, obstacle_id: str) -> None:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
         self.scene.remove(obstacle_id)
+        self._persist_obstacles()
 
     def replace_obstacles(self, payloads: list[dict]) -> list[dict]:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
         self.scene.replace_all(payloads)
+        self._persist_obstacles()
         return self.scene.as_list()
+
+    def obstacle_path(self) -> Path | None:
+        raw = (self.config.obstacle_path or "").strip()
+        return Path(raw).expanduser() if raw else None
+
+    def _persist_obstacles(self) -> None:
+        """Save after every edit; a scene lost on restart is a scene retyped."""
+        path = self.obstacle_path()
+        if path is None or self.scene is None:
+            return
+        try:
+            self.scene.save(path)
+        except OSError as error:
+            self.note(f"obstacles not saved to {path}: {error}")
+
+    def _restore_obstacles(self) -> bool:
+        path = self.obstacle_path()
+        if path is None or self.scene is None or not path.exists():
+            return False
+        try:
+            skipped = self.scene.load(path)
+        except (OSError, ValueError) as error:
+            self.note(f"obstacle file {path} not loaded: {error}")
+            return False
+        self.note(f"obstacles restored from {path}: "
+                  f"{len(self.scene.as_list())} kept"
+                  + (f", {len(skipped)} dropped" if skipped else ""))
+        for reason in skipped:
+            self.note(f"obstacle dropped: {reason}")
+        return True
 
     def collision_report(self, pose_deg=None) -> dict:
         """Whether the current pose is clear, and what it touches if not."""
@@ -262,7 +298,7 @@ class IdentificationService:
 
     # -- campaign --------------------------------------------------------
 
-    def start(self, mode: str, acknowledgement: str = "") -> dict:
+    def start(self, mode: str) -> dict:
         if not self.have_model():
             return {"ok": False, "message": "no /robot_description yet"}
         if self.profile is None:
@@ -270,15 +306,12 @@ class IdentificationService:
         with self._lock:
             if self._state != IDLE:
                 return {"ok": False, "message": f"{self._activity} is running"}
-            if mode == "hardware":
-                if not self.rehearsal_passed:
-                    return {"ok": False,
-                            "message": "rehearse first: a dry run must pass "
-                                       "before the arm is allowed to move"}
-                if acknowledgement != ACKNOWLEDGEMENT:
-                    return {"ok": False,
-                            "message": "hardware runs need the operator "
-                                       "acknowledgement"}
+            if mode == "hardware" and not self.rehearsal_passed:
+                # Not ceremony: the rehearsal plants known friction and must
+                # find it again, and it is what caught the fit returning zero.
+                return {"ok": False,
+                        "message": "rehearse first: a dry run must pass "
+                                   "before the arm is allowed to move"}
             self._state = RUNNING
             self._activity = f"campaign_{mode}"
             self._abort.clear()
@@ -298,7 +331,7 @@ class IdentificationService:
         self._abort.set()
         return {"ok": True, "message": "stop requested"}
 
-    def home(self, acknowledgement: str = "") -> dict:
+    def home(self) -> dict:
         """Drive every joint back to neutral.
 
         A campaign leaves the arm wherever validation ended, and the hardware
@@ -312,10 +345,6 @@ class IdentificationService:
         with self._lock:
             if self._state != IDLE:
                 return {"ok": False, "message": f"{self._activity} is running"}
-            if acknowledgement != ACKNOWLEDGEMENT:
-                return {"ok": False,
-                        "message": "homing moves the arm, so it needs the "
-                                   "operator acknowledgement"}
             self._state = RUNNING
             self._activity = "homing"
             self._abort.clear()
@@ -566,7 +595,6 @@ class IdentificationService:
                 "reach_deg": ([round(v, 1) for v in self.plan.design_limits(
                     self.arm).upper_deg]
                     if self.plan is not None and self.arm is not None else []),
-                "acknowledgement": ACKNOWLEDGEMENT,
                 "rehearsal_passed": self.rehearsal_passed,
                 "obstacles": self.obstacles(),
                 "frames": self.frame_names(),

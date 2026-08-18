@@ -12,14 +12,39 @@ class SignalMapTest(unittest.TestCase):
         self.assertEqual(signals.position, "position")
         self.assertEqual(signals.effort, "current")
 
-    def test_position_and_effort_cannot_be_blank(self):
-        for field in ("position", "effort"):
-            with self.assertRaises(ValueError, msg=field):
-                SignalMap(**{field: ""})
-
-    def test_an_unknown_effort_unit_is_refused(self):
+    def test_position_cannot_be_blank(self):
         with self.assertRaises(ValueError):
-            SignalMap(effort_unit="furlong")
+            SignalMap(position="")
+
+    def test_the_selected_effort_channel_must_be_mapped(self):
+        with self.assertRaises(ValueError):
+            SignalMap(current=None)
+        with self.assertRaises(ValueError):
+            SignalMap(torque=None, effort_source="torque")
+
+    def test_an_unknown_effort_source_is_refused(self):
+        with self.assertRaises(ValueError):
+            SignalMap(effort_source="furlongs")
+
+    def test_the_unit_follows_the_source_it_cannot_disagree(self):
+        amps = SignalMap(current="current", effort_source="current")
+        newtons = SignalMap(torque="torque", effort_source="torque")
+        self.assertEqual(amps.effort_unit, "ampere")
+        self.assertEqual(amps.effort, "current")
+        self.assertEqual(newtons.effort_unit, "newton_metre")
+        self.assertEqual(newtons.effort, "torque")
+
+    def test_a_drive_reporting_both_records_the_one_it_does_not_fit(self):
+        both = SignalMap(current="current", torque="torque",
+                         effort_source="current")
+        self.assertEqual(both.effort, "current")
+        self.assertEqual(both.optional_interfaces().get("torque"), "torque")
+
+    def test_a_torque_only_drive_is_supported(self):
+        signals = SignalMap(current=None, torque="effort",
+                            effort_source="torque")
+        self.assertEqual(signals.required_interfaces(), ("position", "effort"))
+        self.assertNotIn("current", signals.optional_interfaces())
 
     def test_optional_signals_may_be_absent(self):
         signals = SignalMap(temperature=None, enabled=None, fault_code=None)
@@ -42,8 +67,8 @@ class SignalMapTest(unittest.TestCase):
         self.assertIsNone(signals.enabled)
 
     def test_round_trip_through_a_dict(self):
-        original = SignalMap(effort="effort", effort_unit="newton_metre",
-                             temperature=None)
+        original = SignalMap(current=None, torque="effort",
+                             effort_source="torque", temperature=None)
         self.assertEqual(SignalMap.from_dict(original.as_dict()), original)
 
     def test_the_joint_state_preset_is_torque_in_newton_metres(self):

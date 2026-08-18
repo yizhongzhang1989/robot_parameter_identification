@@ -1,5 +1,6 @@
 """Obstacles: binding, collision, and the honesty of the geometry report."""
 
+from pathlib import Path
 import unittest
 
 import numpy as np
@@ -7,7 +8,8 @@ import numpy as np
 try:
     import pinocchio as pin
     from robot_parameter_identification import identification as ident
-    from robot_parameter_identification.obstacles import Obstacle, ObstacleScene
+    from robot_parameter_identification.obstacles import (
+        Obstacle, ObstacleScene, SCHEMA_VERSION)
     from fixtures import synthetic_urdf, PREFIX
 except ImportError as error:
     raise unittest.SkipTest(f"needs pinocchio: {error}") from error
@@ -149,6 +151,66 @@ class ObstacleSceneTest(unittest.TestCase):
     def test_the_wrong_number_of_angles_is_refused(self):
         with self.assertRaises(ValueError):
             self.scene().collision_free(np.zeros(3))
+
+
+class PersistenceTest(ObstacleSceneTest):
+    """A scene the operator drew must survive a restart."""
+
+    def temp_path(self):
+        import tempfile
+
+        handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        handle.close()
+        path = Path(handle.name)
+        self.addCleanup(lambda: path.exists() and path.unlink())
+        return path
+
+    def test_a_saved_scene_reloads_identically(self):
+        scene = self.scene()
+        scene.add(Obstacle(parent_frame=self.base(scene), name="bench",
+                           size_m=(0.4, 0.3, 0.2), xyz_m=(0.2, 0.0, -0.1)))
+        path = self.temp_path()
+        scene.save(path)
+
+        restored = self.scene()
+        restored.load(path)
+        self.assertEqual(scene.as_list(), restored.as_list())
+
+    def test_the_document_is_versioned_and_names_the_shape(self):
+        scene = self.scene()
+        scene.add(Obstacle(parent_frame=self.base(scene)))
+        document = scene.as_document()
+        self.assertEqual(document["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(document["obstacles"][0]["shape"], "box")
+
+    def test_a_future_schema_is_refused_rather_than_misread(self):
+        scene = self.scene()
+        with self.assertRaises(ValueError):
+            scene.load_document({"schema_version": SCHEMA_VERSION + 1,
+                                 "obstacles": []})
+
+    def test_an_unknown_shape_is_refused_rather_than_read_as_a_box(self):
+        with self.assertRaises(ValueError):
+            Obstacle(parent_frame="base", shape="dodecahedron")
+
+    def test_a_box_on_a_frame_this_robot_lacks_is_skipped_not_fatal(self):
+        # The same file may be shared between arms; losing one box must not
+        # cost the operator the rest of the scene.
+        scene = self.scene()
+        good = Obstacle(parent_frame=self.base(scene), name="keep").as_dict()
+        stray = dict(good, parent_frame="no_such_link", name="stray",
+                     id="deadbeef")
+        skipped = scene.load_document(
+            {"schema_version": SCHEMA_VERSION, "obstacles": [good, stray]})
+        self.assertEqual([box.name for box in scene.obstacles()], ["keep"])
+        self.assertEqual(len(skipped), 1)
+
+    def test_an_interrupted_save_leaves_no_partial_file(self):
+        scene = self.scene()
+        scene.add(Obstacle(parent_frame=self.base(scene)))
+        path = self.temp_path()
+        scene.save(path)
+        self.assertFalse(path.with_suffix(path.suffix + ".partial").exists())
 
 
 if __name__ == "__main__":

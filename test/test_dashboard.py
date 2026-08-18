@@ -10,7 +10,7 @@ try:
     from robot_parameter_identification.dashboard.http_server import (
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
-        ACKNOWLEDGEMENT, DashboardConfig, IdentificationService)
+        DashboardConfig, IdentificationService)
     from fixtures import synthetic_urdf, test_profile, PREFIX
 except ImportError as error:
     raise unittest.SkipTest(f"needs pinocchio: {error}") from error
@@ -89,16 +89,19 @@ class ObstacleApiTest(unittest.TestCase):
 class RunGateTest(unittest.TestCase):
     def test_hardware_is_refused_before_a_rehearsal(self):
         made = service()
-        answer = made.start("hardware", ACKNOWLEDGEMENT)
+        answer = made.start("hardware")
         self.assertFalse(answer["ok"])
         self.assertIn("rehearse", answer["message"])
 
-    def test_hardware_is_refused_without_the_acknowledgement(self):
+    def test_a_passed_rehearsal_arms_the_hardware_run(self):
+        # The rehearsal gate is not ceremony: it plants known friction and must
+        # find it again, and it is what caught the fit returning zero.
         made = service()
         made.rehearsal_passed = True
-        answer = made.start("hardware", "please")
+        made._state = "running"
+        answer = made.start("hardware")
         self.assertFalse(answer["ok"])
-        self.assertIn("acknowledgement", answer["message"])
+        self.assertIn("running", answer["message"])
 
     def test_nothing_starts_without_a_model(self):
         blank = IdentificationService(DashboardConfig(), profile=test_profile())
@@ -107,8 +110,11 @@ class RunGateTest(unittest.TestCase):
     def test_the_snapshot_carries_what_the_page_needs(self):
         snapshot = service().snapshot()
         for key in ("state", "connection", "have_model", "obstacles", "frames",
-                    "collision", "progress", "notes", "acknowledgement"):
+                    "collision", "progress", "notes", "rehearsal_passed"):
             self.assertIn(key, snapshot)
+
+    def test_no_acknowledgement_is_demanded_anywhere(self):
+        self.assertNotIn("acknowledgement", service().snapshot())
 
 
 class FakePlant:
@@ -164,31 +170,30 @@ class HomingTest(unittest.TestCase):
         while made.running() and time.monotonic() < deadline:
             time.sleep(0.02)
 
-    def test_homing_needs_the_acknowledgement(self):
+    def test_homing_runs_on_a_bare_click(self):
         made, plant = self.homing_service([5.0] * 7)
-        answer = made.home("please")
-        self.assertFalse(answer["ok"])
-        self.assertIn("acknowledgement", answer["message"])
-        self.assertFalse(plant.parked)
+        self.assertTrue(made.home()["ok"])
+        self.wait(made)
+        self.assertTrue(plant.parked)
 
     def test_homing_is_refused_while_something_runs(self):
         made, _plant = self.homing_service([5.0] * 7)
         made._state = "running"
         made._activity = "campaign_rehearsal"
-        answer = made.home(ACKNOWLEDGEMENT)
+        answer = made.home()
         self.assertFalse(answer["ok"])
         self.assertIn("running", answer["message"])
 
     def test_homing_needs_a_model(self):
         blank = IdentificationService(DashboardConfig(), profile=test_profile())
-        self.assertFalse(blank.home(ACKNOWLEDGEMENT)["ok"])
+        self.assertFalse(blank.home()["ok"])
 
     def test_homing_does_not_need_a_rehearsal(self):
         # It drives no identification, so the rehearsal gate would only stop
         # an operator recovering an arm the plant already refuses to arm.
         made, plant = self.homing_service([5.0] * 7)
         self.assertFalse(made.rehearsal_passed)
-        self.assertTrue(made.home(ACKNOWLEDGEMENT)["ok"])
+        self.assertTrue(made.home()["ok"])
         self.wait(made)
         self.assertTrue(plant.parked)
 
@@ -196,13 +201,13 @@ class HomingTest(unittest.TestCase):
         # That check exists to refuse campaigns off home. Homing is the one
         # job that must be allowed to run precisely then.
         made, plant = self.homing_service([40.0] * 7)
-        made.home(ACKNOWLEDGEMENT)
+        made.home()
         self.wait(made)
         self.assertIs(plant.opened_with.get("require_neutral_start"), False)
 
     def test_homing_reports_where_it_started_and_ended(self):
         made, _plant = self.homing_service([5.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        made.home(ACKNOWLEDGEMENT)
+        made.home()
         self.wait(made)
         progress = made.snapshot()["progress"]
         self.assertEqual(progress["phase"], "homed")
@@ -212,13 +217,13 @@ class HomingTest(unittest.TestCase):
     def test_the_plant_is_released_afterwards(self):
         # A hardware plant owns a ROS context; not closing it leaks one per run.
         made, plant = self.homing_service([5.0] * 7)
-        made.home(ACKNOWLEDGEMENT)
+        made.home()
         self.wait(made)
         self.assertTrue(plant.closed)
 
     def test_the_service_is_idle_again(self):
         made, _plant = self.homing_service([5.0] * 7)
-        made.home(ACKNOWLEDGEMENT)
+        made.home()
         self.wait(made)
         self.assertEqual(made.snapshot()["state"], "idle")
 
@@ -228,12 +233,13 @@ class HomingTest(unittest.TestCase):
         made._release(None)
 
     def test_homing_is_reachable_over_http(self):
-        made, _plant = self.homing_service([0.0] * 7)
+        made, plant = self.homing_service([3.0] * 7)
         routes = build_routes(made, None)
         self.assertIn("/api/home", routes)
         self.assertEqual(routes["/api/home"][0], "POST")
-        answer = routes["/api/home"][1]({"acknowledgement": "nope"})
-        self.assertFalse(answer["ok"])
+        self.assertTrue(routes["/api/home"][1]({})["ok"])
+        self.wait(made)
+        self.assertTrue(plant.parked)
 
 
 class ViewerStateTest(unittest.TestCase):
@@ -513,9 +519,7 @@ class HttpTest(unittest.TestCase):
         self.assertIn(caught.exception.code, (400, 403, 404))
 
     def test_hardware_start_is_refused_over_http_too(self):
-        status, payload = self.post("/api/campaign",
-                                    {"mode": "hardware",
-                                     "acknowledgement": ACKNOWLEDGEMENT})
+        status, payload = self.post("/api/campaign", {"mode": "hardware"})
         self.assertEqual(status, 200)
         self.assertFalse(payload["ok"])
 
