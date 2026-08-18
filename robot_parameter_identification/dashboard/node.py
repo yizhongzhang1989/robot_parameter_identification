@@ -260,8 +260,11 @@ class DashboardNode(Node):
         config = HardwareConfig(
             action=self.service.config.commands.follow_joint_trajectory_action,
             state_topic=self._spec.topic())
+        # The plant must build its OWN node, context and executor. Lending it
+        # this one puts the campaign thread and rclpy.spin() on the same wait
+        # set, which corrupts it and takes the dashboard down mid-run.
         plant = HardwarePlant(profile, config=config,
-                              collision_model=collision_scene, node=self)
+                              collision_model=collision_scene)
         plant.open()
         return plant
 

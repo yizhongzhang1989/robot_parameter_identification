@@ -230,6 +230,35 @@ class StopTest(unittest.TestCase):
         self.assertFalse(snapshot["rehearsal_passed"])
 
 
+class ProgressTest(unittest.TestCase):
+    """Phases report different fields; none may erase another's."""
+
+    def service(self):
+        made = IdentificationService(DashboardConfig())
+        made._activity = "campaign_rehearsal"
+        return made
+
+    def test_a_pose_update_keeps_the_sample_count(self):
+        made = self.service()
+        made._on_progress("A_gravity", {"observations": 42})
+        made._on_progress("A_gravity", {"pose": 3, "poses": 24})
+        self.assertEqual(made.progress["observations"], 42)
+        self.assertEqual(made.progress["pose"], 3)
+
+    def test_a_sample_update_keeps_the_pose_index(self):
+        made = self.service()
+        made._on_progress("A_gravity", {"pose": 3, "poses": 24})
+        made._on_progress("A_gravity", {"observations": 99})
+        self.assertEqual(made.progress["pose"], 3)
+        self.assertEqual(made.progress["observations"], 99)
+
+    def test_elapsed_time_is_always_refreshed(self):
+        made = self.service()
+        made._started_at = 0.0
+        made._on_progress("B_friction", {})
+        self.assertGreater(made.progress["elapsed_s"], 0.0)
+
+
 class HttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -260,6 +260,7 @@ class IdentificationService:
             self._abort.clear()
             self._started_at = time.monotonic()
             self._samples = []
+            self.progress = {"mode": self._activity, "phase": "starting"}
         self._worker = threading.Thread(
             target=self._run, args=(mode,), daemon=True,
             name=f"identification-{mode}")
@@ -294,10 +295,14 @@ class IdentificationService:
                 self._activity = ""
 
     def _on_progress(self, phase: str, detail: dict) -> None:
+        # Phases report different things -- pose index here, sample count there.
+        # Replacing the dict would blank whichever one this update omits.
         with self._lock:
-            self.progress = {"mode": self._activity, "phase": phase,
-                             "elapsed_s": time.monotonic() - self._started_at}
-            self.progress.update(detail or {})
+            merged = dict(self.progress)
+            merged.update({"mode": self._activity, "phase": phase,
+                           "elapsed_s": time.monotonic() - self._started_at})
+            merged.update(detail or {})
+            self.progress = merged
 
     def _finish(self, mode: str, result, observations) -> None:
         payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)
