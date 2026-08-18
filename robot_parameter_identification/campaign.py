@@ -518,6 +518,8 @@ class Campaign:
             phase, self.clock() - self._started, sample, acceleration_deg_s2)
         self.observations.append(observation)
         report.observations += 1
+        # A run lasts tens of minutes, so something has to be able to watch it.
+        self.progress(phase, {"observations": len(self.observations)})
         if observation.temperature_c:
             report.peak_temperature_c = max(
                 report.peak_temperature_c, max(observation.temperature_c))

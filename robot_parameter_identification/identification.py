@@ -143,6 +143,22 @@ class ArmModel:
             np.zeros(self.joint_count) if a_deg_s2 is None else a_deg_s2, dtype=float))
         return np.array(pin.rnea(self.model, self.data, q, v, a))
 
+    def link_transforms(self, q_deg) -> dict[str, list[float]]:
+        """Every frame's pose as a row-major 4x4, for a viewer to draw.
+
+        Forward kinematics rather than TF: the picture is then guaranteed to
+        agree with the model the collision check and the regression use, which
+        is the whole point of showing it.
+        """
+        q = np.radians(np.asarray(q_deg, dtype=float))
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        poses = {}
+        for index, frame in enumerate(self.model.frames):
+            poses[frame.name] = self.data.oMf[index].homogeneous.reshape(
+                -1).tolist()
+        return poses
+
 
 def friction_row(velocity_deg_s: float) -> np.ndarray:
     """Coulomb, viscous and constant offset terms for one joint."""

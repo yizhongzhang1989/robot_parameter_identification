@@ -1,0 +1,174 @@
+"""Static assets, the JSON API, and a mesh proxy for the 3D view."""
+
+from __future__ import annotations
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+import json
+import mimetypes
+import threading
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+MAX_BODY = 4 << 20
+
+
+def build_routes(service, node=None) -> dict:
+    """path -> (method, handler). Handlers take the decoded JSON body."""
+    return {
+        "/api/state": ("GET", lambda _body: service.snapshot()),
+        "/api/viewer": ("GET", lambda _body: _viewer(service, node)),
+        "/api/obstacles": ("POST", lambda body: _obstacles(service, body)),
+        "/api/collision": ("POST",
+                           lambda body: service.collision_report(
+                               body.get("pose_deg"))),
+        "/api/campaign": ("POST",
+                          lambda body: service.start(
+                              str(body.get("mode", "rehearsal")),
+                              str(body.get("acknowledgement", "")))),
+        "/api/stop": ("POST", lambda _body: service.stop()),
+    }
+
+
+def _viewer(service, node) -> dict:
+    payload = service.viewer_state()
+    payload["visuals"] = node.visuals() if node is not None else []
+    return payload
+
+
+def _obstacles(service, body: dict):
+    """One endpoint, four verbs, because the UI edits a list not a resource."""
+    action = str(body.get("action", "replace"))
+    if action == "add":
+        return {"ok": True, "obstacle": service.add_obstacle(
+            body.get("obstacle") or {})}
+    if action == "update":
+        return {"ok": True, "obstacle": service.update_obstacle(
+            str(body.get("id", "")), body.get("changes") or {})}
+    if action == "remove":
+        service.remove_obstacle(str(body.get("id", "")))
+        return {"ok": True}
+    if action == "clear":
+        return {"ok": True, "obstacles": service.replace_obstacles([])}
+    return {"ok": True,
+            "obstacles": service.replace_obstacles(body.get("obstacles") or [])}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    # Every request would otherwise be echoed to the node's stderr.
+    def log_message(self, fmt, *args) -> None:  # noqa: A003
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/mesh":
+            return self._mesh(parse_qs(parsed.query))
+        route = self.server.routes.get(path)
+        if route and route[0] == "GET":
+            return self._json_result(route[1], {})
+        return self._static(path)
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        route = self.server.routes.get(path)
+        if not route or route[0] != "POST":
+            return self._send(404, b"no such endpoint", "text/plain")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            return self._send(413, b"body too large", "text/plain")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, UnicodeDecodeError) as error:
+            return self._json(400, {"ok": False, "message": str(error)})
+        return self._json_result(route[1], body)
+
+    def _json_result(self, handler, body: dict) -> None:
+        try:
+            payload = handler(body)
+        except (KeyError, ValueError, RuntimeError) as error:
+            # Operator mistakes -- an unknown frame, an edit during a run --
+            # are answered, not raised: the dashboard shows the sentence.
+            return self._json(400, {"ok": False, "message": str(error)})
+        except Exception as error:  # noqa: BLE001
+            return self._json(500, {"ok": False, "message": repr(error)})
+        if isinstance(payload, dict) and "ok" not in payload:
+            payload = dict(payload)
+            payload["ok"] = True
+        return self._json(200, payload)
+
+    def _json(self, status: int, payload) -> None:
+        body = json.dumps(payload, default=_plain).encode("utf-8")
+        self._send(status, body, "application/json")
+
+    def _static(self, path: str) -> None:
+        relative = "index.html" if path in ("/", "") else path.lstrip("/")
+        target = (STATIC_DIR / relative).resolve()
+        try:
+            target.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            return self._send(403, b"forbidden", "text/plain")
+        if not target.is_file():
+            return self._send(404, b"not found", "text/plain")
+        kind = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if target.suffix == ".js":
+            kind = "text/javascript"
+        self._send(200, target.read_bytes(), kind)
+
+    def _mesh(self, query: dict) -> None:
+        """Serve a URDF mesh by package name, so the browser can load it."""
+        resolver = getattr(self.server, "mesh_resolver", None)
+        if resolver is None:
+            return self._send(404, b"no mesh resolver", "text/plain")
+        package = (query.get("pkg") or [""])[0]
+        relative = unquote((query.get("path") or [""])[0])
+        try:
+            data, kind = resolver(package, relative)
+        except (KeyError, ValueError, OSError) as error:
+            return self._send(404, str(error).encode("utf-8"), "text/plain")
+        self._send(200, data, kind)
+
+    def _send(self, status: int, body: bytes, kind: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+def _plain(value):
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "as_dict"):
+        return value.as_dict()
+    return str(value)
+
+
+class DashboardServer:
+    """The web surface, on its own thread."""
+
+    def __init__(self, service, port: int = 8300, host: str = "0.0.0.0",
+                 mesh_resolver=None, node=None) -> None:
+        self.httpd = ThreadingHTTPServer((host, port), _Handler)
+        self.httpd.routes = build_routes(service, node)
+        self.httpd.mesh_resolver = mesh_resolver
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self._thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True, name="dashboard-http")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()

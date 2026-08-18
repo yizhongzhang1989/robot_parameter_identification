@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Robot parameter identification</title>
+<link rel="stylesheet" href="/dashboard.css"/>
+<script type="importmap">
+{"imports": {
+  "three": "/vendor/three.module.js",
+  "three/addons/": "/vendor/addons/"
+}}
+</script>
+</head>
+<body>
+
+<header id="topbar">
+  <h1>Parameter identification</h1>
+  <div id="conn" class="pills">
+    <span class="pill" id="pill-desc">model</span>
+    <span class="pill" id="pill-tel">telemetry</span>
+    <span class="pill" id="pill-act">action</span>
+    <span class="pill" id="pill-collide">clearance</span>
+  </div>
+  <div class="spacer"></div>
+  <span id="run-state" class="state">idle</span>
+</header>
+
+<main id="layout">
+
+  <!-- ---------------- 3D ---------------- -->
+  <section id="stage">
+    <div id="viewer"></div>
+    <div id="loading"><div class="spinner"></div><span>loading model…</span></div>
+
+    <div class="overlay" id="view-opts">
+      <label><input type="checkbox" id="show-mesh" checked/> meshes</label>
+      <label><input type="checkbox" id="show-frames"/> frames</label>
+      <label><input type="checkbox" id="show-labels"/> labels</label>
+      <label><input type="checkbox" id="show-ghost" checked/> planned pose</label>
+    </div>
+
+    <div class="overlay" id="edit-box">
+      <div class="row title">
+        <strong>Obstacles</strong>
+        <span id="obst-count" class="muted">0</span>
+      </div>
+      <div class="row">
+        <button id="obst-add" class="small">+ box</button>
+        <button id="obst-del" class="small danger" disabled>delete</button>
+        <button id="obst-clear" class="small">clear</button>
+      </div>
+      <div class="row">
+        <button id="gizmo-move" class="small sel">move</button>
+        <button id="gizmo-rotate" class="small">rotate</button>
+        <button id="gizmo-scale" class="small">size</button>
+      </div>
+      <div id="obst-form" class="hidden">
+        <label class="field">bolted to
+          <select id="obst-frame"></select>
+        </label>
+        <div class="grid3">
+          <label class="field">size x<input id="sz-x" type="number" step="0.01"/></label>
+          <label class="field">y<input id="sz-y" type="number" step="0.01"/></label>
+          <label class="field">z<input id="sz-z" type="number" step="0.01"/></label>
+        </div>
+        <div class="grid3">
+          <label class="field">pos x<input id="px" type="number" step="0.01"/></label>
+          <label class="field">y<input id="py" type="number" step="0.01"/></label>
+          <label class="field">z<input id="pz" type="number" step="0.01"/></label>
+        </div>
+        <div class="grid3">
+          <label class="field">roll<input id="rr" type="number" step="1"/></label>
+          <label class="field">pitch<input id="rp" type="number" step="1"/></label>
+          <label class="field">yaw<input id="ry" type="number" step="1"/></label>
+        </div>
+        <p class="hint">A box on the base is a bench. A box on a link travels
+          with the arm.</p>
+      </div>
+      <ul id="obst-list"></ul>
+    </div>
+
+    <div class="overlay" id="jointbars"><div id="joint-bars"></div></div>
+  </section>
+
+  <!-- ---------------- right panel ---------------- -->
+  <aside id="panel">
+
+    <div class="card">
+      <h2>Run</h2>
+      <div class="row">
+        <button id="btn-rehearse">Rehearse</button>
+        <button id="btn-hardware" class="danger" disabled>Run on hardware</button>
+        <button id="btn-stop" class="stop" disabled>Stop</button>
+      </div>
+      <label class="field">operator acknowledgement
+        <input id="ack" type="text" placeholder="required before the arm moves"/>
+      </label>
+      <p class="hint" id="ack-hint"></p>
+      <div id="phasebar" class="phases"></div>
+      <div id="progress-line" class="muted">not started</div>
+    </div>
+
+    <div class="card">
+      <h2>Connection</h2>
+      <table class="kv" id="conn-table"></table>
+      <p class="hint" id="guards"></p>
+    </div>
+
+    <div class="card">
+      <h2>Fit quality</h2>
+      <p class="hint">Residual per joint. Validation is the number that counts:
+        training error can always be made small.</p>
+      <canvas id="chart-error" height="150"></canvas>
+      <table class="kv" id="verdict-table"></table>
+    </div>
+
+    <div class="card">
+      <h2>Friction curve</h2>
+      <p class="hint">Fitted curve against the samples it was fitted to. A curve
+        that misses the cloud at low speed is the usual sign the reversal model
+        is wrong.</p>
+      <label class="field">joint
+        <select id="friction-joint"></select>
+      </label>
+      <canvas id="chart-friction" height="190"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>Residual against speed</h2>
+      <p class="hint">Structure here is unmodelled physics, not noise.</p>
+      <canvas id="chart-residual" height="170"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>Excitation</h2>
+      <p class="hint">Condition number per joint. Large values mean the
+        experiment barely moved some parameter, so trust it less.</p>
+      <canvas id="chart-condition" height="140"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>Parameters</h2>
+      <div id="params"></div>
+    </div>
+
+    <div class="card">
+      <h2>Log</h2>
+      <pre id="notes"></pre>
+    </div>
+
+  </aside>
+</main>
+
+<div id="toast" class="hidden"></div>
+
+<script type="module" src="/viewer.js"></script>
+<script type="module" src="/charts.js"></script>
+<script type="module" src="/dashboard.js"></script>
+</body>
+</html>
