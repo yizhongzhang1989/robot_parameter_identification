@@ -1,0 +1,70 @@
+{
+  "plan": {
+    "static_poses": 24,
+    "static_candidates": 200,
+    "settle_samples": 3,
+    "friction_amplitude_deg": 20.0,
+    "friction_speeds_deg_s": [
+      1.0,
+      3.0,
+      6.0,
+      10.0
+    ],
+    "fourier_harmonics": 4,
+    "fourier_base_frequency_hz": 0.08,
+    "fourier_duration_s": 30.0,
+    "fourier_attempts": 40,
+    "sample_rate_hz": 20.0,
+    "validation_poses": 12,
+    "validation_speeds_deg_s": [
+      3.5,
+      6.5
+    ],
+    "validation_trajectory_s": 12.0,
+    "maximum_speed_deg_s": 10.0,
+    "maximum_acceleration_deg_s2": 20.0,
+    "position_margin_deg": 5.0,
+    "temperature_ceiling_c": 45.0,
+    "workspace_limit_deg": [],
+    "gravity_probe_deg": 5.0,
+    "gravity_probe_speed_deg_s": 2.0,
+    "coulomb_transition_deg_s": 1.8,
+    "stribeck": false,
+    "stribeck_speed_deg_s": 2.0,
+    "load_friction": false,
+    "seed": 0
+  },
+  "phases": [
+    {
+      "phase": "A_gravity",
+      "observations": 0,
+      "duration_s": 1.208,
+      "peak_temperature_c": 0.0,
+      "peak_speed_deg_s": 0.0,
+      "peak_current_a": 0.0,
+      "detail": {
+        "condition_number": 1.0466933428485787,
+        "candidates_screened": 200,
+        "rejected_by_collision": 0,
+        "rejected_by_path": 0,
+        "travel_deg": 1612.7,
+        "poses": 24
+      },
+      "aborted": "operator stop"
+    }
+  ],
+  "joints": [],
+  "validation_rms_a": [],
+  "validation_samples": 0,
+  "aborted": "operator stop",
+  "complete": false,
+  "verdict": {
+    "state": "fail",
+    "joints": [],
+    "failed_joints": []
+  },
+  "mode": "rehearsal",
+  "rehearsal_check": {
+    "available": false
+  }
+}

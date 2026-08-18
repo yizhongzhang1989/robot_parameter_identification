@@ -154,6 +154,10 @@ $('btn-rehearse').addEventListener('click', () => post('/api/campaign', { mode: 
 $('btn-hardware').addEventListener('click', () => post('/api/campaign', {
   mode: 'hardware', acknowledgement: $('ack').value.trim(),
 }));
+$('btn-home').addEventListener('click', () => {
+  if (!confirm('Home the arm? Every joint drives back to zero.')) return;
+  post('/api/home', { acknowledgement: $('ack').value.trim() });
+});
 $('btn-stop').addEventListener('click', () => post('/api/stop', {}));
 
 /* ---------------- render ---------------- */
@@ -210,10 +214,14 @@ function renderRun(snapshot) {
   $('run-state').className = 'state' + (running ? ' running' : '');
   $('btn-rehearse').disabled = running || !snapshot.have_model;
   $('btn-hardware').disabled = running || !snapshot.rehearsal_passed;
+  // Homing does not use the identification maths, so no rehearsal gate; it
+  // still moves the arm, so the acknowledgement is checked server side.
+  $('btn-home').disabled = running || !snapshot.have_model;
   $('btn-stop').disabled = !running;
   $('ack-hint').textContent = snapshot.rehearsal_passed
-    ? `Type ${snapshot.acknowledgement} to enable the hardware run.`
-    : 'A rehearsal must pass before the arm is allowed to move.';
+    ? `Type ${snapshot.acknowledgement} to enable the hardware run or homing.`
+    : 'A rehearsal must pass before a campaign may move the arm. '
+      + 'Homing needs the acknowledgement only.';
 
   const progress = snapshot.progress || {};
   const current = progress.phase || '';
@@ -230,6 +238,7 @@ function renderRun(snapshot) {
   if (progress.elapsed_s != null) bits.push(`${Math.round(progress.elapsed_s)}s`);
   if (progress.observations != null) bits.push(`${progress.observations} samples`);
   if (progress.pose != null) bits.push(`pose ${progress.pose}/${progress.poses ?? '?'}`);
+  if (progress.worst_deg != null) bits.push(`worst ${progress.worst_deg}\u00b0 from zero`);
   $('progress-line').textContent = bits.join(' · ') || 'not started';
   const failed = progress.phase === 'failed';
   if (progress.error) {

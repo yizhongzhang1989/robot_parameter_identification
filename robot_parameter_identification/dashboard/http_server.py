@@ -26,6 +26,9 @@ def build_routes(service, node=None) -> dict:
                           lambda body: service.start(
                               str(body.get("mode", "rehearsal")),
                               str(body.get("acknowledgement", "")))),
+        "/api/home": ("POST",
+                      lambda body: service.home(
+                          str(body.get("acknowledgement", "")))),
         "/api/stop": ("POST", lambda _body: service.stop()),
     }
 

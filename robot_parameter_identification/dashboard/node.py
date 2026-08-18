@@ -255,12 +255,17 @@ class DashboardNode(Node):
                 return True
         return False
 
-    def hardware_plant(self, profile, collision_scene):
+    def hardware_plant(self, profile, collision_scene,
+                       require_neutral_start: bool = True,
+                       maximum_speed_deg_s: float | None = None):
         from ..plants.ros_control import HardwareConfig, HardwarePlant  # noqa: PLC0415
 
         config = HardwareConfig(
             action=self.service.config.commands.follow_joint_trajectory_action,
-            state_topic=self._spec.topic())
+            state_topic=self._spec.topic(),
+            require_neutral_start=require_neutral_start)
+        if maximum_speed_deg_s is not None:
+            config.maximum_speed_deg_s = float(maximum_speed_deg_s)
         # The plant must build its OWN node, context and executor. Lending it
         # this one puts the campaign thread and rclpy.spin() on the same wait
         # set, which corrupts it and takes the dashboard down mid-run.

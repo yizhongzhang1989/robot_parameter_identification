@@ -35,6 +35,9 @@ MAX_PLOT_POINTS = 1500
 # completes proves the code executes, not that it computes.
 REHEARSAL_NOISE = 0.002
 REHEARSAL_TOLERANCE = 0.02
+# Homing is a recovery move from an unknown pose, so it goes slowly whatever
+# speed the campaign was configured for.
+HOMING_SPEED_DEG_S = 10.0
 
 
 @dataclass
@@ -295,10 +298,78 @@ class IdentificationService:
         self._abort.set()
         return {"ok": True, "message": "stop requested"}
 
+    def home(self, acknowledgement: str = "") -> dict:
+        """Drive every joint back to neutral.
+
+        A campaign leaves the arm wherever validation ended, and the hardware
+        plant refuses to start more than a degree from neutral, so without this
+        the next run cannot be armed without hand-driving the arm.
+        """
+        if not self.have_model():
+            return {"ok": False, "message": "no /robot_description yet"}
+        if self.profile is None:
+            return {"ok": False, "message": "no robot profile loaded"}
+        with self._lock:
+            if self._state != IDLE:
+                return {"ok": False, "message": f"{self._activity} is running"}
+            if acknowledgement != ACKNOWLEDGEMENT:
+                return {"ok": False,
+                        "message": "homing moves the arm, so it needs the "
+                                   "operator acknowledgement"}
+            self._state = RUNNING
+            self._activity = "homing"
+            self._abort.clear()
+            self._started_at = time.monotonic()
+            self.progress = {"mode": "homing", "phase": "starting"}
+        self._worker = threading.Thread(
+            target=self._run_home, daemon=True, name="identification-homing")
+        self._worker.start()
+        return {"ok": True, "message": "homing started"}
+
+    def _run_home(self) -> None:
+        plant = None
+        try:
+            if self.bridge is None:
+                raise RuntimeError("no ROS bridge; cannot drive hardware")
+            # The neutral check exists to refuse campaigns that start off-home.
+            # Homing is the one job that must run precisely then.
+            plant = self.bridge.hardware_plant(
+                self.profile, self.scene,
+                require_neutral_start=False,
+                maximum_speed_deg_s=HOMING_SPEED_DEG_S)
+            before = [float(v) for v in plant.sample()["position_deg"]]
+            self._on_progress("moving",
+                              {"from_deg": [round(v, 2) for v in before]})
+            if self._abort.is_set():
+                raise RuntimeError("stopped before the arm moved")
+            plant.park()
+            after = [float(v) for v in plant.sample()["position_deg"]]
+            worst = max(abs(v) for v in after)
+            self.note(f"homed: worst joint {worst:.3f} deg from neutral")
+            with self._lock:
+                self.progress = {
+                    "mode": "homing", "phase": "homed",
+                    "elapsed_s": time.monotonic() - self._started_at,
+                    "from_deg": [round(v, 2) for v in before],
+                    "to_deg": [round(v, 3) for v in after],
+                    "worst_deg": round(worst, 3),
+                }
+        except Exception as error:  # noqa: BLE001 - a crash must not be silent
+            self.note(f"homing failed: {error}")
+            self.progress = {"mode": "homing", "phase": "failed",
+                             "error": str(error),
+                             "traceback": traceback.format_exc()[-2000:]}
+        finally:
+            self._release(plant)
+            with self._lock:
+                self._state = IDLE
+                self._activity = ""
+
     def running(self) -> bool:
         return self._state == RUNNING
 
     def _run(self, mode: str) -> None:
+        plant = None
         try:
             plant = self._build_plant(mode)
             run = campaign_module.Campaign(
@@ -314,9 +385,20 @@ class IdentificationService:
                              "error": str(error),
                              "traceback": traceback.format_exc()[-2000:]}
         finally:
+            self._release(plant)
             with self._lock:
                 self._state = IDLE
                 self._activity = ""
+
+    def _release(self, plant) -> None:
+        """A hardware plant owns a ROS context; leaving it open leaks it."""
+        closer = getattr(plant, "close", None)
+        if closer is None:
+            return
+        try:
+            closer()
+        except Exception as error:  # noqa: BLE001
+            self.note(f"plant did not close cleanly: {error}")
 
     def _on_progress(self, phase: str, detail: dict) -> None:
         # Within a phase, updates report different things -- pose index here,

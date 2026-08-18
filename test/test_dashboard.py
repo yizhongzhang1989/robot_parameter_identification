@@ -111,6 +111,131 @@ class RunGateTest(unittest.TestCase):
             self.assertIn(key, snapshot)
 
 
+class FakePlant:
+    """Enough of a hardware plant to check the homing plumbing."""
+
+    def __init__(self, position):
+        self.position = list(position)
+        self.parked = False
+        self.closed = False
+        self.opened_with = {}
+
+    def sample(self):
+        return {"position_deg": list(self.position)}
+
+    def park(self):
+        self.parked = True
+        self.position = [0.0] * len(self.position)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeBridge:
+    def __init__(self, plant):
+        self.plant = plant
+
+    def hardware_plant(self, profile, scene, **kwargs):
+        self.plant.opened_with = dict(kwargs)
+        return self.plant
+
+    def health(self):
+        return {"telemetry_ok": True, "action_ok": True, "sample_age_s": 0.01,
+                "description_ok": True}
+
+    def latest_sample(self):
+        return {"position_deg": list(self.plant.position)}
+
+
+class HomingTest(unittest.TestCase):
+    """A campaign leaves the arm off-home; this is how it gets back."""
+
+    def homing_service(self, position):
+        plant = FakePlant(position)
+        made = IdentificationService(DashboardConfig(), bridge=FakeBridge(plant),
+                                     profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        return made, plant
+
+    def wait(self, made):
+        import time
+
+        deadline = time.monotonic() + 30
+        while made.running() and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+    def test_homing_needs_the_acknowledgement(self):
+        made, plant = self.homing_service([5.0] * 7)
+        answer = made.home("please")
+        self.assertFalse(answer["ok"])
+        self.assertIn("acknowledgement", answer["message"])
+        self.assertFalse(plant.parked)
+
+    def test_homing_is_refused_while_something_runs(self):
+        made, _plant = self.homing_service([5.0] * 7)
+        made._state = "running"
+        made._activity = "campaign_rehearsal"
+        answer = made.home(ACKNOWLEDGEMENT)
+        self.assertFalse(answer["ok"])
+        self.assertIn("running", answer["message"])
+
+    def test_homing_needs_a_model(self):
+        blank = IdentificationService(DashboardConfig(), profile=test_profile())
+        self.assertFalse(blank.home(ACKNOWLEDGEMENT)["ok"])
+
+    def test_homing_does_not_need_a_rehearsal(self):
+        # It drives no identification, so the rehearsal gate would only stop
+        # an operator recovering an arm the plant already refuses to arm.
+        made, plant = self.homing_service([5.0] * 7)
+        self.assertFalse(made.rehearsal_passed)
+        self.assertTrue(made.home(ACKNOWLEDGEMENT)["ok"])
+        self.wait(made)
+        self.assertTrue(plant.parked)
+
+    def test_homing_waives_the_neutral_start_check(self):
+        # That check exists to refuse campaigns off home. Homing is the one
+        # job that must be allowed to run precisely then.
+        made, plant = self.homing_service([40.0] * 7)
+        made.home(ACKNOWLEDGEMENT)
+        self.wait(made)
+        self.assertIs(plant.opened_with.get("require_neutral_start"), False)
+
+    def test_homing_reports_where_it_started_and_ended(self):
+        made, _plant = self.homing_service([5.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        made.home(ACKNOWLEDGEMENT)
+        self.wait(made)
+        progress = made.snapshot()["progress"]
+        self.assertEqual(progress["phase"], "homed")
+        self.assertEqual(progress["from_deg"][0], 5.0)
+        self.assertEqual(progress["worst_deg"], 0.0)
+
+    def test_the_plant_is_released_afterwards(self):
+        # A hardware plant owns a ROS context; not closing it leaks one per run.
+        made, plant = self.homing_service([5.0] * 7)
+        made.home(ACKNOWLEDGEMENT)
+        self.wait(made)
+        self.assertTrue(plant.closed)
+
+    def test_the_service_is_idle_again(self):
+        made, _plant = self.homing_service([5.0] * 7)
+        made.home(ACKNOWLEDGEMENT)
+        self.wait(made)
+        self.assertEqual(made.snapshot()["state"], "idle")
+
+    def test_releasing_tolerates_a_plant_that_cannot_be_closed(self):
+        made, _plant = self.homing_service([0.0] * 7)
+        made._release(object())
+        made._release(None)
+
+    def test_homing_is_reachable_over_http(self):
+        made, _plant = self.homing_service([0.0] * 7)
+        routes = build_routes(made, None)
+        self.assertIn("/api/home", routes)
+        self.assertEqual(routes["/api/home"][0], "POST")
+        answer = routes["/api/home"][1]({"acknowledgement": "nope"})
+        self.assertFalse(answer["ok"])
+
+
 class ViewerStateTest(unittest.TestCase):
     def test_viewer_reports_no_model_before_one_arrives(self):
         self.assertFalse(
