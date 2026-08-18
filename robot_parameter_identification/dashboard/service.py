@@ -260,6 +260,9 @@ class IdentificationService:
             self._abort.clear()
             self._started_at = time.monotonic()
             self._samples = []
+            # The previous run's verdict is not this run's; leaving it up reads
+            # as though the campaign now moving has already passed.
+            self.result = None
             self.progress = {"mode": self._activity, "phase": "starting"}
         self._worker = threading.Thread(
             target=self._run, args=(mode,), daemon=True,
@@ -295,14 +298,16 @@ class IdentificationService:
                 self._activity = ""
 
     def _on_progress(self, phase: str, detail: dict) -> None:
-        # Phases report different things -- pose index here, sample count there.
-        # Replacing the dict would blank whichever one this update omits.
+        # Within a phase, updates report different things -- pose index here,
+        # sample count there -- so they merge. Across a phase boundary they
+        # do not, or the old phase's pose index would haunt the new one.
         with self._lock:
-            merged = dict(self.progress)
-            merged.update({"mode": self._activity, "phase": phase,
-                           "elapsed_s": time.monotonic() - self._started_at})
-            merged.update(detail or {})
-            self.progress = merged
+            carried = (dict(self.progress)
+                       if self.progress.get("phase") == phase else {})
+            carried.update({"mode": self._activity, "phase": phase,
+                            "elapsed_s": time.monotonic() - self._started_at})
+            carried.update(detail or {})
+            self.progress = carried
 
     def _finish(self, mode: str, result, observations) -> None:
         payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)

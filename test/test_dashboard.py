@@ -229,6 +229,24 @@ class StopTest(unittest.TestCase):
         # A half-measured model must never unlock the hardware button.
         self.assertFalse(snapshot["rehearsal_passed"])
 
+    def test_starting_clears_the_previous_verdict(self):
+        import time
+
+        made = IdentificationService(DashboardConfig())
+        made.adopt_description(synthetic_urdf())
+        made.adopt_driven_joints(
+            [f"{PREFIX}joint{index}" for index in range(1, 4)])
+        made.result = {"complete": True, "verdict": {"state": "pass"}}
+        self.assertTrue(made.start("rehearsal")["ok"])
+        try:
+            # A stale pass must not be readable as this run's outcome.
+            self.assertIsNone(made.snapshot()["result"])
+        finally:
+            made.stop()
+            deadline = time.monotonic() + 60
+            while made.running() and time.monotonic() < deadline:
+                time.sleep(0.1)
+
 
 class ProgressTest(unittest.TestCase):
     """Phases report different fields; none may erase another's."""
@@ -257,6 +275,13 @@ class ProgressTest(unittest.TestCase):
         made._started_at = 0.0
         made._on_progress("B_friction", {})
         self.assertGreater(made.progress["elapsed_s"], 0.0)
+
+    def test_a_new_phase_drops_the_old_phase_fields(self):
+        made = self.service()
+        made._on_progress("A_gravity", {"pose": 24, "poses": 24})
+        made._on_progress("B_friction", {"observations": 5})
+        self.assertNotIn("pose", made.progress)
+        self.assertEqual(made.progress["observations"], 5)
 
 
 class HttpTest(unittest.TestCase):
