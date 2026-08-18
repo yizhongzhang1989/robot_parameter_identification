@@ -206,14 +206,16 @@ class DashboardNode(Node):
         }
 
     def _action_available(self) -> bool:
+        """Whether anyone is offering the trajectory action.
+
+        An action is not a topic, but rclpy exposes its feedback and status
+        under ``<action>/_action/``, and those are enough to answer the only
+        question the operator has: is there a server there.
+        """
         name = self.service.config.commands.follow_joint_trajectory_action
-        base = name.rsplit("/follow_joint_trajectory", 1)[0]
-        for action, _types in self.get_node_names_and_namespaces():
-            del action
-        # Action servers are not listed by topic introspection alone; probing
-        # the goal topic is enough to tell the operator whether anyone is there.
+        prefix = f"{name}/_action/"
         for topic, _types in self.get_topic_names_and_types():
-            if topic.startswith(f"{base}/") and "goal" in topic:
+            if topic.startswith(prefix):
                 return True
         return False
 

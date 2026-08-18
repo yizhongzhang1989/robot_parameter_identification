@@ -61,6 +61,14 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args) -> None:  # noqa: A003
         return
 
+    def handle_one_request(self) -> None:
+        # A browser closing a poll mid-flight is routine; the base class logs it
+        # as an unhandled exception and buries the real messages.
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
