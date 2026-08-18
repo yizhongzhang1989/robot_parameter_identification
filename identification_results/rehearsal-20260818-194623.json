@@ -1,0 +1,20 @@
+{
+  "complete": true,
+  "joints": [],
+  "mode": "rehearsal",
+  "effort_source": "current",
+  "effort_unit": "ampere",
+  "joint_names": [
+    "right_arm_joint1",
+    "right_arm_joint2",
+    "right_arm_joint3",
+    "right_arm_joint4",
+    "right_arm_joint5",
+    "right_arm_joint6",
+    "right_arm_joint7"
+  ],
+  "action": "/joint_trajectory_controller/follow_joint_trajectory",
+  "rehearsal_check": {
+    "available": false
+  }
+}

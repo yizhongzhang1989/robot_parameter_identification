@@ -11,6 +11,8 @@ try:
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
         DashboardConfig, IdentificationService)
+    from robot_parameter_identification.interfaces import (
+        SignalMap, TelemetrySpec)
     from fixtures import synthetic_urdf, test_profile, PREFIX
 except ImportError as error:
     raise unittest.SkipTest(f"needs pinocchio: {error}") from error
@@ -115,6 +117,32 @@ class RunGateTest(unittest.TestCase):
 
     def test_no_acknowledgement_is_demanded_anywhere(self):
         self.assertNotIn("acknowledgement", service().snapshot())
+
+
+class ResultProvenanceTest(unittest.TestCase):
+    """A result file has to say which arm and which quantity it describes."""
+
+    def test_the_saved_result_names_the_arm_and_the_effort(self):
+        made = service()
+        made.adopt_driven_joints(
+            [f"{PREFIX}joint{index}" for index in range(1, 8)])
+        made._finish("rehearsal", {"complete": True, "joints": []}, [])
+        result = made.snapshot()["result"]
+        self.assertEqual(result["joint_names"][0], f"{PREFIX}joint1")
+        self.assertIn("action", result)
+        self.assertEqual(result["effort_source"], "current")
+        self.assertEqual(result["effort_unit"], "ampere")
+
+    def test_a_torque_run_is_not_labelled_amperes(self):
+        made = IdentificationService(
+            DashboardConfig(telemetry=TelemetrySpec(
+                signals=SignalMap(current=None, torque="torque",
+                                  effort_source="torque"))),
+            profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        made._finish("rehearsal", {"complete": True, "joints": []}, [])
+        self.assertEqual(made.snapshot()["result"]["effort_unit"],
+                         "newton_metre")
 
 
 class FakePlant:
@@ -445,6 +473,76 @@ class SpeedRequestTest(unittest.TestCase):
     def test_zero_keeps_the_conservative_default(self):
         made = self.service(0.0)
         self.assertLessEqual(made.plan.maximum_speed_deg_s, 20.0)
+
+
+class GuardTest(unittest.TestCase):
+    """A named interface is not protection; the panel used to imply it was."""
+
+    def monitor(self, **kwargs):
+        from robot_parameter_identification.campaign import DriveMonitor
+
+        return DriveMonitor(**kwargs)
+
+    def test_a_disabled_drive_stops_the_run(self):
+        trip = self.monitor().check({"enabled": [True, False, True]}, 0.0)
+        self.assertIn("joint2", trip)
+        self.assertIn("disabled", trip)
+
+    def test_a_fault_word_stops_the_run(self):
+        trip = self.monitor().check({"enabled": [True], "fault_code": [7]}, 0.0)
+        self.assertIn("fault code 7", trip)
+
+    def test_a_healthy_frame_passes(self):
+        self.assertIsNone(self.monitor().check(
+            {"enabled": [True] * 3, "fault_code": [0] * 3}, 0.0))
+
+    def test_channels_the_robot_lacks_are_skipped_not_tripped(self):
+        self.assertIsNone(self.monitor().check({}, 0.0))
+
+    def test_voltage_is_only_checked_when_a_window_was_supplied(self):
+        without = self.monitor().check({"voltage_v": [999.0]}, 0.0)
+        self.assertIsNone(without)
+        with_window = self.monitor(minimum_voltage_v=20.0,
+                                   maximum_voltage_v=30.0)
+        self.assertIn("999.0 V", with_window.check({"voltage_v": [999.0]}, 0.0))
+
+    def test_a_derived_profile_does_not_arm_the_voltage_window(self):
+        # Its window is a default, and aborting a good run on a guessed
+        # threshold is worse than not checking.
+        made = service()
+        made.profile_source = "derived"
+        self.assertNotIn("bus-voltage window", made._monitor().guards())
+
+    def test_an_unmapped_signal_reports_its_guard_dark(self):
+        made = IdentificationService(
+            DashboardConfig(telemetry=TelemetrySpec(
+                signals=SignalMap(enabled=None, fault_code=None))),
+            profile=test_profile())
+        dark = made.connection()["missing_guards"]
+        self.assertIn("drive-enabled check", dark)
+        self.assertIn("fault-code check", dark)
+
+    def test_a_mapped_signal_that_never_arrives_still_reports_dark(self):
+        # This is the case the old reporting got wrong: it trusted the name.
+        made = IdentificationService(
+            DashboardConfig(telemetry=TelemetrySpec(
+                signals=SignalMap(enabled="enabled", fault_code="fault_code"))),
+            bridge=SilentBridge(), profile=test_profile())
+        self.assertIn("drive-enabled check", made.connection()["missing_guards"])
+
+
+class SilentBridge:
+    """A robot that names its interfaces but publishes none of them."""
+
+    def health(self):
+        return {"telemetry_ok": False, "action_ok": False, "sample_age_s": None,
+                "description_ok": False}
+
+    def observed_signals(self):
+        return {"position", "effort"}
+
+    def latest_sample(self):
+        return None
 
 
 class HttpTest(unittest.TestCase):

@@ -53,9 +53,12 @@ class DashboardNode(Node):
                 torque=_optional(get("signal.torque", "")),
                 effort_source=str(get("effort_source", "current")),
                 temperature=_optional(get("signal.temperature", "temperature")),
+                # Mapped by default: both are unambiguous on any drive and
+                # need no threshold guessed. The bus-voltage window does need
+                # one, so it stays off until an operator supplies a profile.
+                enabled=_optional(get("signal.enabled", "enabled")),
+                fault_code=_optional(get("signal.fault_code", "fault_code")),
                 voltage=_optional(get("signal.voltage", "")),
-                enabled=_optional(get("signal.enabled", "")),
-                fault_code=_optional(get("signal.fault_code", "")),
             ))
         commands = CommandSpec(
             follow_joint_trajectory_action=str(get(
@@ -85,6 +88,7 @@ class DashboardNode(Node):
         self._lock = threading.Lock()
         self._sample: dict | None = None
         self._sample_at = 0.0
+        self._observed: set = set()
         self._visuals: list[dict] = []
         self._package_dirs: dict[str, Path] = {}
 
@@ -223,6 +227,8 @@ class DashboardNode(Node):
         with self._lock:
             self._sample = sample
             self._sample_at = time.monotonic()
+            self._observed = {role for role, values in rows.items()
+                              if len(values) == count}
 
     def latest_sample(self) -> dict | None:
         with self._lock:
@@ -241,6 +247,11 @@ class DashboardNode(Node):
             "sample_age_s": None if age is None else round(age, 3),
             "action_ok": self._action_available(),
         }
+
+    def observed_signals(self) -> set:
+        """Roles that have actually arrived, not merely been named."""
+        with self._lock:
+            return set(self._observed)
 
     def _action_available(self) -> bool:
         """Whether anyone is offering the trajectory action.

@@ -1,0 +1,15 @@
+........................................................................ [ 32%]
+........................................................................ [ 65%]
+........................................................................ [ 97%]
+.....                                                                    [100%]
+=============================== warnings summary ===============================
+test/test_dashboard.py::RehearsalEndToEndTest::test_a_result_was_produced
+  /usr/lib/python3/dist-packages/scipy/__init__.py:146: UserWarning: A NumPy version >=1.17.3 and <1.25.0 is required for this version of SciPy (detected version 1.26.4
+    warnings.warn(f"A NumPy version >={np_minversion} and <{np_maxversion}"
+
+-- Docs: https://docs.pytest.org/en/stable/warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] test/test_campaign.py:14: unittest.case.SkipTest: campaign needs pinocchio and mujoco: cannot import name 'simulation' from 'robot_parameter_identification.plants' (/home/robot/Documents/robot_parameter_identification/robot_parameter_identification/plants/__init__.py)
+SKIPPED [1] test/test_hardware.py:11: unittest.case.SkipTest: hardware module unavailable: cannot import name 'trajectory_controller' from 'robot_parameter_identification.plants' (/home/robot/Documents/robot_parameter_identification/robot_parameter_identification/plants/__init__.py)
+SKIPPED [1] test/test_model.py:13: unittest.case.SkipTest: needs pinocchio and mujoco: cannot import name 'simulation' from 'robot_parameter_identification.plants' (/home/robot/Documents/robot_parameter_identification/robot_parameter_identification/plants/__init__.py)
+221 passed, 3 skipped, 1 warning in 9.59s

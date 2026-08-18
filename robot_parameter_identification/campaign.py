@@ -109,6 +109,49 @@ class EnvelopeMonitor(Protocol):
 
 
 @dataclass
+class DriveMonitor:
+    """Stops the run when the drives themselves say they are unfit to move.
+
+    Only checks quantities that need no guessed threshold. A disabled drive and
+    a non-zero fault word mean the same thing on every arm. The bus-voltage
+    window does not: a derived profile carries a default, not a measurement, so
+    it is checked only when an operator supplied one.
+
+    Channels the robot does not publish arrive empty and are skipped, so a
+    partially instrumented arm gets the checks it can support rather than none.
+    """
+
+    minimum_voltage_v: float | None = None
+    maximum_voltage_v: float | None = None
+    # Campaign frames are pulled synchronously, so a gap between them is
+    # deliberate dwell rather than lost telemetry; kept for protocol parity.
+    last_sample_at: float | None = None
+
+    def check(self, sample: dict, now: float) -> str | None:
+        for index, live in enumerate(sample.get("enabled") or []):
+            if not live:
+                return f"joint{index + 1} reports its drive disabled"
+        for index, code in enumerate(sample.get("fault_code") or []):
+            if code:
+                return f"joint{index + 1} reports fault code {int(code)}"
+        if self.minimum_voltage_v is None or self.maximum_voltage_v is None:
+            return None
+        for index, volts in enumerate(sample.get("voltage_v") or []):
+            if not self.minimum_voltage_v <= volts <= self.maximum_voltage_v:
+                return (f"joint{index + 1} bus at {volts:.1f} V, outside "
+                        f"{self.minimum_voltage_v:.1f}-"
+                        f"{self.maximum_voltage_v:.1f} V")
+        return None
+
+    def guards(self) -> tuple[str, ...]:
+        """What this monitor is actually able to enforce."""
+        active = ["drive-enabled check", "fault-code check"]
+        if self.minimum_voltage_v is not None:
+            active.append("bus-voltage window")
+        return tuple(active)
+
+
+@dataclass
 class Observation:
     """One usable sample: a state and the current it required."""
 
@@ -482,6 +525,8 @@ MONITORED_FIELDS = (
 def _fully_instrumented(sample: dict) -> bool:
     # Empty, not just absent: a plant on an arm without a bus-voltage interface
     # reports the key with nothing in it, and that is not instrumentation.
+    # Kept for callers that want to know; the monitor no longer waits for it,
+    # because a guard that can run on the channels present should run.
     return all(sample.get(field) for field in MONITORED_FIELDS)
 
 
@@ -535,7 +580,7 @@ class Campaign:
         # Current is an outcome here, not a command: phases A to C are position
         # controlled, so the only honest current limit is the measured one.
         # The commissioned monitor owns those thresholds.
-        if self.monitor is not None and _fully_instrumented(sample):
+        if self.monitor is not None:
             # The stall detector belongs to the streaming current-control loop.
             # Campaign frames are pulled synchronously, so the gap between them
             # is deliberate dwell at a pose, not lost telemetry.

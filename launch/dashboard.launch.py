@@ -49,9 +49,14 @@ TEXT_ARGUMENTS = (
      "interface carrying joint torque; blank if the drive has none"),
     ("signal.temperature", "temperature",
      "interface carrying joint temperature; blank disables the thermal guard"),
-    ("signal.voltage", "", "blank disables the bus-voltage guard"),
-    ("signal.enabled", "", "blank disables the drive-enabled guard"),
-    ("signal.fault_code", "", "blank disables the fault guard"),
+    ("signal.enabled", "enabled",
+     "interface carrying the drive-enabled flag; blank disables that guard"),
+    ("signal.fault_code", "fault_code",
+     "interface carrying the drive fault word; blank disables that guard"),
+    ("signal.voltage", "",
+     "interface carrying bus voltage. Mapping it only enables the guard when "
+     "a written profile supplies the window, because a derived profile's "
+     "window is a default rather than a measurement."),
 )
 
 NUMERIC_ARGUMENTS = (

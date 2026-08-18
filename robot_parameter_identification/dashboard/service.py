@@ -265,6 +265,10 @@ class IdentificationService:
     def connection(self) -> dict:
         described = self.config.telemetry.describe()
         described["action"] = self.config.commands.follow_joint_trajectory_action
+        # A guard is live only if the signal is mapped, the data actually
+        # arrives, and something enforces it. Naming an interface is not
+        # protection, and the panel used to imply it was.
+        described["missing_guards"] = list(self._dark_guards())
         if self.bridge is None:
             described.update(
                 {"telemetry_ok": False, "action_ok": False, "sample_age_s": None,
@@ -404,7 +408,8 @@ class IdentificationService:
             run = campaign_module.Campaign(
                 self.arm, plant, self.plan,
                 progress=self._on_progress,
-                should_stop=self._abort.is_set)
+                should_stop=self._abort.is_set,
+                monitor=self._monitor())
             self.progress = {"mode": mode, "phase": "starting"}
             result = run.run()
             self._finish(mode, result, run.observations)
@@ -418,6 +423,36 @@ class IdentificationService:
             with self._lock:
                 self._state = IDLE
                 self._activity = ""
+
+    def _monitor(self):
+        """The drive guards, with the voltage window only when it was supplied.
+
+        A derived profile's window is a default rather than a measurement, and
+        aborting a good run against a guessed threshold is worse than not
+        checking; the panel says which guards are live either way.
+        """
+        written = self.profile is not None and self.profile_source == "configured"
+        return campaign_module.DriveMonitor(
+            minimum_voltage_v=self.profile.minimum_voltage_v if written else None,
+            maximum_voltage_v=self.profile.maximum_voltage_v if written else None)
+
+    def _dark_guards(self) -> tuple[str, ...]:
+        """Guards that will not fire, and why is not the operator's problem."""
+        signals = self.config.telemetry.signals
+        observed = set()
+        if self.bridge is not None:
+            observed = set(getattr(self.bridge, "observed_signals", set)() or ())
+        live = set(self._monitor().guards())
+        dark = []
+        for guard, role in (("temperature ceiling", "temperature"),
+                            ("drive-enabled check", "enabled"),
+                            ("fault-code check", "fault_code"),
+                            ("bus-voltage window", "voltage")):
+            mapped = bool(getattr(signals, role, None))
+            enforced = guard == "temperature ceiling" or guard in live
+            if not mapped or not enforced or (observed and role not in observed):
+                dark.append(guard)
+        return tuple(dark)
 
     def _release(self, plant) -> None:
         """A hardware plant owns a ROS context; leaving it open leaks it."""
@@ -444,6 +479,16 @@ class IdentificationService:
     def _finish(self, mode: str, result, observations) -> None:
         payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)
         payload["mode"] = mode
+        # The per-joint fields are named _a for historical reasons but hold
+        # whichever effort was regressed, so the file has to say which.
+        signals = self.config.telemetry.signals
+        payload["effort_source"] = signals.effort_source
+        payload["effort_unit"] = signals.effort_unit
+        # Without these a file cannot say which arm it describes, and two arms
+        # writing into one directory become indistinguishable a week later.
+        payload["joint_names"] = list(self.driven_joints) or (
+            list(self.profile.joint_names) if self.profile else [])
+        payload["action"] = self.config.commands.follow_joint_trajectory_action
         payload.update(self._plot_data(payload, observations))
         aborted = payload.get("aborted")
         recovery = {} if mode == "hardware" else self._check_recovery(payload)

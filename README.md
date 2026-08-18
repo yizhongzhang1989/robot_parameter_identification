@@ -44,13 +44,19 @@ telemetry:
   dynamic_joint_state_topic: /dynamic_joint_states
   signals:
     position: position
-    velocity: velocity
-    effort: motor_current
+    velocity: velocity      # null differentiates position instead
+    current: motor_current  # null if the drive reports no current
+    torque: null            # map both if the drive reports both
+    effort_source: current  # which one the fit regresses against
     temperature: temp
-    enabled: null          # not published; the enable guard is reported off
+    enabled: null           # not published; the enable guard is reported off
     fault_code: null
-    effort_unit: ampere    # or newton_metre
 ```
+
+The unit of every identified parameter follows from `effort_source`, so it
+cannot disagree with the channel actually read: `current` gives amperes,
+`torque` gives newton-metres. A drive reporting both records the one it does
+not fit alongside.
 
 The dashboard states which guards are dark because a signal is unmapped, rather
 than skipping them silently.
@@ -102,8 +108,11 @@ any good:
   the experiment barely moved is visible rather than merely reported.
 - **Parameters** — per joint, badged physical or unphysical.
 
-A hardware run is gated twice: a rehearsal must pass first, and the operator
-must type the acknowledgement. The connection panel names any guard that is dark
+A hardware run is gated once: a rehearsal must pass first. That gate is not
+ceremony -- the rehearsal plants known friction and has to find it again, and it
+is what caught the fit quietly returning zero. Homing is not gated, because it
+runs no identification and its whole purpose is recovering an arm the plant
+already refuses to arm. The connection panel names any guard that is dark
 because the robot does not publish its signal.
 
 ## Status

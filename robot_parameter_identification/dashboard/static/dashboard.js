@@ -300,8 +300,8 @@ function renderResult(snapshot) {
     const friction = entry.friction || {};
     const physical = (friction.coulomb ?? 0) >= 0 && (friction.viscous ?? 0) >= 0;
     return `<div class="param-row"><span>J${i + 1}</span>`
-      + `<span class="muted">c ${(friction.coulomb ?? 0).toFixed(3)}`
-      + ` · v ${(friction.viscous ?? 0).toFixed(4)}</span>`
+      + `<span class="muted">c ${(friction.coulomb ?? 0).toFixed(3)} ${state.unit}`
+      + ` \u00b7 v ${(friction.viscous ?? 0).toFixed(4)} ${state.unit}/(\u00b0/s)</span>`
       + `<span class="badge ${physical ? 'ok' : 'bad'}">`
       + `${physical ? 'physical' : 'unphysical'}</span></div>`;
   }).join('') || '<span class="muted">no result yet</span>';
