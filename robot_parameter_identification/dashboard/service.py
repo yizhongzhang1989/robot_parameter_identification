@@ -294,13 +294,19 @@ class IdentificationService:
         payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)
         payload["mode"] = mode
         payload.update(self._plot_data(payload, observations))
+        aborted = payload.get("aborted")
         with self._lock:
             self.result = payload
-            self.progress = {"mode": mode, "phase": "finished"}
+            # A stopped run that still says "finished" is how a half-measured
+            # model gets mistaken for a complete one.
+            self.progress = {"mode": mode,
+                             "phase": "stopped" if aborted else "finished"}
+            if aborted:
+                self.progress["error"] = str(aborted)
             if mode != "hardware":
                 self.rehearsal_passed = bool(payload.get("complete"))
         self._write(payload, mode)
-        self.note(f"{mode} run complete")
+        self.note(f"{mode} run {'stopped: ' + str(aborted) if aborted else 'complete'}")
 
     def _plot_data(self, payload: dict, observations) -> dict:
         """Scatter data for the charts, thinned to something a browser can draw.

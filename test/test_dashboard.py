@@ -191,6 +191,30 @@ class RehearsalEndToEndTest(unittest.TestCase):
             self.assertGreaterEqual(friction["viscous"], 0.0)
 
 
+class StopTest(unittest.TestCase):
+    """Stopping must halt the run and must not be mistaken for finishing."""
+
+    def test_a_stopped_run_is_not_reported_as_finished(self):
+        import time
+
+        made = IdentificationService(DashboardConfig())
+        made.adopt_description(synthetic_urdf())
+        made.adopt_driven_joints(
+            [f"{PREFIX}joint{index}" for index in range(1, 4)])
+        self.assertTrue(made.start("rehearsal")["ok"])
+        made.stop()
+        deadline = time.monotonic() + 60
+        while made.running() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        snapshot = made.snapshot()
+        self.assertEqual(snapshot["state"], "idle")
+        self.assertEqual(snapshot["progress"]["phase"], "stopped")
+        self.assertEqual(snapshot["result"]["aborted"], "operator stop")
+        self.assertFalse(snapshot["result"]["complete"])
+        # A half-measured model must never unlock the hardware button.
+        self.assertFalse(snapshot["rehearsal_passed"])
+
+
 class HttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

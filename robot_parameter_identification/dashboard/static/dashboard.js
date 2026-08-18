@@ -217,10 +217,11 @@ function renderRun(snapshot) {
 
   const progress = snapshot.progress || {};
   const current = progress.phase || '';
+  const done = current === 'finished';
   $('phasebar').innerHTML = PHASES.map((name) => {
     const at = PHASES.indexOf(current);
     const index = PHASES.indexOf(name);
-    const cls = current === name ? 'now' : (at > index || current === 'finished') ? 'done' : '';
+    const cls = current === name ? 'now' : (at > index || done) ? 'done' : '';
     return `<div class="ph ${cls}">${name.split('_')[1]}</div>`;
   }).join('');
 
@@ -230,9 +231,11 @@ function renderRun(snapshot) {
   if (progress.observations != null) bits.push(`${progress.observations} samples`);
   if (progress.pose != null) bits.push(`pose ${progress.pose}/${progress.poses ?? '?'}`);
   $('progress-line').textContent = bits.join(' · ') || 'not started';
+  const failed = progress.phase === 'failed';
   if (progress.error) {
-    $('progress-line').textContent = `failed: ${progress.error}`;
-    $('progress-line').style.color = 'var(--bad)';
+    $('progress-line').textContent =
+      `${failed ? 'failed' : 'stopped'}: ${progress.error}`;
+    $('progress-line').style.color = failed ? 'var(--bad)' : 'var(--warn)';
   } else {
     $('progress-line').style.color = '';
   }
