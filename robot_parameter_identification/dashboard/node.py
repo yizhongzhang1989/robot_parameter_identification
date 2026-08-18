@@ -98,22 +98,19 @@ class DashboardNode(Node):
         for guard in telemetry.signals.missing_guards():
             self.get_logger().warn(f"guard unavailable: {guard}")
 
-    def _declare(self, name: str, default, descriptor=None):
-        # An empty list default is inferred as a byte array, which then refuses
-        # the doubles the operator actually passes, so arrays state their type.
-        if descriptor is not None:
-            self.declare_parameter(name, default, descriptor)
-        else:
-            self.declare_parameter(name, default)
+    def _declare(self, name: str, default):
+        self.declare_parameter(name, default)
         return self.get_parameter(name).value
 
     def _declare_floats(self, name: str) -> list[float]:
-        from rcl_interfaces.msg import ParameterDescriptor, ParameterType  # noqa: PLC0415
+        """A float list parameter, with zero meaning 'not set'.
 
-        value = self._declare(
-            name, [], ParameterDescriptor(
-                type=ParameterType.PARAMETER_DOUBLE_ARRAY))
-        return [float(entry) for entry in (value or [])]
+        An empty list default is inferred as a byte array and then refuses the
+        doubles the operator passes, so the default carries one zero instead.
+        Every value this reads is a positive cap, so zero is unambiguous.
+        """
+        value = self._declare(name, [0.0]) or []
+        return [float(entry) for entry in value if float(entry) > 0.0]
 
     # -- which joints are we identifying ---------------------------------
 
