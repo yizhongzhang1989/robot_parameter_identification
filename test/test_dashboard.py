@@ -126,6 +126,71 @@ class ViewerStateTest(unittest.TestCase):
         self.assertEqual(len(payload["obstacles"]), 1)
 
 
+class RehearsalEndToEndTest(unittest.TestCase):
+    """A whole rehearsal, start to verdict.
+
+    The pieces all passed their own tests while the run still died in phase C
+    on a mistyped trajectory call, so nothing short of running it counts.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import time
+
+        cls.service = IdentificationService(DashboardConfig())
+        cls.service.adopt_description(synthetic_urdf())
+        cls.service.adopt_driven_joints(
+            [f"{PREFIX}joint{index}" for index in range(1, 4)])
+        # Small enough to stay quick, large enough to exercise all four phases.
+        cls.service.plan = cls.service.plan.__class__(
+            static_poses=6, static_candidates=20, settle_samples=1,
+            friction_speeds_deg_s=(2.0, 5.0), fourier_harmonics=2,
+            fourier_duration_s=4.0, fourier_attempts=8, sample_rate_hz=10.0,
+            validation_poses=4, validation_trajectory_s=3.0, seed=1)
+        started = cls.service.start("rehearsal")
+        assert started["ok"], started
+        deadline = time.monotonic() + 120
+        while cls.service.running() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        cls.snapshot = cls.service.snapshot()
+
+    def test_the_run_reached_the_end(self):
+        progress = self.snapshot["progress"]
+        self.assertNotEqual(progress.get("phase"), "failed",
+                            msg=progress.get("traceback", ""))
+        self.assertEqual(progress.get("phase"), "finished")
+
+    def test_a_result_was_produced(self):
+        result = self.snapshot["result"]
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["aborted"])
+        self.assertTrue(result["complete"])
+        self.assertEqual(len(result["joints"]), 3)
+
+    def test_the_verdict_is_reported(self):
+        self.assertIn(self.snapshot["result"]["verdict"]["state"],
+                      ("pass", "warn", "fail"))
+
+    def test_the_charts_have_something_to_draw(self):
+        result = self.snapshot["result"]
+        samples = result.get("friction_samples") or []
+        self.assertEqual(len(samples), 3)
+        self.assertTrue(all(len(series) > 0 for series in samples))
+        first = samples[0][0]
+        self.assertIn("speed", first)
+        self.assertIn("effort", first)
+
+    def test_passing_a_rehearsal_unlocks_the_hardware_button(self):
+        self.assertTrue(self.snapshot["rehearsal_passed"])
+
+    def test_the_injected_friction_is_recovered(self):
+        """The rehearsal is only worth running if it can catch a broken fit."""
+        for entry in self.snapshot["result"]["joints"]:
+            friction = entry["friction"]
+            self.assertGreaterEqual(friction["coulomb"], 0.0)
+            self.assertGreaterEqual(friction["viscous"], 0.0)
+
+
 class HttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

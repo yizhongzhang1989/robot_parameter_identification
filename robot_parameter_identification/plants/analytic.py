@@ -133,10 +133,7 @@ class AnalyticPlant:
         steps = max(2, int(trajectory.duration_s * rate))
         for index in range(steps + 1):
             moment = trajectory.duration_s * index / steps
-            pose = np.asarray(trajectory.position_deg(moment), dtype=float)
-            velocity = np.asarray(trajectory.velocity_deg_s(moment), dtype=float)
-            acceleration = np.asarray(
-                trajectory.acceleration_deg_s2(moment), dtype=float)
+            pose, velocity, acceleration = trajectory.sample(moment)
             self._clock += trajectory.duration_s / steps
             yield self._sample(pose, velocity, acceleration, "track")
 

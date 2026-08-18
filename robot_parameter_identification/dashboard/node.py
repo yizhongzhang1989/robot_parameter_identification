@@ -85,6 +85,7 @@ class DashboardNode(Node):
         self.create_subscription(String, commands.robot_description_topic,
                                  self._on_description, DESCRIPTION_QOS)
         self._subscribe_telemetry(telemetry)
+        self._subscribe_controller_state(commands)
 
         self.server = DashboardServer(self.service, port=port,
                                       mesh_resolver=self._read_mesh, node=self)
@@ -98,6 +99,28 @@ class DashboardNode(Node):
     def _declare(self, name: str, default):
         self.declare_parameter(name, default)
         return self.get_parameter(name).value
+
+    # -- which joints are we identifying ---------------------------------
+
+    def _subscribe_controller_state(self, commands: CommandSpec) -> None:
+        """Ask the controller which joints it drives, rather than being told.
+
+        A dual-arm URDF has twice the joints the action moves, and identifying
+        a model the controller cannot command is meaningless. The joint list is
+        published on a standard topic, so this needs no per-robot config.
+        """
+        from control_msgs.msg import JointTrajectoryControllerState  # noqa: PLC0415
+
+        base = commands.follow_joint_trajectory_action.rsplit(
+            "/follow_joint_trajectory", 1)[0]
+        self.create_subscription(JointTrajectoryControllerState,
+                                 f"{base}/controller_state",
+                                 self._on_controller_state, 5)
+
+    def _on_controller_state(self, message) -> None:
+        names = [str(entry) for entry in message.joint_names]
+        if names:
+            self.service.adopt_driven_joints(names)
 
     # -- telemetry -------------------------------------------------------
 

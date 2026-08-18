@@ -56,11 +56,21 @@ function fillFrames() {
     option.textContent = name;
     select.appendChild(option);
   }
-  if (keep) select.value = keep;
+  select.value = keep || defaultFrame();
+}
+
+/** A bench belongs on the robot's base, not on the kinematic root. */
+function defaultFrame() {
+  const driven = (state.snapshot?.driven_joints || [])[0] || '';
+  const prefix = driven.replace(/joint\d+$/, '');
+  const preferred = state.frames.find(
+    (name) => prefix && name.startsWith(prefix) && /base/i.test(name));
+  return preferred || state.frames.find((n) => /base_link$/i.test(n))
+    || state.frames[0] || '';
 }
 
 $('obst-add').addEventListener('click', async () => {
-  const frame = $('obst-frame').value || state.frames[0];
+  const frame = $('obst-frame').value || defaultFrame();
   if (!frame) return toast('no model yet', 'err');
   const result = await post('/api/obstacles', {
     action: 'add',
@@ -170,15 +180,26 @@ function renderConnection(snapshot) {
     ['action', connection.action],
     ['effort unit', connection.effort_unit],
     ['sample age', connection.sample_age_s == null ? '—' : `${connection.sample_age_s}s`],
+    ['joints driven', (snapshot.driven_joints || []).length || '—'],
+    ['profile', snapshot.profile_source || 'none'],
     ['robot shapes', collision.robot_shapes ?? '—'],
     ['obstacles', collision.enabled_obstacles ?? 0],
   ];
   $('conn-table').innerHTML = rows.map(
     ([k, v]) => `<tr><td>${k}</td><td class="num">${v ?? '—'}</td></tr>`).join('');
 
-  const missing = connection.missing_guards || [];
+  const missing = (connection.missing_guards || []).slice();
+  if (snapshot.profile_source === 'derived' && !snapshot.current_guard) {
+    missing.push('current ceiling (derived profile)');
+  }
+  if (snapshot.profile_source === 'none') {
+    $('guards').textContent = 'No profile: waiting for the controller to name '
+      + 'the joints it drives. Nothing can run until then.';
+    $('guards').style.color = 'var(--bad)';
+    return;
+  }
   $('guards').textContent = missing.length
-    ? `Guards off because the signal is not published: ${missing.join(', ')}.`
+    ? `Guards off because the value is not available: ${missing.join(', ')}.`
     : 'All guards active.';
   $('guards').style.color = missing.length ? 'var(--warn)' : 'var(--muted)';
 }

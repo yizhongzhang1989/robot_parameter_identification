@@ -15,6 +15,7 @@ import traceback
 
 import numpy as np
 
+from .. import autoprofile
 from .. import campaign as campaign_module
 from .. import excitation, identification as ident
 from ..interfaces import CommandSpec, TelemetrySpec
@@ -53,6 +54,9 @@ class IdentificationService:
         self.arm: ident.ArmModel | None = None
         self.scene: ObstacleScene | None = None
         self.urdf_text = ""
+        self.driven_joints: list[str] = []
+        self.configured_profile = profile
+        self.profile_source = "configured" if profile is not None else "none"
         self.components = ModelComponents()
         self.plan = None
         self.result: dict | None = None
@@ -78,28 +82,58 @@ class IdentificationService:
         """Build the model from a freshly received /robot_description."""
         if not urdf_text or urdf_text == self.urdf_text:
             return False
+        self.urdf_text = urdf_text
+        return self._rebuild()
+
+    def adopt_driven_joints(self, names) -> bool:
+        """Restrict identification to the joints the controller actually moves.
+
+        A dual-arm URDF carries twice the joints the action can command, and
+        identifying a model the controller cannot move is meaningless.
+        """
+        names = [str(entry) for entry in names]
+        if names == self.driven_joints:
+            return False
+        self.driven_joints = names
+        self.note(f"controller drives {len(names)} joints")
+        return self._rebuild()
+
+    def _rebuild(self) -> bool:
+        """Model, profile and obstacle scene, from whatever is known so far."""
+        if not self.urdf_text:
+            return False
+        profile, source = self.configured_profile, "configured"
+        if profile is None and self.driven_joints:
+            try:
+                profile = autoprofile.derive_profile(
+                    self.urdf_text, self.driven_joints)
+                source = "derived"
+            except Exception as error:  # noqa: BLE001
+                self.note(f"profile could not be derived: {error}")
         try:
-            if self.profile is not None:
-                arm = ident.ArmModel.from_profile(urdf_text, self.profile)
+            if profile is not None:
+                arm = ident.ArmModel.from_profile(self.urdf_text, profile)
             else:
-                arm = ident.ArmModel.from_urdf_text(urdf_text, "")
+                arm = ident.ArmModel.from_urdf_text(self.urdf_text, "")
+                source = "none"
         except Exception as error:  # noqa: BLE001 - surfaced, never fatal
             self.note(f"robot_description rejected: {error}")
             return False
         with self._lock:
-            self.urdf_text = urdf_text
             self.arm = arm
+            self.profile = profile
+            self.profile_source = source
             previous = self.scene.as_list() if self.scene else []
-            self.scene = ObstacleScene(arm.model, urdf_text=urdf_text)
+            self.scene = ObstacleScene(arm.model, urdf_text=self.urdf_text)
             if previous:
                 try:
                     self.scene.replace_all(previous)
                 except KeyError as error:
                     self.note(f"obstacles dropped, frames changed: {error}")
-            self.plan = campaign_module.default_plan(self.profile) \
-                if self.profile is not None else None
+            self.plan = (campaign_module.default_plan(profile)
+                         if profile is not None else None)
         self.note(f"model ready: {arm.joint_count} joints, "
-                  f"{arm.parameter_count} parameters")
+                  f"{arm.parameter_count} parameters, profile {source}")
         return True
 
     def have_model(self) -> bool:
@@ -337,6 +371,11 @@ class IdentificationService:
                 "joint_names": list(self.arm.joint_names) if self.arm else [],
                 "parameter_count": self.arm.parameter_count if self.arm else 0,
                 "effort_unit": self.config.telemetry.signals.effort_unit,
+                "profile_source": self.profile_source,
+                "current_guard": (
+                    self.profile is not None
+                    and autoprofile.current_guard_active(self.profile)),
+                "driven_joints": list(self.driven_joints),
                 "acknowledgement": ACKNOWLEDGEMENT,
                 "rehearsal_passed": self.rehearsal_passed,
                 "obstacles": self.obstacles(),

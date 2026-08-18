@@ -23,7 +23,8 @@ class ProfileError(ValueError):
     """Raised when a profile is missing or internally inconsistent."""
 
 
-def _sequence(payload: dict, key: str, count: int, name: str) -> tuple[float, ...]:
+def _sequence(payload: dict, key: str, count: int, name: str,
+              allow_unbounded: bool = False) -> tuple[float, ...]:
     value = payload.get(key)
     if value is None:
         raise ProfileError(f"{name}: '{key}' is required")
@@ -38,6 +39,11 @@ def _sequence(payload: dict, key: str, count: int, name: str) -> tuple[float, ..
             number = float(entry)
         except (TypeError, ValueError) as error:
             raise ProfileError(f"{name}: '{key}[{index}]' is not a number") from error
+        # Infinity is the honest value for a ceiling nobody has supplied; it
+        # reads as "this guard is off", which callers can then report.
+        if math.isinf(number) and allow_unbounded and number > 0.0:
+            out.append(number)
+            continue
         if not math.isfinite(number):
             raise ProfileError(f"{name}: '{key}[{index}]' is not finite")
         out.append(number)
@@ -202,8 +208,10 @@ class RobotProfile:
                 _sequence(limits, "workspace_deg", count, source)
                 if limits.get("workspace_deg") is not None else ()),
             continuous_current_a=_sequence(
-                limits, "continuous_current_a", count, source),
-            peak_current_a=_sequence(limits, "peak_current_a", count, source),
+                limits, "continuous_current_a", count, source,
+                allow_unbounded=True),
+            peak_current_a=_sequence(limits, "peak_current_a", count, source,
+                                     allow_unbounded=True),
             source=source,
             notes=dict(payload.get("notes") or {}),
             **optional,
@@ -212,8 +220,7 @@ class RobotProfile:
     @classmethod
     def from_yaml(cls, path: str | Path) -> "RobotProfile":
         path = Path(path)
-        if not path.is_file():
-            raise ProfileError(f"profile not found: {path}")
+        if not path.is_file():            raise ProfileError(f"profile not found: {path}")
         return cls.from_dict(_resolve_extends(path), source=str(path))
 
     def as_dict(self) -> dict:
