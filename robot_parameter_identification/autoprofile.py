@@ -19,10 +19,13 @@ import xml.etree.ElementTree as ElementTree
 
 from .profile import RobotProfile
 
-# Identification is a slow, deliberate exercise; there is no reason to run it
-# anywhere near the speeds the URDF permits for ordinary motion.
+# Identification is a slow, deliberate exercise, so the default stays well under
+# what the URDF permits. SPEED_CEILING_FRACTION is a separate question: the most
+# an operator may raise it to. Friction only shows itself at speed, so refusing
+# to go faster refuses to measure it -- but half of rated is far enough.
 SPEED_FRACTION = 0.15
 MAXIMUM_SPEED_DEG_S = 20.0
+SPEED_CEILING_FRACTION = 0.5
 POSITION_FRACTION = 0.9
 
 
@@ -53,7 +56,8 @@ def joint_limits(urdf_text: str) -> dict[str, dict]:
 
 
 def derive_profile(urdf_text: str, joint_names, name: str = "derived",
-                   workspace_limit_deg=None) -> RobotProfile:
+                   workspace_limit_deg=None,
+                   speed_limit_deg_s=None) -> RobotProfile:
     """A profile good enough to run, built from the URDF and a joint list.
 
     ``workspace_limit_deg`` caps how far the campaign may swing each joint,
@@ -61,12 +65,17 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
     room it stands in: a stand, a bench or a cable tray is invisible to it. Cap
     the workspace, or model the obstruction as a box, or both.
 
+    ``speed_limit_deg_s`` replaces the conservative default speed, up to
+    ``SPEED_CEILING_FRACTION`` of what the URDF rates each joint for. It exists
+    because viscous friction is invisible at crawling speeds.
+
     Raises ``ValueError`` when a named joint has no position limit, because
     guessing a range for a joint we are about to move is not acceptable.
     """
     names = [str(entry) for entry in joint_names]
     if not names:
         raise ValueError("no joint names supplied")
+    requested = _requested_speed(speed_limit_deg_s)
     limits = joint_limits(urdf_text)
 
     positions, speeds = [], []
@@ -81,10 +90,7 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
         # side wins so the asymmetric half is never exceeded.
         reach = min(abs(lower), abs(upper))
         positions.append(round(math.degrees(reach) * POSITION_FRACTION, 2))
-        velocity = entry.get("velocity")
-        speeds.append(MAXIMUM_SPEED_DEG_S if velocity is None else
-                      min(MAXIMUM_SPEED_DEG_S,
-                          math.degrees(velocity) * SPEED_FRACTION))
+        speeds.append(_speed_for(entry.get("velocity"), requested))
     if missing:
         raise ValueError(
             "these joints have no position limit in the URDF, so a profile "
@@ -119,6 +125,11 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
         payload["notes"]["workspace"] = (
             "Capped by the operator because the URDF does not describe what "
             "stands around the arm.")
+    if requested is not None:
+        payload["notes"]["speed"] = (
+            f"Operator raised the campaign speed to {sustained} deg/s "
+            f"(asked {requested}, capped at {SPEED_CEILING_FRACTION:g} of what "
+            "the URDF rates each joint for).")
     return RobotProfile.from_dict(
         payload, source="<derived from /robot_description>")
 
@@ -137,6 +148,25 @@ def _workspace(requested, positions: list[float]) -> list[float]:
     if any(value <= 0.0 for value in values):
         raise ValueError("workspace_limit_deg must be positive")
     return [round(min(cap, reach), 2) for cap, reach in zip(values, positions)]
+
+
+def _requested_speed(speed_limit_deg_s) -> float | None:
+    if speed_limit_deg_s is None:
+        return None
+    value = float(speed_limit_deg_s)
+    if value <= 0.0:
+        raise ValueError("speed_limit_deg_s must be positive")
+    return value
+
+
+def _speed_for(velocity_rad_s, requested: float | None) -> float:
+    """This joint's campaign speed: the default, or the operator's, capped."""
+    if velocity_rad_s is None:
+        return MAXIMUM_SPEED_DEG_S if requested is None else requested
+    rated = math.degrees(velocity_rad_s)
+    if requested is None:
+        return min(MAXIMUM_SPEED_DEG_S, rated * SPEED_FRACTION)
+    return min(requested, rated * SPEED_CEILING_FRACTION)
 
 
 def current_guard_active(profile: RobotProfile) -> bool:

@@ -290,6 +290,19 @@ class Abort(RuntimeError):
 PROBE_SPEED_FRACTION = 0.5
 ACCELERATION_PER_SPEED = 4.0
 
+# The sweep speeds are what actually excites friction, so they are fractions of
+# the speed ceiling rather than fixed figures. Fixed figures meant raising the
+# ceiling changed nothing: the sweep kept running at the old speeds and the
+# viscous term stayed invisible.
+FRICTION_SPEED_FRACTIONS = (0.1, 0.3, 0.6, 1.0)
+VALIDATION_SPEED_FRACTIONS = (0.35, 0.65)
+
+# The plant ramps a sweep over a quarter of its nominal duration, so a pass of
+# `distance` at `speed` implies 4*speed^2/distance of acceleration. A short
+# sweep at high speed is therefore a violent one, and has almost no constant
+# speed left in the middle to measure. Amplitude is sized from this.
+SWEEP_ACCELERATION_DEG_S2 = 360.0
+
 _STATIC_BOUNDS = {
     "static_poses": (4, 60),
     "static_candidates": (10, 400),
@@ -323,6 +336,20 @@ _INTEGER_FIELDS = frozenset({
 })
 
 
+def sweep_speeds(maximum_speed_deg_s: float, fractions) -> tuple[float, ...]:
+    """Speeds spread across the ceiling, so raising it reaches new ground."""
+    speeds = {round(fraction * maximum_speed_deg_s, 2) for fraction in fractions}
+    return tuple(sorted(speed for speed in speeds if speed > 0.0))
+
+
+def sweep_amplitude_deg(maximum_speed_deg_s: float, requested: float) -> float:
+    """Enough travel to reach the top speed without a violent ramp."""
+    low, high = _STATIC_BOUNDS["friction_amplitude_deg"]
+    needed = (ACCELERATION_PER_SPEED * maximum_speed_deg_s ** 2
+              / SWEEP_ACCELERATION_DEG_S2)
+    return float(min(max(requested, needed, low), high))
+
+
 def default_plan(profile: RobotProfile) -> CampaignPlan:
     """A plan that already respects this arm's envelope."""
     plan = CampaignPlan()
@@ -336,12 +363,18 @@ def default_plan(profile: RobotProfile) -> CampaignPlan:
     plan.position_margin_deg = max(
         plan.position_margin_deg, profile.position_margin_deg)
     plan.workspace_limit_deg = tuple(profile.workspace_limit_deg)
-    plan.friction_speeds_deg_s = tuple(
-        s for s in plan.friction_speeds_deg_s if s <= plan.maximum_speed_deg_s
-    ) or (plan.maximum_speed_deg_s,)
-    plan.validation_speeds_deg_s = tuple(
-        s for s in plan.validation_speeds_deg_s if s <= plan.maximum_speed_deg_s)
+    _follow_speed(plan)
     return plan
+
+
+def _follow_speed(plan: CampaignPlan) -> None:
+    """Re-derive everything that only means something relative to the ceiling."""
+    plan.friction_speeds_deg_s = sweep_speeds(
+        plan.maximum_speed_deg_s, FRICTION_SPEED_FRACTIONS)
+    plan.validation_speeds_deg_s = sweep_speeds(
+        plan.maximum_speed_deg_s, VALIDATION_SPEED_FRACTIONS)
+    plan.friction_amplitude_deg = sweep_amplitude_deg(
+        plan.maximum_speed_deg_s, plan.friction_amplitude_deg)
 
 
 def clamp_campaign_plan(
@@ -368,6 +401,14 @@ def clamp_campaign_plan(
         if bounded != value:
             notes.append(f"{name} {value:g} clamped to {bounded:g}")
         setattr(plan, name, int(bounded) if name in _INTEGER_FIELDS else bounded)
+
+    if "maximum_speed_deg_s" in payload:
+        # Otherwise a raised ceiling leaves the sweep running at the old speeds.
+        _follow_speed(plan)
+        if "maximum_acceleration_deg_s2" not in payload:
+            plan.maximum_acceleration_deg_s2 = min(
+                ACCELERATION_PER_SPEED * plan.maximum_speed_deg_s,
+                bounds["maximum_acceleration_deg_s2"][1])
 
     speeds = payload.get("friction_speeds_deg_s")
     if speeds is not None:

@@ -91,6 +91,61 @@ class ConfigurationTest(unittest.TestCase):
         for speed in plan.friction_speeds_deg_s:
             self.assertLessEqual(speed, plan.maximum_speed_deg_s)
 
+    def test_the_sweep_reaches_the_speed_ceiling(self):
+        plan = ri.default_plan(self.profile)
+        self.assertAlmostEqual(max(plan.friction_speeds_deg_s),
+                               plan.maximum_speed_deg_s)
+
+    def test_raising_the_ceiling_actually_moves_the_sweep(self):
+        slow = ri.default_plan(self.profile)
+        fast, _notes = ri.clamp_campaign_plan(
+            {"maximum_speed_deg_s": 12.0}, self.profile)
+        self.assertGreater(max(fast.friction_speeds_deg_s),
+                           max(slow.friction_speeds_deg_s))
+        self.assertAlmostEqual(max(fast.friction_speeds_deg_s), 12.0)
+
+    def test_an_explicit_sweep_speed_still_wins(self):
+        plan, _notes = ri.clamp_campaign_plan(
+            {"maximum_speed_deg_s": 12.0, "friction_speeds_deg_s": [4.0]},
+            self.profile)
+        self.assertEqual(plan.friction_speeds_deg_s, (4.0,))
+
+    def test_a_raised_ceiling_cannot_escape_the_envelope(self):
+        plan, notes = ri.clamp_campaign_plan(
+            {"maximum_speed_deg_s": 500.0}, self.profile)
+        self.assertLessEqual(plan.maximum_speed_deg_s, 12.0)
+        self.assertTrue(any("maximum_speed_deg_s" in note for note in notes))
+
+
+class SweepSizingTest(unittest.TestCase):
+    """A fast sweep needs room, or the ramp is violent and nothing cruises."""
+
+    def test_amplitude_grows_with_speed(self):
+        slow = ri.sweep_amplitude_deg(10.0, 20.0)
+        fast = ri.sweep_amplitude_deg(60.0, 20.0)
+        self.assertGreater(fast, slow)
+
+    def test_a_slow_sweep_keeps_the_requested_amplitude(self):
+        self.assertEqual(ri.sweep_amplitude_deg(10.0, 20.0), 20.0)
+
+    def test_amplitude_never_exceeds_the_operator_bound(self):
+        high = ri.campaign_bounds(load_profile())["friction_amplitude_deg"][1]
+        self.assertLessEqual(ri.sweep_amplitude_deg(500.0, 20.0), high)
+
+    def test_the_implied_ramp_stays_within_the_design_target(self):
+        # The plant ramps over a quarter of the pass, so acceleration is
+        # 4*speed^2/distance. Sizing must keep that near the target.
+        for speed in (10.0, 30.0, 60.0):
+            amplitude = ri.sweep_amplitude_deg(speed, 20.0)
+            implied = 4.0 * speed ** 2 / amplitude
+            self.assertLessEqual(implied, 400.0, f"{speed} deg/s")
+
+    def test_speeds_span_the_ceiling_without_duplicates(self):
+        speeds = ri.sweep_speeds(60.0, (0.1, 0.3, 0.6, 1.0))
+        self.assertEqual(speeds, tuple(sorted(set(speeds))))
+        self.assertAlmostEqual(max(speeds), 60.0)
+        self.assertLess(min(speeds), 10.0)
+
 
 class ModelTest(unittest.TestCase):
     def setUp(self):

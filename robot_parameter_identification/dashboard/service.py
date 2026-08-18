@@ -48,6 +48,9 @@ class DashboardConfig:
     # How far the campaign may swing each joint. The URDF describes the arm,
     # not the stand it is bolted to, so this is often tighter than the URDF.
     workspace_limit_deg: tuple[float, ...] = ()
+    # Top sweep speed. Zero keeps the conservative derived default, which is
+    # too slow to see viscous friction on a full-size arm.
+    maximum_speed_deg_s: float = 0.0
 
 
 class IdentificationService:
@@ -115,7 +118,8 @@ class IdentificationService:
                 cap = list(self.config.workspace_limit_deg) or None
                 profile = autoprofile.derive_profile(
                     self.urdf_text, self.driven_joints,
-                    workspace_limit_deg=cap)
+                    workspace_limit_deg=cap,
+                    speed_limit_deg_s=self._requested_speed())
                 source = "derived"
             except Exception as error:  # noqa: BLE001
                 self.note(f"profile could not be derived: {error}")
@@ -139,11 +143,28 @@ class IdentificationService:
                     self.scene.replace_all(previous)
                 except KeyError as error:
                     self.note(f"obstacles dropped, frames changed: {error}")
-            self.plan = (campaign_module.default_plan(profile)
+            self.plan = (self._build_plan(profile)
                          if profile is not None else None)
         self.note(f"model ready: {arm.joint_count} joints, "
                   f"{arm.parameter_count} parameters, profile {source}")
         return True
+
+    def _requested_speed(self) -> float | None:
+        speed = float(self.config.maximum_speed_deg_s or 0.0)
+        return speed if speed > 0.0 else None
+
+    def _build_plan(self, profile: RobotProfile):
+        """The plan follows the operator's speed, clamped to the envelope."""
+        speed = self._requested_speed()
+        if speed is None:
+            return campaign_module.default_plan(profile)
+        plan, notes = campaign_module.clamp_campaign_plan(
+            {"maximum_speed_deg_s": speed}, profile)
+        for entry in notes:
+            self.note(entry)
+        self.note(f"sweep speeds {list(plan.friction_speeds_deg_s)} deg/s, "
+                  f"amplitude {plan.friction_amplitude_deg:g} deg")
+        return plan
 
     def have_model(self) -> bool:
         return self.arm is not None

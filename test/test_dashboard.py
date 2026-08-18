@@ -284,6 +284,38 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(made.progress["observations"], 5)
 
 
+class SpeedRequestTest(unittest.TestCase):
+    """Raising the ceiling must reach the sweep, not stop at the profile."""
+
+    def service(self, speed):
+        made = IdentificationService(
+            DashboardConfig(maximum_speed_deg_s=speed))
+        made.adopt_description(synthetic_urdf())
+        made.adopt_driven_joints(
+            [f"{PREFIX}joint{index}" for index in range(1, 8)])
+        return made
+
+    def test_the_request_reaches_the_profile_and_the_plan(self):
+        made = self.service(60.0)
+        self.assertAlmostEqual(made.profile.sustained_speed_deg_s, 60.0)
+        self.assertAlmostEqual(made.plan.maximum_speed_deg_s, 60.0)
+
+    def test_the_sweep_actually_runs_at_the_new_speed(self):
+        slow = self.service(0.0)
+        fast = self.service(60.0)
+        self.assertGreater(max(fast.plan.friction_speeds_deg_s),
+                           max(slow.plan.friction_speeds_deg_s))
+        self.assertAlmostEqual(max(fast.plan.friction_speeds_deg_s), 60.0)
+
+    def test_validation_moves_with_it(self):
+        fast = self.service(60.0)
+        self.assertGreater(max(fast.plan.validation_speeds_deg_s), 10.0)
+
+    def test_zero_keeps_the_conservative_default(self):
+        made = self.service(0.0)
+        self.assertLessEqual(made.plan.maximum_speed_deg_s, 20.0)
+
+
 class HttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

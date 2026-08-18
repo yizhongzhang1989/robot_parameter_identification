@@ -47,6 +47,30 @@ class DeriveTest(unittest.TestCase):
                              autoprofile.MAXIMUM_SPEED_DEG_S)
         self.assertGreater(profile.sustained_speed_deg_s, 0.0)
 
+    def test_the_operator_can_raise_the_speed(self):
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, speed_limit_deg_s=60.0)
+        self.assertAlmostEqual(profile.sustained_speed_deg_s, 60.0)
+
+    def test_a_raised_speed_is_still_capped_by_the_urdf_rating(self):
+        rated = math.degrees(3.0)
+        profile = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, speed_limit_deg_s=10_000.0)
+        self.assertLessEqual(profile.sustained_speed_deg_s,
+                             rated * autoprofile.SPEED_CEILING_FRACTION + 1e-6)
+
+    def test_asking_for_nothing_leaves_the_conservative_default(self):
+        quiet = autoprofile.derive_profile(synthetic_urdf(), NAMES)
+        asked = autoprofile.derive_profile(
+            synthetic_urdf(), NAMES, speed_limit_deg_s=None)
+        self.assertEqual(quiet.sustained_speed_deg_s,
+                         asked.sustained_speed_deg_s)
+
+    def test_a_non_positive_speed_is_refused(self):
+        with self.assertRaises(ValueError):
+            autoprofile.derive_profile(
+                synthetic_urdf(), NAMES, speed_limit_deg_s=0.0)
+
     def test_current_ceilings_are_left_unset_rather_than_invented(self):
         """The URDF states newton-metres; converting needs what we are fitting."""
         profile = autoprofile.derive_profile(synthetic_urdf(), NAMES)

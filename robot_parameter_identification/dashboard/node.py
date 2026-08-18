@@ -67,6 +67,7 @@ class DashboardNode(Node):
                                      "identification_results")),
             workspace_limit_deg=tuple(
                 self._declare_floats("workspace_limit_deg")),
+            maximum_speed_deg_s=float(get("maximum_speed_deg_s", 0.0)),
             telemetry=telemetry, commands=commands)
 
         profile = None
