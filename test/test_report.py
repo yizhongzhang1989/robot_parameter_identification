@@ -301,6 +301,57 @@ class ChartIdentityTest(unittest.TestCase):
         self.assertIn("lock.checked = locked;", report._TEMPLATE)
 
 
+class ChartLegendTest(unittest.TestCase):
+    """The residual chart drew two colours and explained neither, and the
+    friction legend named its colours without saying what they were."""
+
+    def setUp(self):
+        self.section = report._TEMPLATE.split("function chartSection", 1)[1] \
+                                       .split("\n}", 1)[0]
+
+    def test_both_scatter_charts_carry_a_legend(self):
+        self.assertEqual(self.section.count('<ul class="key">'), 2)
+
+    def test_every_colour_the_friction_chart_draws_is_in_its_legend(self):
+        body = report._TEMPLATE.split("function drawFriction", 1)[1] \
+                               .split("function drawResidual", 1)[0]
+        drawn = {"rgba(77,163,255": "var(--accent)",   # non-sweep points
+                 "rgba(120,220,150": "var(--sweep)",   # sweep points
+                 "#e0b341": "var(--warn)"}             # fitted curve
+        for literal, swatch in drawn.items():
+            self.assertIn(literal, body)
+            self.assertIn(swatch, self.section)
+
+    def test_every_colour_the_residual_chart_draws_is_in_its_legend(self):
+        body = report._TEMPLATE.split("function drawResidual", 1)[1] \
+                               .split("function drawBars", 1)[0]
+        self.assertIn("rgba(226,86,90", body)      # non-sweep residuals
+        self.assertIn("rgba(120,220,150", body)    # sweep residuals
+        self.assertIn("var(--bad)", self.section)
+        self.assertIn("var(--sweep)", self.section)
+
+    def test_each_legend_entry_explains_the_colour_not_just_names_it(self):
+        for key in ("charts.friction.green", "charts.friction.blue",
+                    "charts.friction.curve", "charts.residual.red",
+                    "charts.residual.green"):
+            self.assertIn(key, report.TEXT)
+            self.assertGreater(len(report.TEXT[key]["en"]), 40, key)
+            self.assertGreater(len(report.TEXT[key]["zh"]), 12, key)
+
+    def test_the_colour_is_named_in_words_as_well_as_shown(self):
+        # A legend that relies on hue alone is unreadable to some readers.
+        for key in ("charts.sweep", "charts.other", "charts.curve",
+                    "charts.red", "charts.green"):
+            self.assertIn("—", report.TEXT[key]["en"], key)
+
+    def test_the_residual_chart_admits_it_omits_the_validation_data(self):
+        # Training residuals flatter the model; saying so is the difference
+        # between a diagnostic and a advertisement.
+        self.assertIn("charts.residual.caveat", report.TEXT)
+        self.assertIn("validation", report.TEXT["charts.residual.caveat"]["en"])
+        self.assertIn("验证", report.TEXT["charts.residual.caveat"]["zh"])
+
+
 class TranslationTest(unittest.TestCase):
 
     def test_every_report_string_has_both_languages(self):

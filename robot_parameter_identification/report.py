@@ -206,23 +206,76 @@ TEXT = {
     "charts.friction": {"en": "Friction curve and its samples",
                         "zh": "摩擦曲线与样本"},
     "charts.friction.say": {
-        "en": "Points are the measured effort with the rigid-body prediction "
-              "removed, so what is left is what friction has to explain. Green "
-              "points come from the sweeps, where one joint moves about a "
-              "single pose: only there does speed change while pose does not. "
-              "Comparing blue against green reads pose differences as speed "
-              "differences.",
-        "zh": "图中散点为实测驱动量减去刚体模型预测后的余量，即摩擦需要解释的部分。"
-              "绿色点来自扫掠段，此时只有单个关节绕同一位姿运动，速度变化而位姿不变。"
-              "把蓝色点与绿色点直接比较，会把位姿差异误读为速度差异。",
+        "en": "The vertical axis is not raw current. Each point is the measured "
+              "effort minus what the fitted rigid-body model predicts for that "
+              "pose and motion, so gravity and inertia have already been taken "
+              "out. What is left is the part friction has to account for.",
+        "zh": "纵轴不是原始电流。每个点是实测驱动量减去刚体模型对该位姿和运动的预测，"
+              "重力与惯性已被扣除，剩下的就是摩擦需要解释的部分。",
+    },
+    "charts.friction.green": {
+        "en": "from phase B, the friction sweeps. One joint moves back and "
+              "forth about a single nominal pose across the whole speed range. "
+              "Because the pose barely changes, a difference between two green "
+              "points is a difference in speed.",
+        "zh": "来自 B 摩擦阶段的扫掠。此时只有一个关节绕同一标称位姿往复运动，"
+              "覆盖整个速度区间。由于位姿几乎不变，两个绿点之间的差异就是速度造成的差异。",
+    },
+    "charts.friction.blue": {
+        "en": "from phase A, held still at many poses, and phase C, all joints "
+              "on a smooth trajectory. Together they cover many poses but "
+              "almost only low speed.",
+        "zh": "来自 A 重力阶段（在多个位姿静止保持）与 C 惯性阶段（所有关节沿平滑轨迹运动）。"
+              "两者覆盖了很多位姿，但速度几乎都很低。",
+    },
+    "charts.friction.curve": {
+        "en": "the fitted model, coulomb x tanh(speed / transition) + viscous x "
+              "speed + offset. A good fit runs through the middle of the cloud "
+              "at every speed, not just on average.",
+        "zh": "拟合模型：库仑 x tanh(速度 / 过渡宽度) + 粘滞 x 速度 + 偏置。"
+              "拟合良好时，曲线在每个速度处都穿过点云中部，而不只是总体居中。",
+    },
+    "charts.friction.warn": {
+        "en": "The two groups differ in pose as well as in speed, so a step "
+              "between blue and green is not on its own evidence about speed. "
+              "Read the speed dependence from the green points; use the blue "
+              "ones to see how the curve behaves near rest.",
+        "zh": "两组数据不只是速度不同，位姿也不同，因此蓝色与绿色之间的落差本身"
+              "并不能作为速度效应的证据。速度依赖性应依据绿点判断，蓝点用来观察"
+              "曲线在近零速处的表现。",
     },
     "charts.residual": {"en": "Residual against speed", "zh": "残差-速度关系"},
     "charts.residual.say": {
-        "en": "What the model still cannot explain. Scatter with no shape is "
-              "noise and is fine. A pattern that bends with speed is physics "
-              "the model does not contain.",
-        "zh": "模型仍未能解释的部分。无规律的散布是噪声，属正常；"
-              "若随速度呈现明显规律，则说明存在模型未包含的物理效应。",
+        "en": "The vertical axis is what the whole model still gets wrong: "
+              "measured effort minus the full prediction, rigid body and "
+              "friction together. Zero would be a perfect prediction.",
+        "zh": "纵轴是整个模型仍未预测对的部分：实测驱动量减去完整预测（刚体加摩擦）。"
+              "零表示预测完全正确。",
+    },
+    "charts.residual.red": {
+        "en": "phases A and C: the same low-speed, many-pose group drawn in "
+              "blue on the chart above.",
+        "zh": "A 与 C 阶段：即上图中以蓝色绘制的那组低速、多位姿数据。",
+    },
+    "charts.residual.green": {
+        "en": "phase B, the sweeps: one joint, one pose, the full speed range.",
+        "zh": "B 阶段的扫掠：单个关节、单一位姿、覆盖整个速度区间。",
+    },
+    "charts.residual.read": {
+        "en": "A shapeless band about zero is measurement noise, and is what a "
+              "sound model looks like. A residual that tilts or curves with "
+              "speed, or that sits to one side of zero, is physics the model "
+              "does not contain rather than noise.",
+        "zh": "围绕零线、没有形状的带状散布是测量噪声，模型健康时就应如此。"
+              "若残差随速度倾斜或弯曲，或整体偏向零线一侧，那是模型未包含的物理效应，"
+              "而非噪声。",
+    },
+    "charts.residual.caveat": {
+        "en": "Validation samples are not drawn here. These are residuals on "
+              "the data the model was fitted to, so they flatter it; the "
+              "validation column in the table above is the honest measure.",
+        "zh": "此处不含验证阶段的样本。这些是模型拟合所用数据上的残差，因而偏乐观；"
+              "上方表格中的验证均方根才是诚实的衡量。",
     },
     "charts.error": {"en": "Error per joint", "zh": "各关节误差"},
     "charts.condition": {"en": "Condition number per joint", "zh": "各关节条件数"},
@@ -234,9 +287,15 @@ TEXT = {
               "其数值所依据的证据越少。",
     },
     "charts.speed": {"en": "speed (°/s)", "zh": "速度（°/秒）"},
-    "charts.sweep": {"en": "sweep samples", "zh": "扫掠样本"},
-    "charts.other": {"en": "other phases", "zh": "其他阶段"},
-    "charts.curve": {"en": "fitted curve", "zh": "拟合曲线"},
+    # The colour is named in the text as well as shown, so the legend still
+    # works for a reader who cannot separate the two hues.
+    "charts.sweep": {"en": "Green — sweep samples", "zh": "绿色 —— 扫掠样本"},
+    "charts.other": {"en": "Blue — static and trajectory phases",
+                     "zh": "蓝色 —— 静态与轨迹阶段"},
+    "charts.curve": {"en": "Yellow — fitted curve", "zh": "黄色 —— 拟合曲线"},
+    "charts.red": {"en": "Red — static and trajectory phases",
+                   "zh": "红色 —— 静态与轨迹阶段"},
+    "charts.green": {"en": "Green — sweep samples", "zh": "绿色 —— 扫掠样本"},
 
     "phases.head": {"en": "Phases", "zh": "各阶段"},
     "phases.say": {
@@ -383,6 +442,11 @@ border-radius:6px;padding:5px 10px}
 .legend{display:flex;gap:18px;color:var(--muted);font-size:12px;margin:8px 0 0}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;
 margin-right:6px;vertical-align:-1px}
+.key{list-style:none;margin:10px 0 0;padding:0;max-width:80ch}
+.key li{display:flex;gap:10px;align-items:flex-start;margin:0 0 7px;
+color:var(--muted);font-size:13px;line-height:1.5}
+.key i{flex:none;width:11px;height:11px;border-radius:2px;margin-top:5px}
+.key b{color:var(--ink);font-weight:600}
 code{background:#222833;padding:1px 6px;border-radius:4px;font-size:12px}
 dl{margin:0}dt{margin-top:10px;font-weight:600}dd{margin:2px 0 0;color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
@@ -491,6 +555,11 @@ function jointSection() {
     </tr></thead><tbody>${rows}</tbody></table></section>`;
 }
 
+function key(colour, term, detail) {
+  return `<li><i style="background:${colour}"></i><span><b>${term}</b>
+    &nbsp;${detail}</span></li>`;
+}
+
 function chartSection() {
   const options = JOINTS.map((_, i) =>
     `<option value="${i}">${esc(NAMES[i] || i + 1)}</option>`).join('');
@@ -503,13 +572,21 @@ function chartSection() {
     <h2 style="margin-top:18px" data-i18n="charts.friction"></h2>
     <p class="say" data-i18n="charts.friction.say"></p>
     <canvas id="c-friction" height="260"></canvas>
-    <p class="legend">
-      <span><i style="background:var(--accent)"></i>${t('charts.other')}</span>
-      <span><i style="background:var(--sweep)"></i>${t('charts.sweep')}</span>
-      <span><i style="background:var(--warn)"></i>${t('charts.curve')}</span></p>
+    <ul class="key">
+      ${key('var(--sweep)', t('charts.sweep'), t('charts.friction.green'))}
+      ${key('var(--accent)', t('charts.other'), t('charts.friction.blue'))}
+      ${key('var(--warn)', t('charts.curve'), t('charts.friction.curve'))}
+    </ul>
+    <p class="say" data-i18n="charts.friction.warn"></p>
     <h2 style="margin-top:22px" data-i18n="charts.residual"></h2>
     <p class="say" data-i18n="charts.residual.say"></p>
     <canvas id="c-residual" height="220"></canvas>
+    <ul class="key">
+      ${key('var(--bad)', t('charts.red'), t('charts.residual.red'))}
+      ${key('var(--sweep)', t('charts.green'), t('charts.residual.green'))}
+    </ul>
+    <p class="say" data-i18n="charts.residual.read"></p>
+    <p class="say" data-i18n="charts.residual.caveat"></p>
     <h2 style="margin-top:22px" data-i18n="charts.error"></h2>
     <canvas id="c-error" height="200"></canvas>
     <h2 style="margin-top:22px" data-i18n="charts.condition"></h2>
