@@ -143,7 +143,17 @@ export function drawFriction(canvas, entry, samples, unit) {
 
   ctx.fillStyle = 'rgba(77,163,255,.45)';
   (samples || []).forEach((sample) => {
+    if (sample.sweep) return;
     ctx.fillRect(sx(sample.speed) - 1, sy(sample.effort) - 1, 2, 2);
+  });
+
+  // Sweep points are the pose-controlled ones: a single joint moving fast
+  // about one pose. Everything else is low speed across many poses, so a
+  // trend read across both groups is part pose, not all speed.
+  ctx.fillStyle = 'rgba(120,220,150,.85)';
+  (samples || []).forEach((sample) => {
+    if (!sample.sweep) return;
+    ctx.fillRect(sx(sample.speed) - 1.5, sy(sample.effort) - 1.5, 3, 3);
   });
 
   ctx.strokeStyle = '#e0b341';
@@ -162,6 +172,9 @@ export function drawFriction(canvas, entry, samples, unit) {
   ctx.textAlign = 'center';
   ctx.fillText(`speed deg/s  (${unit || 'A'} vertical)`,
                (box.left + box.right) / 2, height - 4);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(120,220,150,.95)';
+  ctx.fillText('sweep', box.right, box.top + 4);
   ctx.textAlign = 'left';
 }
 
@@ -191,7 +204,14 @@ export function drawResidual(canvas, points) {
 
   ctx.fillStyle = 'rgba(226,86,90,.5)';
   points.forEach((point) => {
+    if (point.sweep) return;
     ctx.fillRect(sx(point.speed) - 1, sy(point.residual) - 1, 2, 2);
+  });
+
+  ctx.fillStyle = 'rgba(120,220,150,.85)';
+  points.forEach((point) => {
+    if (!point.sweep) return;
+    ctx.fillRect(sx(point.speed) - 1.5, sy(point.residual) - 1.5, 3, 3);
   });
 
   ctx.fillStyle = MUTED;

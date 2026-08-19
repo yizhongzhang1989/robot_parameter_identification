@@ -524,6 +524,13 @@ class IdentificationService:
         prediction, not raw current. Raw current is mostly gravity, which
         varies by pose over the campaign, so a friction curve laid over it was
         being compared against a cloud it never claimed to explain.
+
+        Sweep samples are flagged. They are the only ones where a single joint
+        moves fast around one nominal pose, so they are the only ones in which
+        speed varies without pose varying with it. The rest of the cloud comes
+        from many poses at low speed, and reading a speed trend across the two
+        groups measures the pose difference as much as the speed difference.
+        The flag is omitted when false to keep the polled payload small.
         """
         joints = payload.get("joints") or []
         if not joints or not observations or self.arm is None:
@@ -564,10 +571,15 @@ class IdentificationService:
                     acceleration=acceleration)
                 whole = ident.predict_joint(
                     fit, regressor, speed, acceleration=acceleration)
-                curve.append({"speed": round(speed, 3),
-                              "effort": round(measured - rigid, 4)})
-                errors.append({"speed": round(speed, 3),
-                               "residual": round(measured - whole, 4)})
+                point = {"speed": round(speed, 3),
+                         "effort": round(measured - rigid, 4)}
+                error = {"speed": round(speed, 3),
+                         "residual": round(measured - whole, 4)}
+                if getattr(record, "phase", "") == campaign_module.PHASE_FRICTION:
+                    point["sweep"] = True
+                    error["sweep"] = True
+                curve.append(point)
+                errors.append(error)
             friction.append(curve)
             residual.append(errors)
         return {"friction_samples": friction, "residual_samples": residual}

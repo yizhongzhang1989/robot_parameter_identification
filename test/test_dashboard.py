@@ -366,6 +366,38 @@ class RehearsalEndToEndTest(unittest.TestCase):
         spread = max(still) - min(still)
         self.assertLess(spread, max(4.0 * coulomb, 0.5))
 
+    def test_sweep_samples_are_marked_apart_from_the_rest(self):
+        # The cloud holds two populations: sweep points, where one joint moves
+        # about a single pose, and everything else, taken across many poses.
+        # Overlaid without a mark, a reader measures the pose difference
+        # between the groups and calls it a speed trend.
+        #
+        # No claim is made here about which group is faster. A sweep spends
+        # much of its time accelerating and reversing, so it owns plenty of
+        # slow samples too, and how the speeds compare is a property of the
+        # plan rather than of this code.
+        cloud = self.snapshot["result"]["friction_samples"][0]
+        swept = [point for point in cloud if point.get("sweep")]
+        rest = [point for point in cloud if not point.get("sweep")]
+        self.assertTrue(swept, "no sweep samples were flagged")
+        self.assertTrue(rest, "every sample was flagged as a sweep")
+
+    def test_both_charts_agree_on_which_samples_are_sweeps(self):
+        # The two charts are read against each other, so a point marked in one
+        # and not the other would be worse than no mark at all.
+        result = self.snapshot["result"]
+        for cloud, errors in zip(result["friction_samples"],
+                                 result["residual_samples"]):
+            self.assertEqual([point.get("sweep") for point in cloud],
+                             [point.get("sweep") for point in errors])
+
+    def test_the_flag_is_absent_rather_than_false(self):
+        # It rides on every point of a payload that is polled, so the common
+        # case carries no key at all.
+        cloud = self.snapshot["result"]["friction_samples"][0]
+        self.assertTrue(any("sweep" not in point for point in cloud))
+        self.assertTrue(all(point.get("sweep") is not False for point in cloud))
+
     def test_passing_a_rehearsal_unlocks_the_hardware_button(self):
         self.assertTrue(self.snapshot["rehearsal_passed"])
 
