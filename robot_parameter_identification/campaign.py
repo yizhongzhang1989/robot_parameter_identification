@@ -162,11 +162,18 @@ class Observation:
     acceleration_deg_s2: list[float]
     current_a: list[float]
     temperature_c: list[float] = field(default_factory=list)
+    # Which motion this came out of and how well the window fitted, so a
+    # suspect point can be traced back to the pass that produced it.
+    motion: str = ""
+    window_frames: int = 0
+    window_fit_rms_deg: float = 0.0
 
     @classmethod
     def from_sample(cls, phase: str, time_s: float, sample: dict,
                     acceleration_deg_s2=None) -> "Observation":
         count = len(sample["position_deg"])
+        if acceleration_deg_s2 is None:
+            acceleration_deg_s2 = sample.get("acceleration_deg_s2")
         acceleration = (np.zeros(count) if acceleration_deg_s2 is None
                         else np.asarray(acceleration_deg_s2, dtype=float))
         return cls(
@@ -176,6 +183,9 @@ class Observation:
             acceleration_deg_s2=[float(v) for v in acceleration],
             current_a=[float(v) for v in sample["current_a"]],
             temperature_c=[float(v) for v in sample.get("temperature_c", [])],
+            motion=str(sample.get("motion", "")),
+            window_frames=int(sample.get("window_frames", 0)),
+            window_fit_rms_deg=float(sample.get("window_fit_rms_deg", 0.0)),
         )
 
 
@@ -188,6 +198,9 @@ class CampaignPlan:
     settle_samples: int = 3
     friction_amplitude_deg: float = 20.0
     friction_speeds_deg_s: tuple[float, ...] = (2.0, 5.0, 8.0)
+    # Passes per speed and direction. One pass gives no way to notice that a
+    # pass went wrong; three disagree visibly when one does.
+    friction_repeats: int = 3
     fourier_harmonics: int = 4
     fourier_base_frequency_hz: float = 0.08
     fourier_duration_s: float = 30.0
@@ -340,7 +353,13 @@ ACCELERATION_PER_SPEED = 4.0
 # the speed ceiling rather than fixed figures. Fixed figures meant raising the
 # ceiling changed nothing: the sweep kept running at the old speeds and the
 # viscous term stayed invisible.
-FRICTION_SPEED_FRACTIONS = (0.1, 0.3, 0.6, 1.0)
+# Equally spaced: each pass now yields a handful of fitted points rather than
+# hundreds of raw frames, so the speed axis can be covered properly instead of
+# being sampled at four places.
+FRICTION_SPEED_STEPS = 8
+FRICTION_SPEED_FRACTIONS = tuple(
+    round((step + 1) / FRICTION_SPEED_STEPS, 4)
+    for step in range(FRICTION_SPEED_STEPS))
 VALIDATION_SPEED_FRACTIONS = (0.35, 0.65)
 
 # The plant ramps a sweep over a quarter of its nominal duration, so a pass of
@@ -602,11 +621,22 @@ class Campaign:
         if speeds.size and speeds.max() > self.limits.maximum_speed_deg_s * 2.0:
             raise Abort(f"joint speed {speeds.max():.1f} deg/s exceeded the plan")
 
+    def _stamp_origin(self, stamp: float) -> float:
+        """First publisher stamp seen, so recorded times start near zero."""
+        if getattr(self, "_first_stamp", None) is None:
+            self._first_stamp = stamp
+        return self._first_stamp
+
     def _record(self, phase: str, sample: dict, report: PhaseReport,
                 acceleration_deg_s2=None) -> Observation:
         self._guard(sample)
+        # The publisher's stamp when the plant supplies one: the moment a frame
+        # was appended says nothing useful, because frames arrive in bursts.
+        stamp = sample.get("stamp_s")
+        moment = (self.clock() - self._started if stamp is None
+                  else float(stamp) - self._stamp_origin(float(stamp)))
         observation = Observation.from_sample(
-            phase, self.clock() - self._started, sample, acceleration_deg_s2)
+            phase, moment, sample, acceleration_deg_s2)
         self.observations.append(observation)
         report.observations += 1
         # A run lasts tens of minutes, so something has to be able to watch it.
@@ -688,14 +718,16 @@ class Campaign:
             report.detail = {"sweeps": [sweep.as_dict() for sweep in sweeps]}
             for sweep in sweeps:
                 for speed in sweep.speeds_deg_s:
-                    for distance in (sweep.amplitude_deg, -sweep.amplitude_deg):
-                        origin = np.asarray(sweep.start_deg, dtype=float)
-                        if distance < 0:
-                            origin = origin.copy()
-                            origin[sweep.joint] += sweep.amplitude_deg
-                        for sample in self.plant.traverse(
-                                sweep.joint, origin, distance, speed):
-                            self._record(PHASE_FRICTION, sample, report)
+                    for _repeat in range(max(1, self.plan.friction_repeats)):
+                        for distance in (sweep.amplitude_deg,
+                                         -sweep.amplitude_deg):
+                            origin = np.asarray(sweep.start_deg, dtype=float)
+                            if distance < 0:
+                                origin = origin.copy()
+                                origin[sweep.joint] += sweep.amplitude_deg
+                            for sample in self.plant.traverse(
+                                    sweep.joint, origin, distance, speed):
+                                self._record(PHASE_FRICTION, sample, report)
                 self.progress(PHASE_FRICTION, {
                     "joint": sweep.joint + 1, "joints": len(sweeps)})
         finally:

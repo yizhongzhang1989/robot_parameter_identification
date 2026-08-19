@@ -413,7 +413,8 @@ class IdentificationService:
                 monitor=self._monitor())
             self.progress = {"mode": mode, "phase": "starting"}
             result = run.run()
-            self._finish(mode, result, run.observations)
+            self._finish(mode, result, run.observations,
+                         getattr(plant, "raw_frames", None))
         except Exception as error:  # noqa: BLE001 - a crash must not be silent
             self.note(f"{mode} run failed: {error}")
             self.progress = {"mode": mode, "phase": "failed",
@@ -477,7 +478,7 @@ class IdentificationService:
             carried.update(detail or {})
             self.progress = carried
 
-    def _finish(self, mode: str, result, observations) -> None:
+    def _finish(self, mode: str, result, observations, raw_frames=None) -> None:
         payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)
         payload["mode"] = mode
         # The per-joint fields are named _a for historical reasons but hold
@@ -507,7 +508,7 @@ class IdentificationService:
             if mode != "hardware":
                 self.rehearsal_passed = (bool(payload.get("complete"))
                                          and bool(recovery.get("passed")))
-        self._write(payload, mode, observations)
+        self._write(payload, mode, observations, raw_frames)
         if aborted:
             self.note(f"{mode} run stopped: {aborted}")
         elif recovery.get("available") and not recovery.get("passed"):
@@ -642,10 +643,12 @@ class IdentificationService:
             "joints": errors,
         }
 
-    def _write(self, payload: dict, mode: str, observations=None) -> None:
+    def _write(self, payload: dict, mode: str, observations=None,
+               raw_frames=None) -> None:
         try:
             folder = report_module.write_run(
-                self.config.output_directory, payload, observations)
+                self.config.output_directory, payload, observations,
+                raw_frames=raw_frames)
             self.note(f"written to {folder}")
         except OSError as error:
             self.note(f"could not write result: {error}")

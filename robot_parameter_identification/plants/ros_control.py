@@ -59,6 +59,90 @@ def differentiate(times_s, values, window: int = 5) -> np.ndarray:
     return derivative
 
 
+def fit_window(frames: list[dict], joint_count: int) -> dict | None:
+    """Collapse a burst of consecutive frames into one high-quality sample.
+
+    Position is fitted quadratically against the publisher's own timestamp, so
+    speed comes from the slope and acceleration from the curvature. The drive's
+    reported velocity is quantised and, on this arm, reads up to 7.8 deg/s while
+    the joint provably has not moved; a fit over a tenth of a second of 0.001
+    deg position resolves speed some three orders of magnitude finer.
+    """
+    if len(frames) < 3:
+        return None
+    stamps = np.asarray([f.get("stamp_s", 0.0) for f in frames], dtype=float)
+    span = float(stamps[-1] - stamps[0])
+    if not np.isfinite(span) or span <= 0.0:
+        return None
+    centre = 0.5 * (stamps[0] + stamps[-1])
+    t = stamps - centre
+
+    positions = np.asarray([f["position_deg"] for f in frames], dtype=float)
+    if positions.shape[1] != joint_count:
+        return None
+    basis = np.vstack([np.ones_like(t), t, t ** 2]).T
+    coefficients, *_ = np.linalg.lstsq(basis, positions, rcond=None)
+    residual = positions - basis @ coefficients
+
+    sample = {
+        "position_deg": coefficients[0].tolist(),
+        "speed_deg_s": coefficients[1].tolist(),
+        "acceleration_deg_s2": (2.0 * coefficients[2]).tolist(),
+        "stamp_s": float(centre),
+        "window_frames": len(frames),
+        "window_span_s": round(span, 5),
+        # How straight the motion was over the window. A pass that was still
+        # ramping, or a frame dropped mid-window, shows up here rather than
+        # silently biasing the speed.
+        "window_fit_rms_deg": float(np.sqrt(np.mean(residual ** 2))),
+    }
+    for key in ("current_a", "temperature_c", "voltage_v"):
+        values = [f.get(key, []) for f in frames]
+        if all(len(v) == joint_count for v in values):
+            sample[key] = np.asarray(values, dtype=float).mean(axis=0).tolist()
+        else:
+            sample[key] = []
+    for key, combine in (("enabled", all), ("fault_code", max)):
+        values = [f.get(key, []) for f in frames]
+        if all(len(v) == joint_count for v in values):
+            sample[key] = [combine(v[index] for v in values)
+                           for index in range(joint_count)]
+        else:
+            sample[key] = []
+    sample["arm_status"] = None
+    return sample
+
+
+def pick_windows(frames: list[dict], count: int, span_s: float) -> list[list[dict]]:
+    """Evenly spaced bursts from the settled middle of a motion.
+
+    The ends are ramps, so they are excluded: what the friction phase wants is
+    the part where the joint is already up to speed.
+    """
+    if not frames or count < 1:
+        return []
+    stamps = [f.get("stamp_s", 0.0) for f in frames]
+    total = stamps[-1] - stamps[0]
+    if total <= 0.0:
+        return []
+    # Keep clear of the ramps at either end.
+    usable = [f for f in frames
+              if stamps[0] + 0.2 * total <= f.get("stamp_s", 0.0)
+              <= stamps[0] + 0.8 * total]
+    if len(usable) < 3:
+        usable = frames
+    windows = []
+    for index in range(count):
+        share = (index + 0.5) / count
+        centre = usable[0]["stamp_s"] + share * (
+            usable[-1]["stamp_s"] - usable[0]["stamp_s"])
+        burst = [f for f in usable
+                 if abs(f.get("stamp_s", 0.0) - centre) <= 0.5 * span_s]
+        if len(burst) >= 3:
+            windows.append(burst)
+    return windows
+
+
 @dataclass
 class HardwareConfig:
     action: str = "/joint_trajectory_controller/follow_joint_trajectory"
@@ -71,6 +155,14 @@ class HardwareConfig:
     settle_s: float = SETTLE_S
     settle_samples: int = 5
     stream_rate_hz: float = 50.0
+    # One motion yields this many fitted samples, each from a burst of raw
+    # frames this long. Repeated frames at one pose are repeated rows of the
+    # same regressor, so collecting thousands of them buys noise averaging and
+    # nothing else, while out-voting the sweeps that carry the speed content.
+    window_span_s: float = 0.1
+    windows_per_move: int = 3
+    # Every raw frame behind those samples, kept for the run folder.
+    keep_raw_frames: bool = True
     require_neutral_start: bool = True
     goal_timeout_margin_s: float = 8.0
 
@@ -101,6 +193,10 @@ class HardwarePlant:
         self._lock = threading.Lock()
         self._latest: dict | None = None
         self._latest_at = 0.0
+        # Every frame of the motion in flight, at the publisher's full rate.
+        self._buffer: list[dict] = []
+        self._buffering = False
+        self.raw_frames: list[dict] = []
         self._previous_position: tuple[np.ndarray | None, float] = (None, 0.0)
         self._client = None
         self._rclpy = None
@@ -210,9 +306,20 @@ class HardwarePlant:
         spare = "torque" if signals.effort_source == "current" else "current"
         if spare in columns:
             frame[f"{spare}_measured"] = [float(v) for v in columns[spare]]
+        # The publisher's own stamp, not the time this callback ran. Messages
+        # arrive in bursts whenever the executor gets a slice, so arrival time
+        # compresses a second of motion into a millisecond and any speed
+        # differentiated from it is meaningless.
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        if stamp is not None:
+            frame["stamp_s"] = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        else:
+            frame["stamp_s"] = time.monotonic()
         with self._lock:
             self._latest = frame
             self._latest_at = time.monotonic()
+            if self._buffering:
+                self._buffer.append(frame)
 
     def _speed(self, columns: dict, position_deg: np.ndarray) -> list[float]:
         """Mapped velocity when the drive publishes one, else differentiated.
@@ -258,6 +365,40 @@ class HardwarePlant:
             if time.monotonic() - self._latest_at > maximum_age_s:
                 return None
             return dict(self._latest)
+
+    def _capture(self) -> None:
+        with self._lock:
+            self._buffer = []
+            self._buffering = True
+
+    def _harvest(self, tag: str, phase: str = "") -> list[dict]:
+        """Stop buffering and return the motion's frames, keeping a copy."""
+        with self._lock:
+            self._buffering = False
+            frames = self._buffer
+            self._buffer = []
+        if self.config.keep_raw_frames:
+            for index, frame in enumerate(frames):
+                stored = dict(frame)
+                stored["motion"] = tag
+                stored["phase"] = phase
+                stored["frame"] = index
+                self.raw_frames.append(stored)
+        return frames
+
+    def _observations(self, frames: list[dict], tag: str) -> list[dict]:
+        """The fitted samples one motion contributes to the regression."""
+        windows = pick_windows(frames, self.config.windows_per_move,
+                               self.config.window_span_s)
+        found = []
+        for index, burst in enumerate(windows):
+            fitted = fit_window(burst, self.joint_count)
+            if fitted is None:
+                continue
+            fitted["motion"] = tag
+            fitted["window"] = index
+            found.append(fitted)
+        return found
 
     def _require_sample(self) -> dict:
         frame = self.sample()
@@ -363,17 +504,22 @@ class HardwarePlant:
         return self.dwell()
 
     def dwell(self, pose_deg=None) -> dict:
-        """Average fresh frames where the arm already stands, commanding nothing.
+        """Fit a burst of frames where the arm already stands.
 
-        Repeated readings at one pose are independent draws of sensor noise.
-        They neither need nor should pay for another trajectory goal: a
-        zero-distance goal still costs a full minimum segment plus settle.
+        Fitting rather than averaging because the slope is worth having: it
+        says whether the arm is truly still, which the drive's own velocity
+        channel cannot, and it is the speed the regression will use.
         """
-        frames = []
-        for _ in range(max(1, self.config.settle_samples)):
-            frames.append(self._require_sample())
-            self._spin_for(0.05)
-        return _average(frames, self.joint_count)
+        self._capture()
+        self._spin_for(max(self.config.window_span_s * 3.0, 0.15))
+        frames = self._harvest("dwell", "A_gravity")
+        fitted = fit_window(frames, self.joint_count) if frames else None
+        if fitted is not None:
+            return fitted
+        # No buffered frames means the subscription is not delivering; fall
+        # back to the latest single frame so the caller sees a real failure
+        # from the guard rather than an empty sample here.
+        return self._require_sample()
 
     def park(self) -> dict:
         """Return to neutral so no joint is left holding a load."""
@@ -406,9 +552,15 @@ class HardwarePlant:
         ]
 
         collected: list[dict] = []
-        self._execute(points, lambda _t, frame: collected.append(frame))
-        for frame in collected:
-            yield frame
+        self._capture()
+        try:
+            self._execute(points, lambda _t, frame: collected.append(frame))
+        finally:
+            frames = self._harvest(
+                f"traverse:j{joint}:{speed:g}:{'+' if distance_deg > 0 else '-'}",
+                "B_friction")
+        for observation in self._observations(frames, f"traverse:j{joint}:{speed:g}"):
+            yield observation
 
     def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float):
         """Cross the pose slowly both ways instead of holding still on it.
@@ -450,11 +602,21 @@ class HardwarePlant:
             (end, np.zeros(self.joint_count), ramp + cruise + ramp),
         ]
         collected: list[dict] = []
-        self._execute(points, lambda _t, frame: collected.append(frame))
-        return collected
+        self._capture()
+        try:
+            self._execute(points, lambda _t, frame: collected.append(frame))
+        finally:
+            frames = self._harvest(f"sweep:{speed:g}", "A_gravity")
+        return self._observations(frames, f"sweep:{speed:g}")
 
     def track(self, trajectory, rate_hz: float):
-        """Follow the Fourier design, then differentiate what actually happened."""
+        """Follow the Fourier design and fit consecutive windows of it.
+
+        Acceleration comes out of the same quadratic fit as the speed, so the
+        phase no longer differentiates the drive's quantised velocity channel,
+        which amplified its noise into exactly the term this phase exists to
+        measure.
+        """
         start, _velocity, _acceleration = trajectory.sample(0.0)
         self.hold_pose(start)
 
@@ -465,24 +627,33 @@ class HardwarePlant:
             position, velocity, _ = trajectory.sample(time_s)
             points.append((position, velocity, time_s))
 
-        stamps: list[float] = []
-        collected: list[dict] = []
-
-        def capture(elapsed, frame):
-            stamps.append(elapsed)
-            collected.append(frame)
-
-        self._execute(points, capture)
-        if len(collected) < 3:
+        self._capture()
+        try:
+            self._execute(points)
+        finally:
+            frames = self._harvest("track", "C_inertia")
+        if len(frames) < 3:
             raise RuntimeError(
-                f"phase C captured {len(collected)} frames, which is too few to "
-                "differentiate; check the joint state rate")
-        speeds = np.asarray([f["speed_deg_s"] for f in collected], dtype=float)
-        accelerations = differentiate(stamps, speeds)
-        for frame, acceleration in zip(collected, accelerations):
-            frame = dict(frame)
-            frame["acceleration_deg_s2"] = acceleration.tolist()
-            yield frame
+                f"phase C captured {len(frames)} frames, which is too few to "
+                "fit; check the joint state rate")
+        span = max(self.config.window_span_s, 1e-3)
+        burst: list[dict] = []
+        produced = 0
+        for frame in frames:
+            if burst and frame["stamp_s"] - burst[0]["stamp_s"] >= span:
+                fitted = fit_window(burst, self.joint_count)
+                if fitted is not None:
+                    fitted["motion"] = "track"
+                    fitted["window"] = produced
+                    produced += 1
+                    yield fitted
+                burst = []
+            burst.append(frame)
+        fitted = fit_window(burst, self.joint_count)
+        if fitted is not None:
+            fitted["motion"] = "track"
+            fitted["window"] = produced
+            yield fitted
 
 
 def _average(frames: list[dict], joint_count: int) -> dict:

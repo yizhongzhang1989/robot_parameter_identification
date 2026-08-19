@@ -17,16 +17,19 @@ import time
 
 RESULT_NAME = "result.json"
 OBSERVATIONS_NAME = "observations.csv"
+RAW_FRAMES_NAME = "raw_frames.csv"
 REPORT_NAME = "report.html"
 
 # Column order per joint in the CSV. Kept explicit so the header and the rows
 # cannot drift apart.
 JOINT_COLUMNS = ("position_deg", "velocity_deg_s", "acceleration_deg_s2",
                  "effort", "temperature_c")
+# Every frame behind a fitted observation, at the publisher's full rate.
+RAW_COLUMNS = ("position_deg", "velocity_deg_s", "effort", "temperature_c")
 
 
 def write_run(directory, payload: dict, observations=None,
-              stamp: str | None = None) -> Path:
+              stamp: str | None = None, raw_frames=None) -> Path:
     """Create one folder for this run and fill it. Returns the folder."""
     mode = str(payload.get("mode") or "run")
     stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
@@ -34,10 +37,13 @@ def write_run(directory, payload: dict, observations=None,
     folder.mkdir(parents=True, exist_ok=True)
     (folder / RESULT_NAME).write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    names = joint_names(payload)
     rows = write_observations(folder / OBSERVATIONS_NAME, observations or [],
-                              joint_names(payload))
+                              names)
+    frames = write_raw_frames(folder / RAW_FRAMES_NAME, raw_frames or [], names)
     (folder / REPORT_NAME).write_text(
-        render_report(payload, observation_rows=rows, stamp=stamp),
+        render_report(payload, observation_rows=rows, stamp=stamp,
+                      raw_rows=frames),
         encoding="utf-8")
     return folder
 
@@ -53,7 +59,8 @@ def joint_names(payload: dict) -> list[str]:
 
 def write_observations(path, observations, names: list[str]) -> int:
     """Every sample the campaign kept, one row each. Returns the row count."""
-    header = ["phase", "time_s"]
+    header = ["phase", "time_s", "motion", "window_frames",
+              "window_fit_rms_deg"]
     for name in names:
         header += [f"{name}.{column}" for column in JOINT_COLUMNS]
     written = 0
@@ -62,7 +69,10 @@ def write_observations(path, observations, names: list[str]) -> int:
         writer.writerow(header)
         for record in observations:
             row = [getattr(record, "phase", ""),
-                   _round(getattr(record, "time_s", 0.0), 4)]
+                   _round(getattr(record, "time_s", 0.0), 4),
+                   getattr(record, "motion", ""),
+                   getattr(record, "window_frames", 0),
+                   _round(getattr(record, "window_fit_rms_deg", 0.0), 6)]
             for index in range(len(names)):
                 row += [_round(_at(record, "position_deg", index), 5),
                         _round(_at(record, "velocity_deg_s", index), 5),
@@ -72,6 +82,41 @@ def write_observations(path, observations, names: list[str]) -> int:
             writer.writerow(row)
             written += 1
     return written
+
+
+def write_raw_frames(path, frames, names: list[str]) -> int:
+    """Every frame the plant saw, at the rate the driver published it.
+
+    The fit sees the fitted windows, not these. They are written so the
+    collapse from a burst of frames to one sample can be checked rather than
+    taken on trust.
+    """
+    header = ["phase", "motion", "frame", "stamp_s"]
+    for name in names:
+        header += [f"{name}.{column}" for column in RAW_COLUMNS]
+    written = 0
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for frame in frames:
+            row = [frame.get("phase", ""), frame.get("motion", ""),
+                   frame.get("frame", ""), _round(frame.get("stamp_s"), 6)]
+            for index in range(len(names)):
+                row += [_round(_item(frame, "position_deg", index), 5),
+                        _round(_item(frame, "speed_deg_s", index), 5),
+                        _round(_item(frame, "current_a", index), 6),
+                        _round(_item(frame, "temperature_c", index), 2)]
+            writer.writerow(row)
+            written += 1
+    return written
+
+
+def _item(frame: dict, key: str, index: int):
+    values = frame.get(key)
+    try:
+        return values[index]
+    except (TypeError, IndexError, KeyError):
+        return None
 
 
 def _at(record, field: str, index: int):
@@ -96,14 +141,16 @@ def _round(value, digits: int):
 # --------------------------------------------------------------------------
 
 def render_report(payload: dict, observation_rows: int = 0,
-                  stamp: str | None = None) -> str:
+                  stamp: str | None = None, raw_rows: int = 0) -> str:
     """A standalone HTML page. No network, no build step, both languages."""
     document = {
         "payload": payload,
         "names": joint_names(payload),
         "rows": observation_rows,
+        "rawRows": raw_rows,
         "stamp": stamp or time.strftime("%Y%m%d-%H%M%S"),
-        "files": {"result": RESULT_NAME, "observations": OBSERVATIONS_NAME},
+        "files": {"result": RESULT_NAME, "observations": OBSERVATIONS_NAME,
+                  "raw": RAW_FRAMES_NAME},
     }
     blob = json.dumps(document, ensure_ascii=False, default=_plain)
     # A literal </script> inside the data would end the block early.
@@ -166,7 +213,8 @@ TEXT = {
     "summary.joints": {"en": "joints", "zh": "关节数"},
     "summary.quantity": {"en": "identified quantity", "zh": "辨识量"},
     "summary.action": {"en": "trajectory action", "zh": "轨迹动作服务"},
-    "summary.samples": {"en": "raw samples", "zh": "原始样本数"},
+    "summary.samples": {"en": "fitted samples", "zh": "拟合样本数"},
+    "summary.raw": {"en": "raw frames behind them", "zh": "其背后的原始帧数"},
     "summary.validation": {"en": "validation samples", "zh": "验证样本数"},
     "quantity.current": {"en": "motor current", "zh": "电机电流"},
     "quantity.torque": {"en": "joint torque", "zh": "关节扭矩"},
@@ -346,11 +394,21 @@ TEXT = {
         "zh": "拟合参数及本页所有汇总数值，机器可读格式。",
     },
     "files.observations": {
-        "en": "Every sample the campaign kept: phase, time, and per joint the "
-              "position, speed, acceleration, effort and temperature. Columns "
-              "are named after the URDF joints.",
-        "zh": "本次保留的全部样本：阶段、时间，以及每个关节的位置、速度、加速度、"
-              "驱动量和温度。列名与 URDF 关节名对应。",
+        "en": "One row per fitted sample: the phase, the motion it came from, "
+              "how many raw frames the window held and how well they fitted a "
+              "straight motion, then per joint the position, speed, "
+              "acceleration, effort and temperature. This is what the fit saw. "
+              "Columns are named after the URDF joints.",
+        "zh": "每个拟合样本一行：阶段、来源运动、窗口内的原始帧数及其拟合残差，"
+              "随后是每个关节的位置、速度、加速度、驱动量和温度。这是拟合实际看到的数据。"
+              "列名与 URDF 关节名对应。",
+    },
+    "files.raw": {
+        "en": "Every frame the driver published during each motion, at its full "
+              "rate. The fit does not use these; they are here so the collapse "
+              "from a burst of frames into one sample can be checked.",
+        "zh": "每次运动中驱动器发布的每一帧，按其原始速率记录。拟合不使用这些数据，"
+              "提供它们是为了让由一批帧塌缩成一个样本的这一步可被核查。",
     },
     "files.report": {"en": "This page.", "zh": "本页面。"},
 
@@ -514,6 +572,7 @@ function summarySection() {
     ['summary.joints', JOINTS.length],
     ['summary.quantity', t(SOURCE) + ' (' + UNIT + ')'],
     ['summary.samples', DOC.rows],
+    ['summary.raw', DOC.rawRows || 0],
     ['summary.validation', P.validation_samples ?? 0],
     ['summary.action', P.action || '—'],
   ];
@@ -651,6 +710,7 @@ function fileSection() {
   const items = [
     [DOC.files.result, 'files.result'],
     [DOC.files.observations, 'files.observations'],
+    [DOC.files.raw, 'files.raw'],
     ['report.html', 'files.report'],
   ];
   return `<section><h2 data-i18n="files.head"></h2><dl>

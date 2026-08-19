@@ -69,6 +69,10 @@ class AnalyticPlant:
     temperature_c: float = 32.0
     seed: int = 0
     collision_scene: object | None = None
+    # Matched to the hardware plant: a rehearsal whose data is shaped nothing
+    # like a real run rehearses nothing worth knowing.
+    windows_per_move: int = 3
+    window_span_s: float = 0.1
 
     def __post_init__(self) -> None:
         count = self.profile.joint_count
@@ -115,22 +119,22 @@ class AnalyticPlant:
             return
         direction = math.copysign(1.0, float(distance_deg))
         duration = max(span / speed, MINIMUM_SEGMENT_S)
-        steps = max(2, int(duration * 50.0))
-        for index in range(steps + 1):
-            fraction = index / steps
+        # Sampled where the hardware plant samples: a few points from the
+        # settled middle, not the ramps at either end.
+        count = max(1, int(self.windows_per_move))
+        for index in range(count):
+            share = 0.2 + 0.6 * (index + 0.5) / count
             pose = start.copy()
-            pose[joint] = start[joint] + direction * span * fraction
+            pose[joint] = start[joint] + direction * span * share
             velocity = np.zeros(self.joint_count)
-            # The ends are ramps in reality; a constant-speed body is what the
-            # friction phase is actually interested in.
             velocity[joint] = direction * speed
-            self._clock += duration / steps
+            self._clock += duration / count
             yield self._sample(pose, velocity, np.zeros(self.joint_count),
                                "traverse")
 
     def track(self, trajectory: excitation.FourierTrajectory, rate_hz: float):
-        rate = max(1.0, float(rate_hz))
-        steps = max(2, int(trajectory.duration_s * rate))
+        spacing = max(self.window_span_s, 1.0 / max(1.0, float(rate_hz)))
+        steps = max(2, int(trajectory.duration_s / spacing))
         for index in range(steps + 1):
             moment = trajectory.duration_s * index / steps
             pose, velocity, acceleration = trajectory.sample(moment)
