@@ -156,8 +156,12 @@ button.stop { background: rgba(224,179,65,.16); border-color: rgba(224,179,65,.4
 
 table.kv { width: 100%; border-collapse: collapse; font-size: 12px; }
 table.kv td { padding: 3px 0; vertical-align: top; }
-table.kv td:first-child { color: var(--muted); width: 46%; }
-table.kv td.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* The label must not wrap: a long unbreakable value such as a topic name
+   would otherwise squeeze it, and CJK labels wrap one character per line. */
+table.kv td:first-child { color: var(--muted); width: 46%; white-space: nowrap;
+  padding-right: 8px; }
+table.kv td.num { text-align: right; font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere; }
 td.ok { color: var(--ok); } td.bad { color: var(--bad); } td.warn { color: var(--warn); }
 
 #obst-list { list-style: none; margin: 8px 0 0; padding: 0; }
