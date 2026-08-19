@@ -262,19 +262,24 @@ TEXT = {
               "重力与惯性已被扣除，剩下的就是摩擦需要解释的部分。",
     },
     "charts.friction.green": {
-        "en": "from phase B, the friction sweeps. One joint moves back and "
-              "forth about a single nominal pose across the whole speed range. "
-              "Because the pose barely changes, a difference between two green "
-              "points is a difference in speed.",
-        "zh": "来自 B 摩擦阶段的扫掠。此时只有一个关节绕同一标称位姿往复运动，"
-              "覆盖整个速度区间。由于位姿几乎不变，两个绿点之间的差异就是速度造成的差异。",
+        "en": "from phase B, and only where this joint was the one being "
+              "swept. It moves back and forth about a single nominal pose "
+              "across the whole speed range, so with the pose barely changing, "
+              "a difference between two green points is a difference in speed. "
+              "The sweeps of the other joints are recorded too, but this joint "
+              "is standing still through them, so they are drawn blue.",
+        "zh": "来自 B 摩擦阶段，且只包含本关节自己被扫掠的样本。此时它绕同一标称位姿"
+              "往复运动、覆盖整个速度区间，位姿几乎不变，因此两个绿点之间的差异就是"
+              "速度造成的差异。其他关节被扫掠时本关节是静止的，那些样本按蓝色绘制。",
     },
     "charts.friction.blue": {
-        "en": "from phase A, held still at many poses, and phase C, all joints "
-              "on a smooth trajectory. Together they cover many poses but "
+        "en": "from phase A, held still at many poses, phase C, all joints on "
+              "a smooth trajectory, and the parts of phase B where a different "
+              "joint was being swept. Together they cover many poses but "
               "almost only low speed.",
-        "zh": "来自 A 重力阶段（在多个位姿静止保持）与 C 惯性阶段（所有关节沿平滑轨迹运动）。"
-              "两者覆盖了很多位姿，但速度几乎都很低。",
+        "zh": "来自 A 重力阶段（在多个位姿静止保持）、C 惯性阶段（所有关节沿平滑轨迹"
+              "运动），以及 B 阶段中其他关节被扫掠的部分。它们覆盖了很多位姿，"
+              "但速度几乎都很低。",
     },
     "charts.friction.curve": {
         "en": "the fitted model, coulomb x tanh(speed / transition) + viscous x "
@@ -306,8 +311,9 @@ TEXT = {
         "zh": "A 与 C 阶段：即上图中以蓝色绘制的那组低速、多位姿数据。",
     },
     "charts.residual.green": {
-        "en": "phase B, the sweeps: one joint, one pose, the full speed range.",
-        "zh": "B 阶段的扫掠：单个关节、单一位姿、覆盖整个速度区间。",
+        "en": "phase B, and only where this joint was the one being swept: "
+              "one joint, one pose, the full speed range.",
+        "zh": "B 阶段中本关节自己被扫掠的样本：单个关节、单一位姿、覆盖整个速度区间。",
     },
     "charts.residual.read": {
         "en": "A shapeless band about zero is measurement noise, and is what a "
@@ -793,6 +799,38 @@ function caption(ctx, box, text) {
   ctx.fillText(text, box.left + 8, box.top + 13);
 }
 
+/* The speed axis carried a name but no numbers, so a cluster could be seen
+ * without being placed. */
+function xTicks(ctx, box, maxSpeed, sx) {
+  const step = niceStep(2 * maxSpeed / 8);
+  ctx.textAlign = 'center';
+  for (let v = -Math.floor(maxSpeed / step) * step; v <= maxSpeed; v += step) {
+    const x = sx(v);
+    if (x < box.left - 1 || x > box.right + 1) continue;
+    ctx.strokeStyle = v === 0 ? '#2a3038' : '#20252d';
+    ctx.beginPath();
+    ctx.moveTo(x, box.top);
+    ctx.lineTo(x, box.bottom);
+    ctx.stroke();
+    ctx.fillStyle = '#8b96a5';
+    ctx.fillText(formatTick(v, step), x, box.bottom + 14);
+  }
+  ctx.textAlign = 'left';
+}
+
+function niceStep(raw) {
+  const power = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1e-9))));
+  for (const factor of [1, 2, 2.5, 5, 10]) {
+    if (factor * power >= raw) return factor * power;
+  }
+  return 10 * power;
+}
+
+function formatTick(value, step) {
+  const digits = step >= 1 ? 0 : (step >= 0.1 ? 1 : 2);
+  return value.toFixed(digits);
+}
+
 function frictionCurve(entry, maxSpeed) {
   const f = entry.friction || {};
   const transition = (entry.components || {}).coulomb_transition_deg_s || 0;
@@ -825,13 +863,12 @@ function drawFriction(canvas, entry, samples, label, forced) {
   const low = forced ? forced.low : Math.min(...values);
   const high = forced ? forced.high : Math.max(...values);
   const span = (high - low) || 1;
-  const box = { left: 62, right: width - 12, top: 12, bottom: height - 30 };
+  const box = { left: 62, right: width - 12, top: 12, bottom: height - 44 };
   const sx = (v) => box.left + ((v + maxSpeed) / (2 * maxSpeed)) * (box.right - box.left);
   const sy = (e) => box.bottom - ((e - low) / span) * (box.bottom - box.top);
   axes(ctx, box);
   yTicks(ctx, box, low, high, UNIT);
-  ctx.strokeStyle = '#2a3038';
-  ctx.beginPath(); ctx.moveTo(sx(0), box.top); ctx.lineTo(sx(0), box.bottom); ctx.stroke();
+  xTicks(ctx, box, maxSpeed, sx);
   ctx.fillStyle = 'rgba(77,163,255,.45)';
   points.forEach((s) => { if (!s.sweep) ctx.fillRect(sx(s.speed) - 1, sy(s.effort) - 1, 2, 2); });
   ctx.fillStyle = 'rgba(120,220,150,.9)';
@@ -851,13 +888,14 @@ function drawFriction(canvas, entry, samples, label, forced) {
 function drawResidual(canvas, points, label, forced) {
   const { ctx, width, height } = frame(canvas);
   if (!points || !points.length) return empty(ctx, width, height);
-  const box = { left: 62, right: width - 12, top: 12, bottom: height - 30 };
+  const box = { left: 62, right: width - 12, top: 12, bottom: height - 44 };
   const maxSpeed = Math.max(1, ...points.map((p) => Math.abs(p.speed)));
   const maxRes = forced || Math.max(1e-6, ...points.map((p) => Math.abs(p.residual)));
   const sx = (v) => box.left + ((v + maxSpeed) / (2 * maxSpeed)) * (box.right - box.left);
   const sy = (r) => (box.top + box.bottom) / 2 - (r / maxRes) * ((box.bottom - box.top) / 2);
   axes(ctx, box);
   yTicks(ctx, box, -maxRes, maxRes, UNIT);
+  xTicks(ctx, box, maxSpeed, sx);
   ctx.fillStyle = 'rgba(226,86,90,.5)';
   points.forEach((p) => { if (!p.sweep) ctx.fillRect(sx(p.speed) - 1, sy(p.residual) - 1, 2, 2); });
   ctx.fillStyle = 'rgba(120,220,150,.9)';

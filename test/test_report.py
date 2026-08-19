@@ -330,6 +330,12 @@ class ChartLegendTest(unittest.TestCase):
         self.assertIn("var(--bad)", self.section)
         self.assertIn("var(--sweep)", self.section)
 
+    def test_the_speed_axis_is_numbered(self):
+        # It carried a name but no numbers, so a cluster could be seen without
+        # being placed anywhere on the axis.
+        self.assertIn("function xTicks", report._TEMPLATE)
+        self.assertIn("xTicks(ctx, box, maxSpeed, sx)", report._TEMPLATE)
+
     def test_each_legend_entry_explains_the_colour_not_just_names_it(self):
         for key in ("charts.friction.green", "charts.friction.blue",
                     "charts.friction.curve", "charts.residual.red",

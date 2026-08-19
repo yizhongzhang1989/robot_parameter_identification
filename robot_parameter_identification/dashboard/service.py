@@ -25,6 +25,28 @@ from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
 
 IDLE, RUNNING = "idle", "running"
+
+
+def _swept_here(record, joint: int) -> bool:
+    """Was *this* joint the one being swept when the sample was taken?
+
+    The friction phase moves one joint at a time, so six sevenths of a
+    seven-joint arm's sweep-phase samples are a record of the joint standing
+    still. Marking those as sweeps put a wall of them on the zero line of every
+    chart and invited exactly the comparison the two colours exist to prevent.
+    """
+    if getattr(record, "phase", "") != campaign_module.PHASE_FRICTION:
+        return False
+    motion = getattr(record, "motion", "") or ""
+    for part in motion.split(":"):
+        if part.startswith("j") and part[1:].isdigit():
+            return int(part[1:]) == joint
+    # Older runs carry no motion tag; fall back to whether it actually moved.
+    try:
+        return abs(float(record.velocity_deg_s[joint])) > 0.5
+    except (AttributeError, IndexError, TypeError):
+        return False
+
 # A campaign yields tens of thousands of samples; a scatter plot stops being
 # readable long before a browser stops being able to draw them.
 MAX_PLOT_POINTS = 1500
@@ -577,7 +599,7 @@ class IdentificationService:
                          "effort": round(measured - rigid, 4)}
                 error = {"speed": round(speed, 3),
                          "residual": round(measured - whole, 4)}
-                if getattr(record, "phase", "") == campaign_module.PHASE_FRICTION:
+                if _swept_here(record, index):
                     point["sweep"] = True
                     error["sweep"] = True
                 curve.append(point)

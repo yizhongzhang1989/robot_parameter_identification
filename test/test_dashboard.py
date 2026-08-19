@@ -10,7 +10,7 @@ try:
     from robot_parameter_identification.dashboard.http_server import (
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
-        DashboardConfig, IdentificationService)
+        DashboardConfig, IdentificationService, _swept_here)
     from robot_parameter_identification.interfaces import (
         SignalMap, TelemetrySpec)
     from fixtures import synthetic_urdf, test_profile, PREFIX
@@ -464,6 +464,43 @@ class StopTest(unittest.TestCase):
             deadline = time.monotonic() + 60
             while made.running() and time.monotonic() < deadline:
                 time.sleep(0.1)
+
+
+class SweptJointTest(unittest.TestCase):
+    """The friction phase moves one joint at a time, so most of its samples
+    are a record of any given joint standing still. Marking those as sweeps
+    put six sevenths of them on the zero line of a seven-joint arm's chart."""
+
+    class Record:
+        def __init__(self, phase, motion="", velocity=None):
+            self.phase = phase
+            self.motion = motion
+            self.velocity_deg_s = velocity or [0.0] * 7
+
+    def test_the_swept_joint_is_marked(self):
+        record = self.Record("B_friction", "traverse:j3:15")
+        self.assertTrue(_swept_here(record, 3))
+
+    def test_the_joints_standing_still_are_not(self):
+        record = self.Record("B_friction", "traverse:j3:15")
+        for joint in (0, 1, 2, 4, 5, 6):
+            self.assertFalse(_swept_here(record, joint), joint)
+
+    def test_other_phases_are_never_sweeps(self):
+        record = self.Record("A_gravity", "sweep:2")
+        self.assertFalse(_swept_here(record, 0))
+
+    def test_a_run_without_motion_tags_falls_back_to_movement(self):
+        # Results recorded before the tag existed still have to draw.
+        moving = [0.0] * 7
+        moving[2] = 20.0
+        record = self.Record("B_friction", "", moving)
+        self.assertTrue(_swept_here(record, 2))
+        self.assertFalse(_swept_here(record, 1))
+
+    def test_a_malformed_tag_does_not_raise(self):
+        record = self.Record("B_friction", "traverse:jX:15")
+        self.assertFalse(_swept_here(record, 0))
 
 
 class ProgressTest(unittest.TestCase):
