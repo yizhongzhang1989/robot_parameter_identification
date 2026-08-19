@@ -23,6 +23,11 @@ class ModelComponents:
     # instant it moves. On a harmonic drive the reversal is spread over a
     # finite speed, and most of this arm's data sits inside that spread.
     coulomb_transition_deg_s: float = 0.0
+    # Candidate widths to choose between, per joint. Twenty rungs of hardware
+    # data put the best width between 0.28 and 1.37 deg/s depending on the
+    # joint, so one asserted figure cannot serve them all: holding 1.8 for
+    # every joint cost the worst one sixty per cent of its held-out error.
+    coulomb_transition_search: tuple[float, ...] = ()
     actuator_inertia: bool = False
     stribeck: bool = False
     # Stribeck is only linear once this is fixed, so it is a setting, not a fit.
@@ -64,6 +69,13 @@ class ModelComponents:
                 raise ValueError(
                     "coulomb_transition_deg_s must be zero or positive")
             known["coulomb_transition_deg_s"] = width
+        if "coulomb_transition_search" in known:
+            widths = tuple(float(w) for w in
+                           known["coulomb_transition_search"] or ())
+            if any(not np.isfinite(w) or w <= 0.0 for w in widths):
+                raise ValueError(
+                    "coulomb_transition_search widths must be positive")
+            known["coulomb_transition_search"] = widths
         return cls(**known)
 
 

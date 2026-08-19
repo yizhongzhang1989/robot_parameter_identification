@@ -156,11 +156,20 @@ class HardwareConfig:
     settle_samples: int = 5
     stream_rate_hz: float = 50.0
     # One motion yields this many fitted samples, each from a burst of raw
-    # frames this long. Repeated frames at one pose are repeated rows of the
-    # same regressor, so collecting thousands of them buys noise averaging and
+    # frames. Repeated frames at one pose are repeated rows of the same
+    # regressor, so collecting thousands of them buys noise averaging and
     # nothing else, while out-voting the sweeps that carry the speed content.
+    #
+    # One window, not several: measured on this arm, the current wanders about
+    # twenty times more within a pass than the pass mean moves between
+    # repeats. Three short windows are three correlated looks at the same
+    # pass; one long one is a better measurement of it.
     window_span_s: float = 0.1
-    windows_per_move: int = 3
+    window_maximum_span_s: float = 1.5
+    # How far the joint may travel inside a window. Averaging across a wider
+    # arc than this starts averaging across a changing gravity term.
+    window_arc_deg: float = 6.0
+    windows_per_move: int = 1
     # Every raw frame behind those samples, kept for the run folder.
     keep_raw_frames: bool = True
     require_neutral_start: bool = True
@@ -196,6 +205,7 @@ class HardwarePlant:
         # Every frame of the motion in flight, at the publisher's full rate.
         self._buffer: list[dict] = []
         self._buffering = False
+        self._passes = 0
         self.raw_frames: list[dict] = []
         self._previous_position: tuple[np.ndarray | None, float] = (None, 0.0)
         self._client = None
@@ -386,10 +396,20 @@ class HardwarePlant:
                 self.raw_frames.append(stored)
         return frames
 
-    def _observations(self, frames: list[dict], tag: str) -> list[dict]:
+    def _window_span(self, speed_deg_s: float) -> float:
+        """The longest window this speed can fill without crossing much arc."""
+        speed = abs(float(speed_deg_s))
+        if speed <= 0.0:
+            return self.config.window_maximum_span_s
+        by_arc = self.config.window_arc_deg / speed
+        return float(min(max(by_arc, self.config.window_span_s),
+                         self.config.window_maximum_span_s))
+
+    def _observations(self, frames: list[dict], tag: str,
+                      speed_deg_s: float = 0.0) -> list[dict]:
         """The fitted samples one motion contributes to the regression."""
         windows = pick_windows(frames, self.config.windows_per_move,
-                               self.config.window_span_s)
+                               self._window_span(speed_deg_s))
         found = []
         for index, burst in enumerate(windows):
             fitted = fit_window(burst, self.joint_count)
@@ -553,13 +573,16 @@ class HardwarePlant:
 
         collected: list[dict] = []
         self._capture()
+        self._passes += 1
+        # The repeat index is part of the tag: without it three repeats of one
+        # rung share a name and cannot be told apart in the raw record.
+        tag = (f"traverse:j{joint}:{speed:g}:"
+               f"{'+' if distance_deg > 0 else '-'}:{self._passes}")
         try:
             self._execute(points, lambda _t, frame: collected.append(frame))
         finally:
-            frames = self._harvest(
-                f"traverse:j{joint}:{speed:g}:{'+' if distance_deg > 0 else '-'}",
-                "B_friction")
-        for observation in self._observations(frames, f"traverse:j{joint}:{speed:g}"):
+            frames = self._harvest(tag, "B_friction")
+        for observation in self._observations(frames, tag, speed):
             yield observation
 
     def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float):
@@ -603,11 +626,13 @@ class HardwarePlant:
         ]
         collected: list[dict] = []
         self._capture()
+        self._passes += 1
+        tag = f"sweep:{speed:g}:{self._passes}"
         try:
             self._execute(points, lambda _t, frame: collected.append(frame))
         finally:
-            frames = self._harvest(f"sweep:{speed:g}", "A_gravity")
-        return self._observations(frames, f"sweep:{speed:g}")
+            frames = self._harvest(tag, "A_gravity")
+        return self._observations(frames, tag, speed)
 
     def track(self, trajectory, rate_hz: float):
         """Follow the Fourier design and fit consecutive windows of it.

@@ -193,5 +193,67 @@ class GeneralisationTest(unittest.TestCase):
         self.assertAlmostEqual(whole - rigid, expected, places=3)
 
 
+class TransitionWidthTest(unittest.TestCase):
+    """The reversal width is a shape, not an amplitude, so it is searched.
+    Searching it against everything lets it absorb whatever else the fit could
+    not explain, so it is scored only where speed varies and pose does not."""
+
+    WIDTH = 1.8
+    COULOMB = 0.30
+    VISCOUS = 0.004
+
+    def _data(self, speeds, rng):
+        regressors, velocities, currents = [], [], []
+        for speed in speeds:
+            for _ in range(6):
+                pose = rng.normal(size=4)
+                row = np.zeros((1, 4))
+                row[0] = pose
+                regressors.append(row)
+                velocities.append(speed)
+                effort = (float(pose @ np.array([0.5, -0.2, 0.1, 0.3]))
+                          + self.COULOMB * np.tanh(speed / self.WIDTH)
+                          + self.VISCOUS * speed
+                          + rng.normal(scale=0.002))
+                currents.append(effort)
+        return regressors, velocities, currents
+
+    def _fit(self, speeds, rows=None, search=()):
+        rng = np.random.default_rng(3)
+        regressors, velocities, currents = self._data(speeds, rng)
+        components = ident.ModelComponents(
+            coulomb_transition_deg_s=self.WIDTH,
+            coulomb_transition_search=tuple(search))
+        return ident.fit_joint(
+            0, regressors, velocities, currents, components=components,
+            transition_rows=rows, maximum_condition=1e6)
+
+    def test_a_wide_ladder_recovers_the_planted_width(self):
+        speeds = [s for base in (0.3, 0.6, 1.2, 2.5, 5.0, 10.0, 20.0, 40.0)
+                  for s in (base, -base)]
+        grid = tuple(np.geomspace(0.08, 6.0, 25))
+        fit = self._fit(speeds, rows=[True] * len(speeds) * 6, search=grid)
+        self.assertAlmostEqual(
+            fit.components.coulomb_transition_deg_s, self.WIDTH, delta=0.6)
+
+    def test_without_marked_rows_the_width_is_left_alone(self):
+        speeds = [s for base in (0.3, 1.2, 5.0, 20.0) for s in (base, -base)]
+        grid = tuple(np.geomspace(0.08, 6.0, 25))
+        fit = self._fit(speeds, rows=None, search=grid)
+        self.assertEqual(fit.components.coulomb_transition_deg_s, self.WIDTH)
+
+    def test_too_few_marked_rows_leaves_the_width_alone(self):
+        speeds = [2.0, -2.0]
+        grid = tuple(np.geomspace(0.08, 6.0, 25))
+        rows = [True] * 4 + [False] * 8
+        fit = self._fit(speeds, rows=rows, search=grid)
+        self.assertEqual(fit.components.coulomb_transition_deg_s, self.WIDTH)
+
+    def test_an_empty_search_changes_nothing(self):
+        speeds = [s for base in (0.3, 1.2, 5.0, 20.0) for s in (base, -base)]
+        fit = self._fit(speeds, rows=[True] * 48, search=())
+        self.assertEqual(fit.components.coulomb_transition_deg_s, self.WIDTH)
+
+
 if __name__ == "__main__":
     unittest.main()

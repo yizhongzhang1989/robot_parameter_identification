@@ -190,19 +190,31 @@ class PassSizingTest(unittest.TestCase):
 
     CEILING = 80.0
 
-    def test_a_slow_pass_is_short(self):
-        self.assertLess(ri.pass_amplitude_deg(0.5, self.CEILING), 1.0)
+    def test_a_slow_pass_stays_short_in_travel(self):
+        # Time is what a slow pass is allowed to spend, because averaging is
+        # what it is for; travel is what must stay small, because travel is
+        # what costs workspace and changes the gravity term.
+        self.assertLess(ri.pass_amplitude_deg(0.5, self.CEILING), 3.0)
+
+    def test_a_crawl_is_given_longer_to_be_averaged_over(self):
+        from robot_parameter_identification import campaign
+
+        self.assertGreater(campaign.friction_cruise_s(0.5),
+                           2.0 * campaign.friction_cruise_s(60.0))
 
     def test_a_fast_pass_is_long(self):
         self.assertGreater(ri.pass_amplitude_deg(60.0, self.CEILING), 40.0)
 
-    def test_every_pass_takes_about_the_same_time(self):
-        # Which is the point: the cost of a rung does not depend on its speed.
-        durations = []
+    def test_no_pass_outstays_the_cruise_ceiling(self):
+        from robot_parameter_identification import campaign
+
         for speed in ri.friction_speed_ladder(60.0):
             amplitude = ri.pass_amplitude_deg(speed, self.CEILING)
-            durations.append(amplitude / speed)
-        self.assertLess(max(durations) / min(durations), 1.5)
+            ramps = speed ** 2 / campaign.SWEEP_ACCELERATION_DEG_S2
+            cruise = (amplitude - ramps) / speed
+            self.assertLessEqual(cruise,
+                                 campaign.FRICTION_MAXIMUM_CRUISE_S + 1e-6)
+            self.assertGreaterEqual(cruise, 0.4 * campaign.FRICTION_CRUISE_S)
 
     def test_it_never_exceeds_the_room_it_is_given(self):
         for speed in (1.0, 30.0, 60.0, 500.0):

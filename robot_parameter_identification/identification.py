@@ -13,7 +13,7 @@ result predicts current directly, which is what the impedance controller needs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import subprocess
 import tempfile
 from pathlib import Path
@@ -22,6 +22,14 @@ import numpy as np
 import pinocchio as pin
 
 from .model import DEFAULT_COMPONENTS, ModelComponents, extra_row
+
+# Samples needed inside a candidate reversal before it is worth considering.
+MINIMUM_TRANSITION_SAMPLES = 12
+# Relative residual improvement a fitted width must show before it displaces
+# the configured one. Hardware gains were eleven to sixty per cent; anything
+# near the noise is the split between Coulomb and viscous drifting, not a
+# better measurement of the reversal.
+TRANSITION_GAIN = 0.05
 
 PARAMETERS_PER_LINK = 10
 FRICTION_COLUMNS = ("coulomb", "viscous", "offset")
@@ -367,6 +375,63 @@ def _solve(rigid: np.ndarray, velocities: np.ndarray, accelerations: np.ndarray,
     return outcome
 
 
+def _fit_transition(rigid, velocities, accelerations, components, target,
+                    tolerance, maximum_condition, rigid_width, mask=None):
+    """Solve once per candidate reversal width and keep the best.
+
+    The width sets the shape of a column rather than its amplitude, so it
+    cannot be solved for linearly. Amplitudes are still fitted on everything;
+    only the choice between widths is scored, and only on the rows the caller
+    marks.
+
+    Those rows matter. Scoring on all of the data lets the width absorb
+    whatever the rigid-body block could not: on a joint whose block was
+    truncated to rank eleven of nineteen, the search cut the residual eightfold
+    by moving the width from the planted 1.8 to 2.44 and inflating Coulomb by a
+    third. Scored on passes where the joint sweeps about one pose, gravity is a
+    constant the offset takes and speed is the only thing that varies, which is
+    the condition under which a reversal width means anything.
+    """
+    candidates = tuple(getattr(components, "coulomb_transition_search", ())
+                       or ())
+    default = replace(components, coulomb_transition_search=())
+    baseline = _solve(rigid, velocities, accelerations, default, target,
+                      tolerance, maximum_condition, rigid_width)
+    if not candidates or baseline is None:
+        return None if baseline is None else (default, baseline)
+    if mask is None or int(np.count_nonzero(mask)) < MINIMUM_TRANSITION_SAMPLES:
+        return (default, baseline)
+
+    mask = np.asarray(mask, dtype=bool)
+    speeds = np.abs(np.asarray(velocities, dtype=float))[mask]
+    reference = _residual_of(baseline, target, mask)
+    best = None
+    for width in candidates:
+        # Below this the tanh column is saturated at every sample present, so
+        # nothing distinguishes one such candidate from another.
+        if int(np.count_nonzero(speeds <= 3.0 * width)) < 4:
+            continue
+        trial = replace(default, coulomb_transition_deg_s=float(width))
+        outcome = _solve(rigid, velocities, accelerations, trial, target,
+                         tolerance, maximum_condition, rigid_width)
+        if outcome is None:
+            continue
+        residual = _residual_of(outcome, target, mask)
+        if best is None or residual < best[0]:
+            best = (residual, trial, outcome)
+    if best is None or best[0] > reference * (1.0 - TRANSITION_GAIN):
+        return (default, baseline)
+    return (best[1], best[2])
+
+
+def _residual_of(outcome, target, mask=None) -> float:
+    stacked, columns, solution, _rank, _condition = outcome
+    error = target - stacked[:, columns] @ solution
+    if mask is not None:
+        error = error[np.asarray(mask, dtype=bool)]
+    return float(np.sqrt(np.mean(error ** 2)))
+
+
 def fit_joint(
     joint: int, regressors: list[np.ndarray], velocities: list[float],
     currents: list[float], include_friction: bool = True,
@@ -374,6 +439,7 @@ def fit_joint(
     holdout_fraction: float = 0.25, seed: int = 0,
     accelerations: list[float] | None = None,
     components: ModelComponents | None = None,
+    transition_rows: list[bool] | None = None,
 ) -> JointRegression:
     """Regress one joint's measured current onto its dynamics columns."""
     if components is None:
@@ -391,10 +457,12 @@ def fit_joint(
     accelerations = np.asarray(accelerations, dtype=float)
     target = np.asarray(currents, dtype=float)
 
-    outcome = _solve(rigid, velocities, accelerations, components, target,
-                     tolerance, maximum_condition, rigid_width)
+    outcome = _fit_transition(rigid, velocities, accelerations, components,
+                              target, tolerance, maximum_condition,
+                              rigid_width, transition_rows)
     if outcome is None:
         raise ValueError(f"joint{joint + 1} data does not excite any parameter")
+    components, outcome = outcome
     stacked, columns, solution, rank, condition = outcome
 
     holdout_rms = None

@@ -71,7 +71,7 @@ class AnalyticPlant:
     collision_scene: object | None = None
     # Matched to the hardware plant: a rehearsal whose data is shaped nothing
     # like a real run rehearses nothing worth knowing.
-    windows_per_move: int = 3
+    windows_per_move: int = 1
     window_span_s: float = 0.1
 
     def __post_init__(self) -> None:

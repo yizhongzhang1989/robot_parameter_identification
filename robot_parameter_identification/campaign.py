@@ -34,6 +34,12 @@ PHASE_GRAVITY = "A_gravity"
 PHASE_FRICTION = "B_friction"
 PHASE_INERTIA = "C_inertia"
 PHASE_VALIDATION = "D_validation"
+
+# Reversal widths offered to each joint's fit. Hardware puts the best value
+# between 0.28 and 1.37 deg/s depending on the joint, so the grid brackets that
+# generously rather than asserting one figure for the whole arm.
+COULOMB_TRANSITION_SEARCH = tuple(
+    round(float(w), 4) for w in np.geomspace(0.08, 6.0, 25))
 PHASES = (PHASE_GRAVITY, PHASE_FRICTION, PHASE_INERTIA, PHASE_VALIDATION)
 
 MAXIMUM_CONDITION = 1.0e3
@@ -220,6 +226,8 @@ class CampaignPlan:
     # from a hard sign() to 1.8 deg/s cuts worst-joint validation error 11%
     # and the gain survives the non-negativity constraint, unlike Stribeck.
     coulomb_transition_deg_s: float = 1.8
+    # Offered to each joint's fit instead of asserting one width for the arm.
+    coulomb_transition_search: tuple[float, ...] = COULOMB_TRANSITION_SEARCH
     # Superseded by coulomb_transition_deg_s, which buys the same curvature
     # with one non-negative column instead of a cancelling pair. Left available
     # because a different transmission may genuinely show static > dynamic.
@@ -251,11 +259,14 @@ class CampaignPlan:
         payload["friction_speeds_deg_s"] = list(self.friction_speeds_deg_s)
         payload["validation_speeds_deg_s"] = list(self.validation_speeds_deg_s)
         payload["workspace_limit_deg"] = list(self.workspace_limit_deg)
+        payload["coulomb_transition_search"] = list(
+            self.coulomb_transition_search)
         return payload
 
     def model_components(self) -> ModelComponents:
         return ModelComponents(
             coulomb_transition_deg_s=self.coulomb_transition_deg_s,
+            coulomb_transition_search=tuple(self.coulomb_transition_search),
             stribeck=self.stribeck,
             stribeck_speed_deg_s=self.stribeck_speed_deg_s,
             load_friction=self.load_friction)
@@ -365,7 +376,14 @@ VALIDATION_SPEED_FRACTIONS = (0.35, 0.65)
 # Constant-speed time each pass must hold, which is what sizes its travel. A
 # fixed arc would make a slow pass take a minute and a fast one a fraction of a
 # second, for the same three fitted samples.
+#
+# Held longer when the joint is crawling: the current wanders far more within a
+# pass than the pass mean moves between repeats, so the averaging window is
+# what limits the measurement, and at half a degree per second four seconds of
+# it costs two degrees of travel.
 FRICTION_CRUISE_S = 1.0
+FRICTION_MAXIMUM_CRUISE_S = 4.0
+FRICTION_CRUISE_ARC_DEG = 6.0
 
 # The plant ramps a sweep over a quarter of its nominal duration, so a pass of
 # `distance` at `speed` implies 4*speed^2/distance of acceleration. A short
@@ -435,6 +453,16 @@ def friction_speed_ladder(maximum_speed_deg_s: float,
     return tuple(sorted(speed for speed in speeds if speed > 0.0))
 
 
+def friction_cruise_s(speed_deg_s: float) -> float:
+    """How long one pass holds its speed. Longer when that is cheap."""
+    speed = abs(float(speed_deg_s))
+    if speed <= 0.0:
+        return FRICTION_MAXIMUM_CRUISE_S
+    wanted = FRICTION_CRUISE_ARC_DEG / speed
+    return float(min(FRICTION_MAXIMUM_CRUISE_S,
+                     max(FRICTION_CRUISE_S, wanted)))
+
+
 def pass_amplitude_deg(speed_deg_s: float, ceiling_deg: float) -> float:
     """Travel for one pass at one speed: both ramps plus the cruise.
 
@@ -444,7 +472,8 @@ def pass_amplitude_deg(speed_deg_s: float, ceiling_deg: float) -> float:
     """
     speed = max(float(speed_deg_s), 0.0)
     ramps = speed * speed / SWEEP_ACCELERATION_DEG_S2
-    return float(min(float(ceiling_deg), ramps + speed * FRICTION_CRUISE_S))
+    return float(min(float(ceiling_deg),
+                     ramps + speed * friction_cruise_s(speed)))
 
 
 def sweep_amplitude_deg(maximum_speed_deg_s: float, requested: float) -> float:
@@ -588,6 +617,20 @@ def _fully_instrumented(sample: dict) -> bool:
     # Kept for callers that want to know; the monitor no longer waits for it,
     # because a guard that can run on the channels present should run.
     return all(sample.get(field) for field in MONITORED_FIELDS)
+
+
+def _swept_rows(observations, joint: int) -> list[bool]:
+    """Rows where this joint was the one being swept, one pass at one pose."""
+    rows = []
+    for record in observations:
+        swept = False
+        if getattr(record, "phase", "") == PHASE_FRICTION:
+            for part in (getattr(record, "motion", "") or "").split(":"):
+                if part.startswith("j") and part[1:].isdigit():
+                    swept = int(part[1:]) == joint
+                    break
+        rows.append(swept)
+    return rows
 
 
 class Campaign:
@@ -930,6 +973,7 @@ class Campaign:
                 [c[joint] for c in train_rows[2]],
                 maximum_condition=MAXIMUM_CONDITION,
                 components=self.plan.model_components(),
+                transition_rows=_swept_rows(training, joint),
                 seed=self.plan.seed)
             entry = fit.as_dict()
             if holdout_rows is not None:
