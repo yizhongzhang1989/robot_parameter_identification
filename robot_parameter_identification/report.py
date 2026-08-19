@@ -194,6 +194,15 @@ TEXT = {
 
     "charts.head": {"en": "Per-joint diagnostics", "zh": "逐关节诊断图"},
     "charts.pick": {"en": "joint", "zh": "关节"},
+    "charts.lock": {"en": "same scale for every joint",
+                    "zh": "所有关节共用同一刻度"},
+    "charts.lock.say": {
+        "en": "Each chart is scaled to its own joint by default, so a small "
+              "joint and a large one fill the frame identically and look the "
+              "same. Tick this to put them all on one scale and compare them.",
+        "zh": "默认每张图按各自关节的数据缩放，于是量级小的关节和量级大的关节"
+              "同样填满画框，看上去完全一样。勾选此项可将所有关节置于同一刻度以便比较。",
+    },
     "charts.friction": {"en": "Friction curve and its samples",
                         "zh": "摩擦曲线与样本"},
     "charts.friction.say": {
@@ -396,6 +405,10 @@ const P = DOC.payload || {};
 const JOINTS = P.joints || [];
 const NAMES = DOC.names || [];
 let lang = (navigator.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+// A language switch rebuilds the DOM, so what the reader had selected has to
+// live outside it.
+let locked = false;
+let picked = 0;
 
 const t = (key) => (TEXT[key] ? (TEXT[key][lang] ?? TEXT[key].en) : key);
 /* t() echoes the key when there is no entry, which is the wanted behaviour for
@@ -484,6 +497,9 @@ function chartSection() {
   return `<section><h2 data-i18n="charts.head"></h2>
     <label>${t('charts.pick')}
       <select id="pick">${options}</select></label>
+    <label style="margin-left:16px"><input type="checkbox" id="lock"/>
+      ${t('charts.lock')}</label>
+    <p class="say" style="margin-top:8px" data-i18n="charts.lock.say"></p>
     <h2 style="margin-top:18px" data-i18n="charts.friction"></h2>
     <p class="say" data-i18n="charts.friction.say"></p>
     <canvas id="c-friction" height="260"></canvas>
@@ -614,27 +630,69 @@ function empty(ctx, width, height) {
   ctx.textAlign = 'left';
 }
 
-function drawFriction(canvas, entry, samples) {
-  const { ctx, width, height } = frame(canvas);
-  if (!entry) return empty(ctx, width, height);
-  const points = samples || [];
+/* Ticks rather than a lone min and max in the corner: when the scale is the
+ * only thing that changes between two joints, one small number is not enough
+ * to notice it has changed. */
+function yTicks(ctx, box, low, high, unit) {
+  const span = (high - low) || 1;
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i += 1) {
+    const value = low + (span * i) / 4;
+    const y = box.bottom - ((value - low) / span) * (box.bottom - box.top);
+    ctx.strokeStyle = i === 0 || i === 4 ? '#2a3038' : '#20252d';
+    ctx.beginPath();
+    ctx.moveTo(box.left, y);
+    ctx.lineTo(box.right, y);
+    ctx.stroke();
+    ctx.fillStyle = '#8b96a5';
+    ctx.fillText(value.toFixed(2) + (i === 4 ? ' ' + unit : ''),
+                 box.left - 6, y + 3);
+  }
+  ctx.textAlign = 'left';
+}
+
+function caption(ctx, box, text) {
+  ctx.fillStyle = '#c6cedb';
+  ctx.fillText(text, box.left + 8, box.top + 13);
+}
+
+function frictionCurve(entry, maxSpeed) {
   const f = entry.friction || {};
   const transition = (entry.components || {}).coulomb_transition_deg_s || 0;
-  const speeds = points.map((s) => s.speed);
-  const maxSpeed = Math.max(10, ...speeds.map(Math.abs));
   const curve = [];
   for (let i = 0; i <= 160; i += 1) {
     const v = -maxSpeed + (2 * maxSpeed * i) / 160;
     const rev = transition > 0 ? Math.tanh(v / transition) : Math.sign(v);
     curve.push([v, (f.coulomb || 0) * rev + (f.viscous || 0) * v + (f.offset || 0)]);
   }
+  return curve;
+}
+
+function frictionSpan(index) {
+  const entry = JOINTS[index] || {};
+  const points = (P.friction_samples || [])[index] || [];
+  const maxSpeed = Math.max(10, ...points.map((s) => Math.abs(s.speed)));
+  const values = frictionCurve(entry, maxSpeed).map((p) => p[1])
+    .concat(points.map((s) => s.effort));
+  return { low: Math.min(...values), high: Math.max(...values) };
+}
+
+function drawFriction(canvas, entry, samples, label, forced) {
+  const { ctx, width, height } = frame(canvas);
+  if (!entry) return empty(ctx, width, height);
+  const points = samples || [];
+  const speeds = points.map((s) => s.speed);
+  const maxSpeed = Math.max(10, ...speeds.map(Math.abs));
+  const curve = frictionCurve(entry, maxSpeed);
   const values = curve.map((p) => p[1]).concat(points.map((s) => s.effort));
-  const low = Math.min(...values), high = Math.max(...values);
+  const low = forced ? forced.low : Math.min(...values);
+  const high = forced ? forced.high : Math.max(...values);
   const span = (high - low) || 1;
-  const box = { left: 54, right: width - 12, top: 12, bottom: height - 30 };
+  const box = { left: 62, right: width - 12, top: 12, bottom: height - 30 };
   const sx = (v) => box.left + ((v + maxSpeed) / (2 * maxSpeed)) * (box.right - box.left);
   const sy = (e) => box.bottom - ((e - low) / span) * (box.bottom - box.top);
   axes(ctx, box);
+  yTicks(ctx, box, low, high, UNIT);
   ctx.strokeStyle = '#2a3038';
   ctx.beginPath(); ctx.moveTo(sx(0), box.top); ctx.lineTo(sx(0), box.bottom); ctx.stroke();
   ctx.fillStyle = 'rgba(77,163,255,.45)';
@@ -644,32 +702,31 @@ function drawFriction(canvas, entry, samples) {
   ctx.strokeStyle = '#e0b341'; ctx.lineWidth = 1.8; ctx.beginPath();
   curve.forEach(([v, e], i) => { const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
   ctx.stroke();
+  const f = entry.friction || {};
+  caption(ctx, box, `${label}   c ${(f.coulomb || 0).toFixed(3)} ${UNIT}`
+    + `   v ${(f.viscous || 0).toFixed(4)} ${UNIT}/(°/s)`);
   ctx.fillStyle = '#8b96a5';
-  ctx.fillText(high.toFixed(2) + ' ' + UNIT, 4, box.top + 8);
-  ctx.fillText(low.toFixed(2), 4, box.bottom);
   ctx.textAlign = 'center';
   ctx.fillText(t('charts.speed'), (box.left + box.right) / 2, height - 8);
   ctx.textAlign = 'left';
 }
 
-function drawResidual(canvas, points) {
+function drawResidual(canvas, points, label, forced) {
   const { ctx, width, height } = frame(canvas);
   if (!points || !points.length) return empty(ctx, width, height);
-  const box = { left: 54, right: width - 12, top: 12, bottom: height - 30 };
+  const box = { left: 62, right: width - 12, top: 12, bottom: height - 30 };
   const maxSpeed = Math.max(1, ...points.map((p) => Math.abs(p.speed)));
-  const maxRes = Math.max(1e-6, ...points.map((p) => Math.abs(p.residual)));
+  const maxRes = forced || Math.max(1e-6, ...points.map((p) => Math.abs(p.residual)));
   const sx = (v) => box.left + ((v + maxSpeed) / (2 * maxSpeed)) * (box.right - box.left);
   const sy = (r) => (box.top + box.bottom) / 2 - (r / maxRes) * ((box.bottom - box.top) / 2);
   axes(ctx, box);
-  ctx.strokeStyle = '#2a3038';
-  ctx.beginPath(); ctx.moveTo(box.left, sy(0)); ctx.lineTo(box.right, sy(0)); ctx.stroke();
+  yTicks(ctx, box, -maxRes, maxRes, UNIT);
   ctx.fillStyle = 'rgba(226,86,90,.5)';
   points.forEach((p) => { if (!p.sweep) ctx.fillRect(sx(p.speed) - 1, sy(p.residual) - 1, 2, 2); });
   ctx.fillStyle = 'rgba(120,220,150,.9)';
   points.forEach((p) => { if (p.sweep) ctx.fillRect(sx(p.speed) - 1.5, sy(p.residual) - 1.5, 3, 3); });
+  if (label) caption(ctx, box, label);
   ctx.fillStyle = '#8b96a5';
-  ctx.fillText('+' + maxRes.toFixed(3) + ' ' + UNIT, 4, box.top + 8);
-  ctx.fillText('-' + maxRes.toFixed(3), 4, box.bottom);
   ctx.textAlign = 'center';
   ctx.fillText(t('charts.speed'), (box.left + box.right) / 2, height - 8);
   ctx.textAlign = 'left';
@@ -703,11 +760,22 @@ function shortName(name, index) {
 }
 
 function redrawCharts() {
-  const index = parseInt((document.getElementById('pick') || {}).value || '0', 10);
+  const index = Math.min(picked, Math.max(0, JOINTS.length - 1));
+  const name = NAMES[index] || String(index + 1);
+  const shared = !!(document.getElementById('lock') || {}).checked;
+  let span = null;
+  let residualCap = null;
+  if (shared) {
+    const all = JOINTS.map((_, i) => frictionSpan(i));
+    span = { low: Math.min(...all.map((s) => s.low)),
+             high: Math.max(...all.map((s) => s.high)) };
+    residualCap = Math.max(1e-6, ...(P.residual_samples || []).flat()
+      .map((p) => Math.abs(p.residual)));
+  }
   drawFriction(document.getElementById('c-friction'), JOINTS[index],
-               (P.friction_samples || [])[index]);
+               (P.friction_samples || [])[index], name, span);
   drawResidual(document.getElementById('c-residual'),
-               (P.residual_samples || [])[index]);
+               (P.residual_samples || [])[index], name, residualCap);
   drawBars(document.getElementById('c-error'), JOINTS.map((e, i) => ({
     label: shortName(NAMES[i], i),
     value: e.validation_rms_a ?? e.holdout_rms_a ?? e.residual_rms_a ?? 0,
@@ -733,7 +801,18 @@ function render() {
     node.textContent = t(node.getAttribute('data-i18n'));
   }
   const pick = document.getElementById('pick');
-  if (pick) pick.addEventListener('change', redrawCharts);
+  if (pick) {
+    pick.value = String(picked);
+    pick.addEventListener('change', () => {
+      picked = parseInt(pick.value || '0', 10);
+      redrawCharts();
+    });
+  }
+  const lock = document.getElementById('lock');
+  if (lock) {
+    lock.checked = locked;
+    lock.addEventListener('change', () => { locked = lock.checked; redrawCharts(); });
+  }
   redrawCharts();
 }
 

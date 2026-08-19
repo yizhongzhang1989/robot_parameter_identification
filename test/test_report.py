@@ -270,6 +270,37 @@ class CanvasScalingTest(unittest.TestCase):
         self.assertIn("canvas.style.height = height + 'px'", self.frame)
 
 
+class ChartIdentityTest(unittest.TestCase):
+    """Every joint's friction curve is the same shape scaled by its own
+    coefficients. Fitted to its own axis it fills the frame identically, so
+    flipping through the joints showed what looked like one unchanging chart."""
+
+    def test_the_chart_names_the_joint_it_is_drawing(self):
+        self.assertIn("caption(ctx, box, `${label}", report._TEMPLATE)
+
+    def test_the_caption_carries_the_fitted_coefficients(self):
+        # Two joints differing only in magnitude are otherwise indistinguishable.
+        block = report._TEMPLATE.split("function drawFriction", 1)[1]
+        self.assertIn("f.coulomb", block.split("function drawResidual")[0])
+        self.assertIn("f.viscous", block.split("function drawResidual")[0])
+
+    def test_a_shared_scale_is_offered(self):
+        self.assertIn('id="lock"', report._TEMPLATE)
+        self.assertIn("charts.lock", report.TEXT)
+        self.assertIn("frictionSpan", report._TEMPLATE)
+
+    def test_the_axis_is_ticked_not_just_cornered(self):
+        self.assertIn("function yTicks", report._TEMPLATE)
+        self.assertIn("yTicks(ctx, box", report._TEMPLATE)
+
+    def test_the_selected_joint_outlives_a_language_switch(self):
+        # render() rebuilds the DOM, so a selection held only in the <select>
+        # would snap back to the first joint on every switch.
+        self.assertIn("let picked = 0;", report._TEMPLATE)
+        self.assertIn("pick.value = String(picked);", report._TEMPLATE)
+        self.assertIn("lock.checked = locked;", report._TEMPLATE)
+
+
 class TranslationTest(unittest.TestCase):
 
     def test_every_report_string_has_both_languages(self):
