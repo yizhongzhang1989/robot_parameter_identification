@@ -445,13 +445,18 @@ def predict_joint(regression: JointRegression, regressor: np.ndarray,
     components = regression.components
     if not components.column_names():
         return float(rigid[regression.columns] @ regression.parameters)
-    row = np.concatenate([rigid, extra_row(velocity, acceleration, components)])
+    extra = extra_row(velocity, acceleration, components)
+    row = np.concatenate([rigid, extra])
     if components.load_friction:
         load = _rigid_current(
             row[None, :], regression.columns, regression.parameters,
             rigid.size)[0]
         row = np.concatenate(
             [rigid, extra_row(velocity, acceleration, components, load)])
+    if not include_friction:
+        # Zeroing the friction block is what lets a caller separate the
+        # rigid-body current from what friction adds on top of it.
+        row = np.concatenate([rigid, np.zeros_like(extra)])
     return float(row[regression.columns] @ regression.parameters)
 
 

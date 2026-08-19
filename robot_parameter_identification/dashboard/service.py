@@ -489,7 +489,8 @@ class IdentificationService:
         payload["joint_names"] = list(self.driven_joints) or (
             list(self.profile.joint_names) if self.profile else [])
         payload["action"] = self.config.commands.follow_joint_trajectory_action
-        payload.update(self._plot_data(payload, observations))
+        payload.update(self._plot_data(payload, observations,
+                                       getattr(result, "fits", None)))
         aborted = payload.get("aborted")
         recovery = {} if mode == "hardware" else self._check_recovery(payload)
         if recovery:
@@ -516,39 +517,58 @@ class IdentificationService:
         else:
             self.note(f"{mode} run complete")
 
-    def _plot_data(self, payload: dict, observations) -> dict:
+    def _plot_data(self, payload: dict, observations, fits=None) -> dict:
         """Scatter data for the charts, thinned to something a browser can draw.
 
-        The friction plot is the reason this exists: a fitted curve on its own
-        looks fine no matter how wrong it is, and only laying it over the cloud
-        it came from shows a reversal model that misses at low speed.
+        The friction plot carries measured current minus the rigid-body
+        prediction, not raw current. Raw current is mostly gravity, which
+        varies by pose over the campaign, so a friction curve laid over it was
+        being compared against a cloud it never claimed to explain.
         """
         joints = payload.get("joints") or []
-        if not joints or not observations:
+        if not joints or not observations or self.arm is None:
             return {}
         moving = [record for record in observations
                   if getattr(record, "phase", "") != "D_validation"]
+        if not moving:
+            return {}
         stride = max(1, len(moving) // MAX_PLOT_POINTS)
         thinned = moving[::stride]
+        fits = list(fits or [])
+        if len(fits) != len(joints):
+            # Without the regressions there is no prediction to subtract, and
+            # an empty panel is better than a misleading one.
+            return {}
+
+        regressors = [
+            self.arm.torque_regressor(record.position_deg,
+                                      record.velocity_deg_s,
+                                      record.acceleration_deg_s2)
+            for record in thinned]
+
         friction, residual = [], []
-        for index, entry in enumerate(joints):
-            speeds, efforts, errors = [], [], []
-            for record in thinned:
+        for index, fit in enumerate(fits):
+            curve, errors = [], []
+            for record, regressor in zip(thinned, regressors):
                 try:
                     speed = float(record.velocity_deg_s[index])
-                    effort = float(record.current_a[index])
+                    measured = float(record.current_a[index])
                 except (AttributeError, IndexError, TypeError):
                     continue
-                speeds.append(round(speed, 3))
-                efforts.append(round(effort, 4))
-            friction.append([{"speed": s, "effort": e}
-                             for s, e in zip(speeds, efforts)])
-            predicted = entry.get("predicted_a") or []
-            measured = entry.get("measured_a") or []
-            for step in range(0, min(len(predicted), len(measured)), stride):
-                errors.append({"speed": 0.0,
-                               "residual": round(
-                                   measured[step] - predicted[step], 4)})
+                acceleration = 0.0
+                if record.acceleration_deg_s2 is not None and index < len(
+                        record.acceleration_deg_s2):
+                    acceleration = float(record.acceleration_deg_s2[index])
+                rigid = ident.predict_joint(
+                    fit, regressor, speed, include_friction=False,
+                    acceleration=acceleration)
+                whole = ident.predict_joint(
+                    fit, regressor, speed, acceleration=acceleration)
+                curve.append({"speed": round(speed, 3),
+                              "effort": round(measured - rigid, 4)})
+                errors.append({"speed": round(speed, 3),
+                               "residual": round(measured - whole, 4)})
+            friction.append(curve)
             residual.append(errors)
         return {"friction_samples": friction, "residual_samples": residual}
 

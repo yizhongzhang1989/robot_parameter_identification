@@ -335,9 +335,36 @@ class RehearsalEndToEndTest(unittest.TestCase):
         samples = result.get("friction_samples") or []
         self.assertEqual(len(samples), 3)
         self.assertTrue(all(len(series) > 0 for series in samples))
-        first = samples[0][0]
-        self.assertIn("speed", first)
-        self.assertIn("effort", first)
+
+    def test_the_residual_chart_is_not_empty(self):
+        # It was, for as long as it existed: it read predicted_a and
+        # measured_a, which no regression ever carried.
+        residual = self.snapshot["result"].get("residual_samples") or []
+        self.assertEqual(len(residual), 3)
+        self.assertTrue(all(len(series) > 0 for series in residual))
+
+    def test_residuals_carry_the_speed_they_happened_at(self):
+        # Every point used to be reported at speed zero, so the one chart
+        # meant to show structure against speed could not show any.
+        speeds = {point["speed"]
+                  for point in self.snapshot["result"]["residual_samples"][0]}
+        self.assertGreater(len(speeds), 5)
+
+    def test_the_friction_cloud_has_gravity_removed(self):
+        # Raw current at rest spans the gravity of every pose visited. What
+        # the friction curve claims to explain is what is left after the
+        # rigid-body prediction is subtracted.
+        cloud = self.snapshot["result"]["friction_samples"][0]
+        self.assertIn("speed", cloud[0])
+        self.assertIn("effort", cloud[0])
+        still = [point["effort"] for point in cloud if abs(point["speed"]) < 1.0]
+        self.assertGreater(len(still), 3)
+        entry = self.snapshot["result"]["joints"][0]
+        coulomb = abs(entry["friction"].get("coulomb", 0.0))
+        # Near zero speed a friction model predicts one value; the spread
+        # there must be small beside the Coulomb step it is meant to show.
+        spread = max(still) - min(still)
+        self.assertLess(spread, max(4.0 * coulomb, 0.5))
 
     def test_passing_a_rehearsal_unlocks_the_hardware_button(self):
         self.assertTrue(self.snapshot["rehearsal_passed"])

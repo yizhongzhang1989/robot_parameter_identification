@@ -170,6 +170,28 @@ class GeneralisationTest(unittest.TestCase):
             ident.fit_joint(0, [regressor] * 5, [0.0] * 5, [0.0] * 5,
                             include_friction=False)
 
+    def test_excluding_friction_actually_excludes_it(self):
+        """The flag existed and was ignored, so both calls returned the same."""
+        regressors, velocities, currents = self.sample(
+            160, seed=11, noise_a=0.0, speed_deg_s=20.0)
+        fit = ident.fit_joint(
+            0, regressors, [v[0] for v in velocities],
+            [c[0] for c in currents], maximum_condition=1e3)
+        self.assertGreater(abs(fit.friction["coulomb"]), 0.01)
+
+        moving = next(index for index, v in enumerate(velocities)
+                      if abs(v[0]) > 5.0)
+        whole = ident.predict_joint(fit, regressors[moving], velocities[moving][0])
+        rigid = ident.predict_joint(fit, regressors[moving], velocities[moving][0],
+                                    include_friction=False)
+        self.assertNotAlmostEqual(whole, rigid, places=3)
+        # What the two differ by is exactly the friction the curve draws.
+        expected = (fit.friction["coulomb"] * np.tanh(
+            velocities[moving][0] / 1.8)
+            + fit.friction["viscous"] * velocities[moving][0]
+            + fit.friction["offset"])
+        self.assertAlmostEqual(whole - rigid, expected, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()

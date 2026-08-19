@@ -284,6 +284,9 @@ class CampaignResult:
     validation_rms_a: list[float] = field(default_factory=list)
     validation_samples: int = 0
     aborted: str | None = None
+    # The fitted regressions themselves, kept out of as_dict because they are
+    # arrays, not a document. Diagnostics need them to predict per observation.
+    fits: list = field(default_factory=list, repr=False)
 
     @property
     def complete(self) -> bool:
@@ -864,6 +867,7 @@ class Campaign:
                 error = float(np.sqrt(np.mean((predicted - truth) ** 2)))
                 entry["validation_rms_a"] = round(error, 6)
                 result.validation_rms_a.append(error)
+            result.fits.append(fit)
             result.joints.append(entry)
         return result
 
