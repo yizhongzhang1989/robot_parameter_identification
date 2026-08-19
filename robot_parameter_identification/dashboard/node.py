@@ -207,11 +207,22 @@ class DashboardNode(Node):
     def _store(self, rows: dict[str, list[float]], count: int) -> None:
         if count == 0 or len(rows.get("position", [])) != count:
             return
-        scale = 1.0 if self._spec.signals.position_in_degrees else 180.0 / np.pi
+        signals = self._spec.signals
+        scale = 1.0 if signals.position_in_degrees else 180.0 / np.pi
         sample = {
             "position_deg": [value * scale for value in rows["position"]],
             "current_a": list(rows.get("effort", [])),
         }
+        # "effort" is whichever channel is fitted. A drive may publish both, so
+        # the panel gets each under its own name rather than having to guess.
+        spare = "torque" if signals.effort_source == "current" else "current"
+        measured = {signals.effort_source: rows.get("effort", [])}
+        if spare in rows:
+            measured[spare] = rows[spare]
+        if measured.get("current"):
+            sample["drive_current_a"] = list(measured["current"])
+        if measured.get("torque"):
+            sample["joint_torque_nm"] = list(measured["torque"])
         if "velocity" in rows:
             sample["speed_deg_s"] = [value * scale for value in rows["velocity"]]
         for role, key in (("temperature", "temperature_c"),

@@ -186,6 +186,7 @@ class TelemetrySpec:
             "required": list(self.signals.required_interfaces()),
             "optional": self.signals.optional_interfaces(),
             "missing_guards": list(self.signals.missing_guards()),
+            "effort_source": self.signals.effort_source,
             "effort_unit": self.signals.effort_unit,
         }
 

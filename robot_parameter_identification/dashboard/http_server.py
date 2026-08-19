@@ -17,6 +17,7 @@ def build_routes(service, node=None) -> dict:
     """path -> (method, handler). Handlers take the decoded JSON body."""
     return {
         "/api/state": ("GET", lambda _body: service.snapshot()),
+        "/api/runs": ("GET", lambda _body: {"runs": service.runs()}),
         "/api/viewer": ("GET", lambda _body: _viewer(service, node)),
         "/api/obstacles": ("POST", lambda body: _obstacles(service, body)),
         "/api/collision": ("POST",
@@ -74,6 +75,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/mesh":
             return self._mesh(parse_qs(parsed.query))
+        if path.startswith("/runs/"):
+            return self._run_file(path[len("/runs/"):])
         route = self.server.routes.get(path)
         if route and route[0] == "GET":
             return self._json_result(route[1], {})
@@ -128,6 +131,26 @@ class _Handler(BaseHTTPRequestHandler):
             kind = "text/javascript"
         self._send(200, target.read_bytes(), kind)
 
+    def _run_file(self, relative: str) -> None:
+        """Serve a saved run's report and data out of the output directory.
+
+        Resolved before it is checked, so neither ".." nor a symlink planted in
+        the folder can reach a file outside it.
+        """
+        service = getattr(self.server, "service", None)
+        if service is None:
+            return self._send(404, b"no results", "text/plain")
+        root = Path(service.config.output_directory).resolve()
+        target = (root / unquote(relative)).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return self._send(403, b"forbidden", "text/plain")
+        if not target.is_file():
+            return self._send(404, b"not found", "text/plain")
+        kind = mimetypes.guess_type(target.name)[0] or "text/plain"
+        self._send(200, target.read_bytes(), kind)
+
     def _mesh(self, query: dict) -> None:
         """Serve a URDF mesh by package name, so the browser can load it."""
         resolver = getattr(self.server, "mesh_resolver", None)
@@ -169,6 +192,7 @@ class DashboardServer:
         self.httpd = ThreadingHTTPServer((host, port), _Handler)
         self.httpd.routes = build_routes(service, node)
         self.httpd.mesh_resolver = mesh_resolver
+        self.httpd.service = service
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
         self._thread = threading.Thread(

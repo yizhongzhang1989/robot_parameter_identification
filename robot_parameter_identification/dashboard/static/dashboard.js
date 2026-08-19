@@ -3,12 +3,29 @@
  */
 
 import { drawCondition, drawErrors, drawFriction, drawResidual } from '/charts.js';
+import { LANGUAGES, applyStatic, getLang, onLangChange, setLang, t }
+  from '/i18n.js';
 
 const POLL_MS = 400;
+// A directory scan does not belong on the fast path; saved runs change once
+// per campaign, not four times a second.
+const RUNS_EVERY = 25;
 const PHASES = ['A_gravity', 'B_friction', 'C_inertia', 'D_validation'];
 
 const $ = (id) => document.getElementById(id);
-const state = { snapshot: null, selected: null, frames: [], unit: 'A' };
+const state = { snapshot: null, selected: null, frames: [], unit: 'A',
+                ticks: 0, runs: [] };
+
+/* ---------------- language ---------------- */
+
+const langSelect = $('lang');
+langSelect.innerHTML = LANGUAGES.map(
+  (entry) => `<option value="${entry.code}">${entry.label}</option>`).join('');
+langSelect.value = getLang();
+langSelect.addEventListener('change', () => setLang(langSelect.value));
+onLangChange(() => { if (state.snapshot) renderAll(state.snapshot); });
+document.documentElement.lang = getLang() === 'zh' ? 'zh-CN' : 'en';
+applyStatic(document);
 
 /* ---------------- transport ---------------- */
 
@@ -71,7 +88,7 @@ function defaultFrame() {
 
 $('obst-add').addEventListener('click', async () => {
   const frame = $('obst-frame').value || defaultFrame();
-  if (!frame) return toast('no model yet', 'err');
+  if (!frame) return toast(t('obst.nomodel'), 'err');
   const result = await post('/api/obstacles', {
     action: 'add',
     obstacle: { parent_frame: frame, size_m: [0.2, 0.2, 0.2],
@@ -165,47 +182,60 @@ function pill(id, ok, label) {
 
 function renderConnection(snapshot) {
   const connection = snapshot.connection || {};
-  pill('pill-desc', !!connection.description_ok, 'model');
-  pill('pill-tel', !!connection.telemetry_ok, 'telemetry');
-  pill('pill-act', !!connection.action_ok, 'action');
+  pill('pill-desc', !!connection.description_ok, t('pill.model'));
+  pill('pill-tel', !!connection.telemetry_ok, t('pill.telemetry'));
+  pill('pill-act', !!connection.action_ok, t('pill.action'));
 
   const collision = snapshot.collision || {};
-  if (!collision.available) pill('pill-collide', null, 'clearance');
-  else pill('pill-collide', collision.clear, collision.clear ? 'clear' : 'contact');
+  if (!collision.available) pill('pill-collide', null, t('pill.clearance'));
+  else pill('pill-collide', collision.clear,
+            t(collision.clear ? 'pill.clear' : 'pill.contact'));
 
+  const quantity = connection.effort_source === 'torque'
+    ? `${t('live.torque')} (N·m)` : `${t('live.current')} (A)`;
   const rows = [
-    ['transport', connection.transport],
-    ['topic', connection.topic],
-    ['action', connection.action],
-    ['effort unit', connection.effort_unit],
-    ['sample age', connection.sample_age_s == null ? '—' : `${connection.sample_age_s}s`],
-    ['joints driven', (snapshot.driven_joints || []).length || '—'],
-    ['profile', snapshot.profile_source || 'none'],
-    ['robot shapes', collision.robot_shapes ?? '—'],
-    ['obstacles', collision.enabled_obstacles ?? 0],
+    ['conn.transport', connection.transport],
+    ['conn.topic', connection.topic],
+    ['conn.action', connection.action],
+    ['conn.effort_unit', quantity],
+    ['conn.sample_age', connection.sample_age_s == null
+      ? '—' : `${connection.sample_age_s}s`],
+    ['conn.driven', (snapshot.driven_joints || []).length || '—'],
+    ['conn.profile', snapshot.profile_source || 'none'],
+    ['conn.shapes', collision.robot_shapes ?? '—'],
+    ['conn.obstacles', collision.enabled_obstacles ?? 0],
   ];
   $('conn-table').innerHTML = rows.map(
-    ([k, v]) => `<tr><td>${k}</td><td class="num">${v ?? '—'}</td></tr>`).join('');
+    ([k, v]) => `<tr><td>${t(k)}</td><td class="num">${v ?? '—'}</td></tr>`)
+    .join('');
 
   const missing = (connection.missing_guards || []).slice();
   if (snapshot.profile_source === 'derived' && !snapshot.current_guard) {
     missing.push('current ceiling (derived profile)');
   }
   if (snapshot.profile_source === 'none') {
-    $('guards').textContent = 'No profile: waiting for the controller to name '
-      + 'the joints it drives. Nothing can run until then.';
+    $('guards').textContent = t('conn.noprofile');
     $('guards').style.color = 'var(--bad)';
     return;
   }
   $('guards').textContent = missing.length
-    ? `Guards off because the value is not available: ${missing.join(', ')}.`
-    : 'All guards active.';
+    ? t('conn.guards_off', { v: missing.join(', ') })
+    : t('conn.guards_all');
   $('guards').style.color = missing.length ? 'var(--warn)' : 'var(--muted)';
+}
+
+/** Phase names double as progress states ("finished", "failed"), which have
+ * no translation entry; t() hands back the key, so fall through to it. */
+function phaseLabel(name) {
+  const key = 'phase.' + name;
+  const text = t(key);
+  return text === key ? name : text;
 }
 
 function renderRun(snapshot) {
   const running = snapshot.state === 'running';
-  $('run-state').textContent = running ? (snapshot.activity || 'running') : 'idle';
+  $('run-state').textContent = running
+    ? (snapshot.activity || t('state.running')) : t('state.idle');
   $('run-state').className = 'state' + (running ? ' running' : '');
   $('btn-rehearse').disabled = running || !snapshot.have_model;
   $('btn-hardware').disabled = running || !snapshot.rehearsal_passed;
@@ -214,9 +244,7 @@ function renderRun(snapshot) {
   $('btn-home').disabled = running || !snapshot.have_model;
   $('btn-stop').disabled = !running;
   $('ack-hint').textContent = snapshot.rehearsal_passed
-    ? 'Rehearsal passed: the hardware run is armed.'
-    : 'A rehearsal must pass before a campaign may move the arm. '
-      + 'Homing is always available.';
+    ? t('run.armed') : t('run.locked');
 
   const progress = snapshot.progress || {};
   const current = progress.phase || '';
@@ -225,20 +253,26 @@ function renderRun(snapshot) {
     const at = PHASES.indexOf(current);
     const index = PHASES.indexOf(name);
     const cls = current === name ? 'now' : (at > index || done) ? 'done' : '';
-    return `<div class="ph ${cls}">${name.split('_')[1]}</div>`;
+    return `<div class="ph ${cls}">${phaseLabel(name)}</div>`;
   }).join('');
 
   const bits = [];
-  if (progress.phase) bits.push(progress.phase);
+  if (progress.phase) bits.push(phaseLabel(progress.phase));
   if (progress.elapsed_s != null) bits.push(`${Math.round(progress.elapsed_s)}s`);
-  if (progress.observations != null) bits.push(`${progress.observations} samples`);
-  if (progress.pose != null) bits.push(`pose ${progress.pose}/${progress.poses ?? '?'}`);
-  if (progress.worst_deg != null) bits.push(`worst ${progress.worst_deg}\u00b0 from zero`);
-  $('progress-line').textContent = bits.join(' · ') || 'not started';
+  if (progress.observations != null) {
+    bits.push(`${progress.observations} ${t('run.samples')}`);
+  }
+  if (progress.pose != null) {
+    bits.push(`${t('run.pose')} ${progress.pose}/${progress.poses ?? '?'}`);
+  }
+  if (progress.worst_deg != null) {
+    bits.push(t('run.worst', { v: progress.worst_deg }));
+  }
+  $('progress-line').textContent = bits.join(' · ') || t('run.notstarted');
   const failed = progress.phase === 'failed';
   if (progress.error) {
     $('progress-line').textContent =
-      `${failed ? 'failed' : 'stopped'}: ${progress.error}`;
+      `${failed ? t('run.failed') : t('run.stopped')}: ${progress.error}`;
     $('progress-line').style.color = failed ? 'var(--bad)' : 'var(--warn)';
   } else {
     $('progress-line').style.color = '';
@@ -254,10 +288,66 @@ function renderJointBars(snapshot) {
     const value = positions[index] ?? 0;
     const pct = Math.min(100, Math.abs(value) / 180 * 100);
     const left = value >= 0 ? 50 : 50 - pct / 2;
-    return `<div class="jb"><span class="name">${name.slice(-7)}</span>`
+    return `<div class="jb"><span class="name" title="${name}">${name}</span>`
       + `<span class="track"><span class="fill" style="left:${left}%;width:${pct / 2}%"></span></span>`
       + `<span class="val">${value.toFixed(1)}°</span></div>`;
   }).join('');
+}
+
+/* Columns appear only when the robot actually publishes them, so an empty
+ * column never gets mistaken for a reading of zero. */
+const LIVE_COLUMNS = [
+  { key: 'position_deg', label: 'live.position', unit: '°', digits: 2 },
+  { key: 'speed_deg_s', label: 'live.speed', unit: '°/s', digits: 2 },
+  { key: 'drive_current_a', label: 'live.current', unit: 'A', digits: 3 },
+  { key: 'joint_torque_nm', label: 'live.torque', unit: 'N·m', digits: 3 },
+  { key: 'temperature_c', label: 'live.temperature', unit: '°C', digits: 1 },
+  { key: 'voltage_v', label: 'live.voltage', unit: 'V', digits: 1 },
+];
+
+function renderLive(snapshot) {
+  const table = $('live-table');
+  const sample = snapshot.sample;
+  const names = snapshot.joint_names || [];
+  if (!sample || !names.length) {
+    table.innerHTML = `<tr><td class="muted">${t('live.waiting')}</td></tr>`;
+    return;
+  }
+  const fitted = snapshot.connection?.effort_source === 'torque'
+    ? 'joint_torque_nm' : 'drive_current_a';
+  const columns = LIVE_COLUMNS.filter(
+    (column) => Array.isArray(sample[column.key]) && sample[column.key].length);
+  const status = sample.enabled || sample.fault_code;
+
+  const head = `<tr><th>${t('live.joint')}</th>`
+    + columns.map((column) => {
+      const mark = column.key === fitted
+        ? ` <span class="tag">${t('live.fitted')}</span>` : '';
+      return `<th class="num">${t(column.label)} <span class="unit">`
+        + `${column.unit}</span>${mark}</th>`;
+    }).join('')
+    + (status ? `<th class="num">${t('live.fault')}</th>` : '')
+    + '</tr>';
+
+  const body = names.map((name, index) => {
+    const cells = columns.map((column) => {
+      const value = sample[column.key][index];
+      const text = Number.isFinite(value) ? value.toFixed(column.digits) : '—';
+      const hot = column.key === 'temperature_c' && value > 45;
+      return `<td class="num${hot ? ' bad' : ''}">${text}</td>`;
+    }).join('');
+    let flag = '';
+    if (status) {
+      const code = sample.fault_code ? sample.fault_code[index] : 0;
+      const off = sample.enabled ? sample.enabled[index] === false : false;
+      const bad = off || (code !== undefined && code !== 0);
+      const label = off ? t('live.disabled') : (code ? String(code) : 'ok');
+      flag = `<td class="num${bad ? ' bad' : ' ok'}">${label}</td>`;
+    }
+    return `<tr><td title="${name}">${name}</td>${cells}${flag}</tr>`;
+  }).join('');
+
+  table.innerHTML = head + body;
 }
 
 function renderResult(snapshot) {
@@ -267,9 +357,15 @@ function renderResult(snapshot) {
   drawCondition($('chart-condition'), result, 1000);
 
   const joints = result?.joints || [];
+  // The result carries the names the run was recorded against; the live model
+  // may already describe a different arm.
+  const names = (result?.joint_names || []).length
+    ? result.joint_names : (snapshot.joint_names || []);
+  const label = (index) => names[index] || `${index + 1}`;
   const select = $('friction-joint');
   if (select.options.length !== joints.length) {
-    select.innerHTML = joints.map((_, i) => `<option value="${i}">J${i + 1}</option>`).join('');
+    select.innerHTML = joints.map(
+      (_, i) => `<option value="${i}">${label(i)}</option>`).join('');
   }
   const index = Math.min(parseInt(select.value || '0', 10), Math.max(0, joints.length - 1));
   drawFriction($('chart-friction'), joints[index], result?.friction_samples?.[index],
@@ -278,53 +374,82 @@ function renderResult(snapshot) {
 
   const verdict = result?.verdict?.joints || [];
   $('verdict-table').innerHTML = verdict.map((entry, i) =>
-    `<tr><td>J${i + 1}</td><td class="num ${entry.state === 'pass' ? 'ok' : 'bad'}">`
-    + `${entry.state}</td></tr>`).join('');
+    `<tr><td>${label(i)}</td><td class="num ${entry.state === 'pass' ? 'ok' : 'bad'}">`
+    + `${t('verdict.' + entry.state)}</td></tr>`).join('');
 
   const recovery = result?.rehearsal_check;
   const note = $('recovery');
   if (!recovery || !recovery.available) {
     note.textContent = '';
   } else if (recovery.passed) {
-    note.textContent = `Rehearsal recovered the planted friction to within `
-      + `${recovery.worst_coulomb_error} (tolerance ${recovery.tolerance}).`;
+    note.textContent = t('recovery.ok', { v: recovery.worst_coulomb_error,
+                                          t: recovery.tolerance });
     note.style.color = 'var(--ok)';
   } else {
-    note.textContent = `Rehearsal ran but did NOT recover the planted friction: `
-      + `worst error ${recovery.worst_coulomb_error} exceeds `
-      + `${recovery.tolerance}. The hardware button stays locked.`;
+    note.textContent = t('recovery.bad', { v: recovery.worst_coulomb_error,
+                                           t: recovery.tolerance });
     note.style.color = 'var(--bad)';
   }
 
   $('params').innerHTML = joints.map((entry, i) => {
     const friction = entry.friction || {};
     const physical = (friction.coulomb ?? 0) >= 0 && (friction.viscous ?? 0) >= 0;
-    return `<div class="param-row"><span>J${i + 1}</span>`
+    return `<div class="param-row"><span title="${label(i)}">${label(i)}</span>`
       + `<span class="muted">c ${(friction.coulomb ?? 0).toFixed(3)} ${state.unit}`
       + ` \u00b7 v ${(friction.viscous ?? 0).toFixed(4)} ${state.unit}/(\u00b0/s)</span>`
       + `<span class="badge ${physical ? 'ok' : 'bad'}">`
-      + `${physical ? 'physical' : 'unphysical'}</span></div>`;
-  }).join('') || '<span class="muted">no result yet</span>';
+      + `${t(physical ? 'params.physical' : 'params.unphysical')}</span></div>`;
+  }).join('') || `<span class="muted">${t('params.none')}</span>`;
+}
+
+function renderRuns(runs) {
+  const list = $('runs');
+  if (!runs || !runs.length) {
+    list.innerHTML = `<li class="muted">${t('out.none')}</li>`;
+    return;
+  }
+  list.innerHTML = runs.map((run) =>
+    `<li><span>${run.name}</span>`
+    + `<a href="${run.report}" target="_blank" rel="noopener">`
+    + `${t('out.report')}</a></li>`).join('');
 }
 
 $('friction-joint').addEventListener('change', () => renderResult(state.snapshot || {}));
 
 /* ---------------- poll ---------------- */
 
+function renderAll(snapshot) {
+  renderConnection(snapshot);
+  renderRun(snapshot);
+  renderLive(snapshot);
+  renderJointBars(snapshot);
+  renderObstacleList();
+  if (state.selected) fillForm();
+  renderResult(snapshot);
+  // Redrawn from the cache: the listing is polled rarely, and a language
+  // change must not leave it in the old one until the next scan.
+  renderRuns(state.runs);
+  $('notes').textContent = (snapshot.notes || []).join('\n');
+}
+
+async function pollRuns() {
+  try {
+    const data = await (await fetch('/api/runs', { cache: 'no-store' })).json();
+    state.runs = data.runs || [];
+    renderRuns(state.runs);
+  } catch (error) { /* the panel is still usable without the listing */ }
+}
+
 async function poll() {
   try {
     const snapshot = await (await fetch('/api/state', { cache: 'no-store' })).json();
     state.snapshot = snapshot;
-    renderConnection(snapshot);
-    renderRun(snapshot);
-    renderJointBars(snapshot);
-    renderObstacleList();
-    if (state.selected) fillForm();
-    renderResult(snapshot);
-    $('notes').textContent = (snapshot.notes || []).join('\n');
+    renderAll(snapshot);
   } catch (error) {
-    pill('pill-desc', false, 'offline');
+    pill('pill-desc', false, t('pill.offline'));
   }
+  if (state.ticks % RUNS_EVERY === 0) pollRuns();
+  state.ticks += 1;
 }
 setInterval(poll, POLL_MS);
 poll();

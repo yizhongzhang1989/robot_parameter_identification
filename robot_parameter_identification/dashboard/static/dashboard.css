@@ -182,10 +182,41 @@ td.ok { color: var(--ok); } td.bad { color: var(--bad); } td.warn { color: var(-
 /* ---------------- joint bars ---------------- */
 
 .jb { display: flex; align-items: center; gap: 6px; font-size: 10px; margin: 2px 0; }
-.jb .name { width: 58px; color: var(--muted); text-align: right; }
+.jb .name { width: 118px; color: var(--muted); text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
 .jb .track { width: 130px; height: 5px; background: #222836; border-radius: 3px; position: relative; }
 .jb .fill { position: absolute; top: 0; height: 5px; background: var(--accent); border-radius: 3px; }
 .jb .val { width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---------------- live telemetry ---------------- */
+
+.scroll-x { overflow-x: auto; }
+table.live { width: 100%; border-collapse: collapse; font-size: 11px;
+  font-variant-numeric: tabular-nums; }
+table.live th { color: var(--muted); font-weight: 500; text-align: right;
+  padding: 3px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.live th:first-child, table.live td:first-child { text-align: left; }
+table.live td { padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,.04);
+  white-space: nowrap; }
+table.live td.num { text-align: right; }
+table.live td.ok { color: var(--ok); }
+table.live td.bad { color: var(--bad); }
+table.live .unit { opacity: .6; }
+table.live .tag { color: var(--accent); font-size: 9px; padding: 0 4px;
+  border: 1px solid rgba(77,163,255,.4); border-radius: 3px; }
+
+/* ---------------- saved runs ---------------- */
+
+.runs { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+.runs li { display: flex; justify-content: space-between; gap: 8px;
+  padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,.04); }
+.runs a { color: var(--accent); text-decoration: none; }
+.runs a:hover { text-decoration: underline; }
+
+/* ---------------- language ---------------- */
+
+select.lang { background: #1b212b; color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 8px; font-size: 11px; }
 
 /* ---------------- charts, params, log ---------------- */
 

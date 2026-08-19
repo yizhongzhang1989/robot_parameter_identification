@@ -18,6 +18,7 @@ import numpy as np
 from .. import autoprofile
 from .. import campaign as campaign_module
 from .. import excitation, identification as ident
+from .. import report as report_module
 from ..interfaces import CommandSpec, TelemetrySpec
 from ..model import ModelComponents
 from ..obstacles import Obstacle, ObstacleScene
@@ -506,7 +507,7 @@ class IdentificationService:
             if mode != "hardware":
                 self.rehearsal_passed = (bool(payload.get("complete"))
                                          and bool(recovery.get("passed")))
-        self._write(payload, mode)
+        self._write(payload, mode, observations)
         if aborted:
             self.note(f"{mode} run stopped: {aborted}")
         elif recovery.get("available") and not recovery.get("passed"):
@@ -641,16 +642,36 @@ class IdentificationService:
             "joints": errors,
         }
 
-    def _write(self, payload: dict, mode: str) -> None:
-        directory = Path(self.config.output_directory)
+    def _write(self, payload: dict, mode: str, observations=None) -> None:
         try:
-            directory.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            path = directory / f"{mode}-{stamp}.json"
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            self.note(f"written to {path}")
+            folder = report_module.write_run(
+                self.config.output_directory, payload, observations)
+            self.note(f"written to {folder}")
         except OSError as error:
             self.note(f"could not write result: {error}")
+
+    def runs(self, limit: int = 12) -> list[dict]:
+        """Result folders that hold a readable report, newest first."""
+        directory = Path(self.config.output_directory)
+        if not directory.is_dir():
+            return []
+        found = []
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return []
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if not (entry / report_module.REPORT_NAME).is_file():
+                continue
+            found.append({
+                "name": entry.name,
+                "report": f"/runs/{entry.name}/{report_module.REPORT_NAME}",
+                "modified": entry.stat().st_mtime,
+            })
+        found.sort(key=lambda item: item["modified"], reverse=True)
+        return found[:limit]
 
     # -- snapshot --------------------------------------------------------
 
