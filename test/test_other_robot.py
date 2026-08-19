@@ -147,6 +147,77 @@ class SweepSizingTest(unittest.TestCase):
         self.assertLess(min(speeds), 10.0)
 
 
+class SpeedLadderTest(unittest.TestCase):
+    """Friction bends fastest near zero, so the rungs go there."""
+
+    def test_the_ladder_has_at_least_twenty_rungs(self):
+        self.assertGreaterEqual(len(ri.friction_speed_ladder(60.0)), 20)
+
+    def test_it_reaches_the_ceiling_exactly(self):
+        self.assertAlmostEqual(max(ri.friction_speed_ladder(60.0)), 60.0)
+
+    def test_it_starts_well_below_the_coulomb_reversal(self):
+        # The reversal is 1.8 deg/s wide; a ladder starting above it measures
+        # the straight part of the curve and guesses the bend.
+        self.assertLessEqual(min(ri.friction_speed_ladder(60.0)), 0.5)
+
+    def test_the_spacing_is_logarithmic(self):
+        speeds = ri.friction_speed_ladder(60.0)
+        ratios = [b / a for a, b in zip(speeds, speeds[1:])]
+        self.assertLess(max(ratios) - min(ratios), 0.05)
+
+    def test_most_rungs_sit_where_the_curve_bends(self):
+        speeds = ri.friction_speed_ladder(60.0)
+        low = [s for s in speeds if s <= 6.0]
+        self.assertGreaterEqual(len(low), len(speeds) // 2)
+
+    def test_a_slower_arm_gets_the_same_shape(self):
+        speeds = ri.friction_speed_ladder(12.0)
+        self.assertGreaterEqual(len(speeds), 20)
+        self.assertAlmostEqual(max(speeds), 12.0)
+
+    def test_no_rung_exceeds_the_ceiling(self):
+        for ceiling in (2.0, 12.0, 60.0):
+            for speed in ri.friction_speed_ladder(ceiling):
+                self.assertLessEqual(speed, ceiling + 1e-9)
+
+    def test_a_ceiling_below_the_floor_still_yields_a_sweep(self):
+        self.assertEqual(ri.friction_speed_ladder(0.3), (0.3,))
+
+
+class PassSizingTest(unittest.TestCase):
+    """Each pass is sized for its own speed, or a crawl takes a minute."""
+
+    CEILING = 80.0
+
+    def test_a_slow_pass_is_short(self):
+        self.assertLess(ri.pass_amplitude_deg(0.5, self.CEILING), 1.0)
+
+    def test_a_fast_pass_is_long(self):
+        self.assertGreater(ri.pass_amplitude_deg(60.0, self.CEILING), 40.0)
+
+    def test_every_pass_takes_about_the_same_time(self):
+        # Which is the point: the cost of a rung does not depend on its speed.
+        durations = []
+        for speed in ri.friction_speed_ladder(60.0):
+            amplitude = ri.pass_amplitude_deg(speed, self.CEILING)
+            durations.append(amplitude / speed)
+        self.assertLess(max(durations) / min(durations), 1.5)
+
+    def test_it_never_exceeds_the_room_it_is_given(self):
+        for speed in (1.0, 30.0, 60.0, 500.0):
+            self.assertLessEqual(ri.pass_amplitude_deg(speed, 20.0), 20.0)
+
+    def test_there_is_room_to_cruise_after_the_ramps(self):
+        from robot_parameter_identification import campaign
+
+        for speed in ri.friction_speed_ladder(60.0):
+            amplitude = ri.pass_amplitude_deg(speed, self.CEILING)
+            ramps = speed ** 2 / campaign.SWEEP_ACCELERATION_DEG_S2
+            self.assertGreater(amplitude - ramps, 0.4 * speed,
+                               f"{speed} deg/s has no cruise left")
+
+
 class ModelTest(unittest.TestCase):
     def setUp(self):
         self.profile = load_profile()

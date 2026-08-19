@@ -29,7 +29,8 @@ from .campaign import (
     Plant, EnvelopeMonitor, PHASES, PHASE_GRAVITY, PHASE_FRICTION,
     PHASE_INERTIA, PHASE_VALIDATION, MAXIMUM_CONDITION,
     campaign_bounds, clamp_campaign_plan, default_plan, judge_joint,
-    sweep_speeds, sweep_amplitude_deg,
+    sweep_speeds, sweep_amplitude_deg, friction_speed_ladder,
+    pass_amplitude_deg,
 )
 
 __all__ = [
@@ -46,5 +47,6 @@ __all__ = [
     "Abort", "Plant", "EnvelopeMonitor", "PHASES", "PHASE_GRAVITY",
     "PHASE_FRICTION", "PHASE_INERTIA", "PHASE_VALIDATION", "MAXIMUM_CONDITION",
     "campaign_bounds", "clamp_campaign_plan", "default_plan", "judge_joint",
-    "sweep_speeds", "sweep_amplitude_deg",
+    "sweep_speeds", "sweep_amplitude_deg", "friction_speed_ladder",
+    "pass_amplitude_deg",
 ]

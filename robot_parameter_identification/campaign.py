@@ -349,18 +349,23 @@ class Abort(RuntimeError):
 PROBE_SPEED_FRACTION = 0.5
 ACCELERATION_PER_SPEED = 4.0
 
-# The sweep speeds are what actually excites friction, so they are fractions of
+# The sweep speeds are what actually excites friction, so they are derived from
 # the speed ceiling rather than fixed figures. Fixed figures meant raising the
 # ceiling changed nothing: the sweep kept running at the old speeds and the
 # viscous term stayed invisible.
-# Equally spaced: each pass now yields a handful of fitted points rather than
-# hundreds of raw frames, so the speed axis can be covered properly instead of
-# being sampled at four places.
-FRICTION_SPEED_STEPS = 8
-FRICTION_SPEED_FRACTIONS = tuple(
-    round((step + 1) / FRICTION_SPEED_STEPS, 4)
-    for step in range(FRICTION_SPEED_STEPS))
+#
+# Spaced logarithmically. Friction changes fastest near zero -- the Coulomb
+# reversal is a couple of degrees per second wide -- so an evenly spaced ladder
+# spends most of its rungs where the curve is already a straight line and none
+# where it bends.
+FRICTION_SPEED_STEPS = 20
+FRICTION_MINIMUM_SPEED_DEG_S = 0.5
 VALIDATION_SPEED_FRACTIONS = (0.35, 0.65)
+
+# Constant-speed time each pass must hold, which is what sizes its travel. A
+# fixed arc would make a slow pass take a minute and a fast one a fraction of a
+# second, for the same three fitted samples.
+FRICTION_CRUISE_S = 1.0
 
 # The plant ramps a sweep over a quarter of its nominal duration, so a pass of
 # `distance` at `speed` implies 4*speed^2/distance of acceleration. A short
@@ -372,7 +377,7 @@ _STATIC_BOUNDS = {
     "static_poses": (4, 60),
     "static_candidates": (10, 400),
     "settle_samples": (1, 20),
-    "friction_amplitude_deg": (5.0, 40.0),
+    "friction_amplitude_deg": (5.0, 80.0),
     "fourier_harmonics": (1, 6),
     "fourier_base_frequency_hz": (0.02, 0.3),
     "fourier_duration_s": (5.0, 120.0),
@@ -407,11 +412,45 @@ def sweep_speeds(maximum_speed_deg_s: float, fractions) -> tuple[float, ...]:
     return tuple(sorted(speed for speed in speeds if speed > 0.0))
 
 
+def friction_speed_ladder(maximum_speed_deg_s: float,
+                          steps: int = FRICTION_SPEED_STEPS,
+                          minimum_deg_s: float = FRICTION_MINIMUM_SPEED_DEG_S,
+                          ) -> tuple[float, ...]:
+    """Logarithmic rungs from a crawl up to the ceiling.
+
+    The bottom is absolute rather than a fraction of the ceiling: what makes a
+    low speed worth measuring is the width of the Coulomb reversal, which is a
+    property of the joint and does not move when the operator raises the top
+    speed.
+    """
+    top = float(maximum_speed_deg_s)
+    if top <= 0.0:
+        return ()
+    low = min(float(minimum_deg_s), top)
+    if steps < 2 or low >= top:
+        return (round(top, 3),)
+    ratio = (top / low) ** (1.0 / (steps - 1))
+    speeds = {round(low * ratio ** step, 3) for step in range(steps - 1)}
+    speeds.add(round(top, 3))
+    return tuple(sorted(speed for speed in speeds if speed > 0.0))
+
+
+def pass_amplitude_deg(speed_deg_s: float, ceiling_deg: float) -> float:
+    """Travel for one pass at one speed: both ramps plus the cruise.
+
+    Sized per speed so that every pass costs about the same time and yields the
+    same few fitted samples, instead of a slow pass dragging a fixed arc out
+    for a minute while a fast one has no constant-speed middle at all.
+    """
+    speed = max(float(speed_deg_s), 0.0)
+    ramps = speed * speed / SWEEP_ACCELERATION_DEG_S2
+    return float(min(float(ceiling_deg), ramps + speed * FRICTION_CRUISE_S))
+
+
 def sweep_amplitude_deg(maximum_speed_deg_s: float, requested: float) -> float:
-    """Enough travel to reach the top speed without a violent ramp."""
+    """Room the fastest pass needs; slower passes take less of it."""
     low, high = _STATIC_BOUNDS["friction_amplitude_deg"]
-    needed = (ACCELERATION_PER_SPEED * maximum_speed_deg_s ** 2
-              / SWEEP_ACCELERATION_DEG_S2)
+    needed = pass_amplitude_deg(maximum_speed_deg_s, high)
     return float(min(max(requested, needed, low), high))
 
 
@@ -434,8 +473,7 @@ def default_plan(profile: RobotProfile) -> CampaignPlan:
 
 def _follow_speed(plan: CampaignPlan) -> None:
     """Re-derive everything that only means something relative to the ceiling."""
-    plan.friction_speeds_deg_s = sweep_speeds(
-        plan.maximum_speed_deg_s, FRICTION_SPEED_FRACTIONS)
+    plan.friction_speeds_deg_s = friction_speed_ladder(plan.maximum_speed_deg_s)
     plan.validation_speeds_deg_s = sweep_speeds(
         plan.maximum_speed_deg_s, VALIDATION_SPEED_FRACTIONS)
     plan.friction_amplitude_deg = sweep_amplitude_deg(
@@ -717,14 +755,18 @@ class Campaign:
                 speeds_deg_s=self.plan.friction_speeds_deg_s)
             report.detail = {"sweeps": [sweep.as_dict() for sweep in sweeps]}
             for sweep in sweeps:
+                # The design hands back the room available; each speed takes
+                # only the part of it that speed needs, centred on the same
+                # pose so every pass measures the same gravity term.
+                centre = (np.asarray(sweep.start_deg, dtype=float)[sweep.joint]
+                          + sweep.amplitude_deg / 2.0)
                 for speed in sweep.speeds_deg_s:
+                    amplitude = pass_amplitude_deg(speed, sweep.amplitude_deg)
                     for _repeat in range(max(1, self.plan.friction_repeats)):
-                        for distance in (sweep.amplitude_deg,
-                                         -sweep.amplitude_deg):
+                        for distance in (amplitude, -amplitude):
                             origin = np.asarray(sweep.start_deg, dtype=float)
-                            if distance < 0:
-                                origin = origin.copy()
-                                origin[sweep.joint] += sweep.amplitude_deg
+                            origin = origin.copy()
+                            origin[sweep.joint] = centre - distance / 2.0
                             for sample in self.plant.traverse(
                                     sweep.joint, origin, distance, speed):
                                 self._record(PHASE_FRICTION, sample, report)
