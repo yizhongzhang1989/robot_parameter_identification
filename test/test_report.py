@@ -241,6 +241,35 @@ class ServedRunsTest(unittest.TestCase):
         self.assertEqual(self._get(f"/runs/%2e%2e%2f{self.outside.name}"), 403)
 
 
+class CanvasScalingTest(unittest.TestCase):
+    """The report draws its own charts, so it repeats the panel's canvas
+    setup. It got it wrong once: the backing store was widened for the pixel
+    ratio but not heightened, and on a 2x display the transform pushed the
+    lower half of every chart outside the buffer."""
+
+    def setUp(self):
+        self.frame = report._TEMPLATE.split("function frame(canvas)", 1)[1] \
+                                     .split("\n}", 1)[0]
+
+    def test_both_dimensions_are_scaled_for_the_pixel_ratio(self):
+        self.assertIn("width * ratio", self.frame)
+        self.assertIn("height * ratio", self.frame)
+
+    def test_the_logical_height_is_stashed_rather_than_read_back(self):
+        # Assigning canvas.height writes the same attribute the logical height
+        # would be read from, so reading it back compounds on every redraw.
+        self.assertIn("logicalHeight", self.frame)
+        self.assertNotIn("= canvas.height", self.frame)
+
+    def test_the_ratio_is_capped(self):
+        # A 3x phone would otherwise allocate nine times the pixels for a
+        # sharpness nobody can see.
+        self.assertIn("Math.min(window.devicePixelRatio || 1, 2)", self.frame)
+
+    def test_the_css_height_stays_the_logical_one(self):
+        self.assertIn("canvas.style.height = height + 'px'", self.frame)
+
+
 class TranslationTest(unittest.TestCase):
 
     def test_every_report_string_has_both_languages(self):

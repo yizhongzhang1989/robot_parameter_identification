@@ -576,11 +576,20 @@ function glossarySection() {
 /* ---------------- charts ---------------- */
 
 function frame(canvas) {
-  const ratio = window.devicePixelRatio || 1;
-  const width = canvas.clientWidth || 900;
-  const height = canvas.height;
-  canvas.width = width * ratio;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  // Stashed on first use. Reading the logical height back from the height
+  // attribute would be self-feeding: scaling the backing store writes that
+  // same attribute, so every redraw would scale the chart again.
+  if (!canvas.dataset.logicalHeight) {
+    canvas.dataset.logicalHeight = String(+canvas.getAttribute('height') || 220);
+  }
+  const height = +canvas.dataset.logicalHeight;
+  const width = Math.max(240, Math.round(canvas.clientWidth || 900));
   canvas.style.height = height + 'px';
+  const backingWidth = Math.round(width * ratio);
+  const backingHeight = Math.round(height * ratio);
+  if (canvas.width !== backingWidth) canvas.width = backingWidth;
+  if (canvas.height !== backingHeight) canvas.height = backingHeight;
   const ctx = canvas.getContext('2d');
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
