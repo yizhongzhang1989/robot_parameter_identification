@@ -682,6 +682,28 @@ class Campaign:
 
         return admissible
 
+    def _self_collision_checked(self) -> bool:
+        """Whether the scene can actually see the arm, not merely be asked.
+
+        When the link meshes fail to resolve -- a changed package path is
+        enough -- the scene keeps answering, and it answers clear to
+        everything, because with no link shapes there are no pairs to test.
+        Sweeping at home survives that: the pose is neutral and known good.
+        Sweeping at postures drawn from the whole range does not, because the
+        only thing that made them safe was the screen.
+        """
+        model = getattr(self.plant, "collision_model", None)
+        report = getattr(model, "geometry_report", None)
+        return bool(report and report().get("self_collision_checked"))
+
+    def _friction_postures(self) -> tuple[int, str | None]:
+        """How many postures may be swept, given what can be verified."""
+        wanted = max(1, int(self.plan.friction_postures))
+        if wanted == 1 or self._self_collision_checked():
+            return wanted, None
+        return 1, ("collision geometry unavailable, so postures away from home "
+                   f"could not be screened: swept home only, not {wanted}")
+
     # -- guards ----------------------------------------------------------
 
     def _guard(self, sample: dict) -> None:
@@ -800,14 +822,18 @@ class Campaign:
     def run_friction(self) -> PhaseReport:
         report, start = self._open(PHASE_FRICTION)
         try:
+            postures, downgraded = self._friction_postures()
             sweeps = excitation.design_friction_sweeps(
                 self.arm, self.limits,
                 amplitude_deg=self.plan.friction_amplitude_deg,
                 speeds_deg_s=self.plan.friction_speeds_deg_s,
-                postures=self.plan.friction_postures,
+                postures=postures,
                 collision_free=self._collision_free(),
                 seed=self.plan.seed)
-            report.detail = {"sweeps": [sweep.as_dict() for sweep in sweeps]}
+            report.detail = {"sweeps": [sweep.as_dict() for sweep in sweeps],
+                             "postures": postures}
+            if downgraded:
+                report.detail["downgraded"] = downgraded
             for index, sweep in enumerate(sweeps):
                 # The design hands back the room available; each speed takes
                 # only the part of it that speed needs, centred on the same

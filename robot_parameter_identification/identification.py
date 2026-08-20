@@ -159,6 +159,41 @@ class ArmModel:
             np.zeros(self.joint_count) if a_deg_s2 is None else a_deg_s2, dtype=float))
         return np.array(pin.rnea(self.model, self.data, q, v, a))
 
+    def joint_loads(self, q_deg) -> np.ndarray:
+        """What each joint carries at this pose, as four terms.
+
+        Only the first term does work against the motor; the other three set the
+        normal load the bearing is pressed together with, which is what Coulomb
+        friction is proportional to. They are not interchangeable: joint one's
+        axis is horizontal, so its radial force is the same 22 N in every pose
+        while its axial torque runs from nothing to 4.7 Nm, and joint seven is
+        the reverse, carrying no axial torque anywhere but a radial force that
+        does vary. Reading friction against posture needs all four.
+
+        Returns one row per joint: axial torque Nm, radial force N, thrust force
+        N, tilting moment Nm.
+        """
+        q = np.radians(np.asarray(q_deg, dtype=float))
+        zero = np.zeros(self.joint_count)
+        pin.rnea(self.model, self.data, q, zero, zero)
+        loads = np.zeros((self.joint_count, 4))
+        for joint in range(self.joint_count):
+            # The axis is the joint's own motion subspace, not a guessed z: the
+            # axes here are a mix of y and z, and assuming one shifts every
+            # reading by a joint.
+            axis = np.asarray(self.data.joints[joint + 1].S).reshape(6)[3:]
+            axis = axis / np.linalg.norm(axis)
+            wrench = self.data.f[joint + 1]
+            along = float(wrench.angular @ axis)
+            thrust = float(wrench.linear @ axis)
+            loads[joint] = (
+                abs(along),
+                float(np.linalg.norm(wrench.linear - thrust * axis)),
+                abs(thrust),
+                float(np.linalg.norm(wrench.angular - along * axis)),
+            )
+        return loads
+
     def link_transforms(self, q_deg) -> dict[str, list[float]]:
         """Every frame's pose as a row-major 4x4, for a viewer to draw.
 

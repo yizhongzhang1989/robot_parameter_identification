@@ -178,10 +178,18 @@ class FrictionSweep:
     start_deg: list[float]
     amplitude_deg: float
     speeds_deg_s: list[float]
-    # Gravity torque on this joint at this posture. Recorded because it is the
-    # variable the posture was chosen to spread, and without it the run cannot
-    # say what load its friction was measured under.
-    gravity_nm: float = 0.0
+    # What this joint carries at this posture: axial torque Nm, radial force N,
+    # thrust force N, tilting moment Nm. Recorded because it is the variable the
+    # posture was chosen to spread, and without it the run cannot say what load
+    # its friction was measured under. Four terms rather than one because no
+    # single term varies on every joint: joint one's radial force is fixed by
+    # its horizontal axis, joint seven's axial torque is zero everywhere.
+    load: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+
+    @property
+    def gravity_nm(self) -> float:
+        """The part the motor has to push against."""
+        return self.load[0]
 
     def as_dict(self) -> dict:
         return {
@@ -190,6 +198,7 @@ class FrictionSweep:
             "amplitude_deg": self.amplitude_deg,
             "speeds_deg_s": list(self.speeds_deg_s),
             "gravity_nm": round(self.gravity_nm, 4),
+            "load": [round(term, 4) for term in self.load],
         }
 
 
@@ -221,7 +230,7 @@ def design_friction_sweeps(
 
     One posture measures a joint under one gravity load, and which load that is
     depends on where the other joints happen to be. On this arm joint one
-    carries 0.17 Nm at home and up to 4.5 Nm with the arm extended, so friction
+    carries 0.17 Nm at home and up to 4.7 Nm with the arm extended, so friction
     fitted at home alone describes a small corner of its working range, while
     joint two barely varies and one posture would have served it.
     """
@@ -246,34 +255,64 @@ def design_friction_sweeps(
             start[joint] = centre - room / 2.0
             sweeps.append(FrictionSweep(
                 joint, start.tolist(), float(room), speeds,
-                gravity_nm=abs(float(arm.inverse_dynamics(posture)[joint]))))
+                load=tuple(arm.joint_loads(posture)[joint].tolist())))
     return sweeps
 
 
 def _sweep_postures(arm, joint, base, centre, room, low, high, wanted,
                     collision_free, candidates, rng):
-    """Collision-free postures for one joint, spread over its gravity load."""
+    """Collision-free postures for one joint, spread over the load it carries.
+
+    Spread across all four load terms rather than the gravity torque alone. No
+    single term varies on every joint -- joint one's radial force is fixed by
+    its horizontal axis, joint seven carries no axial torque in any pose -- so
+    choosing on one term picks arbitrarily on the joints where that term is
+    constant, and the run then cannot say whether their friction moved with
+    posture or not.
+    """
     found = []
     home = base.copy()
     home[joint] = centre
     if _sweep_free(home, joint, room, collision_free):
-        found.append((abs(float(arm.inverse_dynamics(home)[joint])), home))
-    if wanted > 1:
+        found.append(home)
+    # Without a screen there is nothing that could make a drawn posture safe,
+    # and a posture nobody checked must not be swept. Home is the exception:
+    # it is the pose the arm is already sitting in.
+    if wanted > 1 and collision_free is not None:
         for _ in range(candidates):
             pose = rng.uniform(low, high)
             pose[joint] = centre
-            if not _sweep_free(pose, joint, room, collision_free):
-                continue
-            found.append((abs(float(arm.inverse_dynamics(pose)[joint])), pose))
-    if not found:
-        return []
-    found.sort(key=lambda item: item[0])
+            if _sweep_free(pose, joint, room, collision_free):
+                found.append(pose)
+    if not found or wanted < 1:
+        return found[:max(wanted, 0)]
     if len(found) <= wanted:
-        return [pose for _torque, pose in found]
-    # Evenly spaced by load rather than by chance, so the lightest and the
-    # heaviest the arm can reach are both represented.
-    picks = np.linspace(0, len(found) - 1, wanted).round().astype(int)
-    return [found[index][1] for index in dict.fromkeys(picks.tolist())]
+        return found
+    return _spread_by_load(arm, joint, found, wanted)
+
+
+def _spread_by_load(arm, joint, poses, wanted):
+    """Pick the postures furthest apart in load, keeping home as the reference.
+
+    Each load term is scaled by its own range first, so a joint whose radial
+    force swings 22 N does not drown out the 4.7 Nm of torque beside it, and a
+    joint where one term never moves simply contributes nothing on that axis
+    instead of dominating.
+    """
+    loads = np.array([arm.joint_loads(pose)[joint] for pose in poses])
+    span = loads.max(axis=0) - loads.min(axis=0)
+    scaled = loads / np.where(span > 1e-9, span, 1.0)
+    # Home is index zero when it was admissible, and it is the posture every
+    # earlier run used, so keeping it makes this run comparable with those.
+    chosen = [0]
+    gap = np.linalg.norm(scaled - scaled[0], axis=1)
+    while len(chosen) < wanted:
+        pick = int(np.argmax(gap))
+        if gap[pick] <= 0.0:
+            break
+        chosen.append(pick)
+        gap = np.minimum(gap, np.linalg.norm(scaled - scaled[pick], axis=1))
+    return [poses[index] for index in chosen]
 
 
 @dataclass
