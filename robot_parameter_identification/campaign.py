@@ -207,6 +207,10 @@ class CampaignPlan:
     # Passes per speed and direction. One pass gives no way to notice that a
     # pass went wrong; three disagree visibly when one does.
     friction_repeats: int = 3
+    # Postures each joint is swept at. Its gravity load depends on where the
+    # other joints are, so one posture measures friction under one load: joint
+    # one of this arm sees 0.17 Nm at home and 4.5 Nm with the arm extended.
+    friction_postures: int = 3
     fourier_harmonics: int = 4
     fourier_base_frequency_hz: float = 0.08
     fourier_duration_s: float = 30.0
@@ -799,9 +803,12 @@ class Campaign:
             sweeps = excitation.design_friction_sweeps(
                 self.arm, self.limits,
                 amplitude_deg=self.plan.friction_amplitude_deg,
-                speeds_deg_s=self.plan.friction_speeds_deg_s)
+                speeds_deg_s=self.plan.friction_speeds_deg_s,
+                postures=self.plan.friction_postures,
+                collision_free=self._collision_free(),
+                seed=self.plan.seed)
             report.detail = {"sweeps": [sweep.as_dict() for sweep in sweeps]}
-            for sweep in sweeps:
+            for index, sweep in enumerate(sweeps):
                 # The design hands back the room available; each speed takes
                 # only the part of it that speed needs, centred on the same
                 # pose so every pass measures the same gravity term.
@@ -818,7 +825,8 @@ class Campaign:
                                     sweep.joint, origin, distance, speed):
                                 self._record(PHASE_FRICTION, sample, report)
                 self.progress(PHASE_FRICTION, {
-                    "joint": sweep.joint + 1, "joints": len(sweeps)})
+                    "joint": sweep.joint + 1,
+                    "sweep": index + 1, "sweeps": len(sweeps)})
         finally:
             report.duration_s = self.clock() - start
         return report

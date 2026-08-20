@@ -96,6 +96,106 @@ class FrictionDesignTest(unittest.TestCase):
                 start[sweep.joint] + sweep.amplitude_deg, high[sweep.joint] + 1e-6)
 
 
+class MultiPostureSweepTest(unittest.TestCase):
+    """A joint's gravity load depends on where the other joints are, so one
+    posture measures its friction under one load out of many."""
+
+    def setUp(self):
+        self.arm = arm_model()
+        self.limits = excitation.DesignLimits(
+            lower_deg=np.full(self.arm.joint_count, -80.0),
+            upper_deg=np.full(self.arm.joint_count, 80.0),
+            margin_deg=5.0, maximum_speed_deg_s=60.0,
+            maximum_acceleration_deg_s2=240.0)
+
+    def test_one_posture_reproduces_the_old_design(self):
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,))
+        self.assertEqual(len(sweeps), self.arm.joint_count)
+
+    def test_three_postures_give_three_sweeps_per_joint(self):
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3)
+        for joint in range(self.arm.joint_count):
+            mine = [s for s in sweeps if s.joint == joint]
+            self.assertEqual(len(mine), 3, f"joint {joint}")
+
+    def test_the_postures_differ_in_load(self):
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3)
+        spread = []
+        for joint in range(self.arm.joint_count):
+            loads = [s.gravity_nm for s in sweeps if s.joint == joint]
+            spread.append(max(loads) - min(loads))
+        # Some joints genuinely cannot be loaded; at least one must vary.
+        self.assertGreater(max(spread), 0.05)
+
+    def test_every_pass_is_screened_along_its_whole_length(self):
+        """A posture clear at its centre can still put the arm through an
+        obstacle partway along the sweep, where it spends most of its time."""
+        seen = []
+
+        def collision_free(pose):
+            seen.append(np.asarray(pose, dtype=float).copy())
+            return True
+
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=30.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=collision_free)
+        self.assertTrue(sweeps)
+        for sweep in sweeps:
+            start = np.asarray(sweep.start_deg, dtype=float)
+            end = start.copy()
+            end[sweep.joint] += sweep.amplitude_deg
+            middle = 0.5 * (start + end)
+            for wanted in (start, end, middle):
+                self.assertTrue(
+                    any(np.allclose(wanted, pose, atol=1e-6) for pose in seen),
+                    f"joint {sweep.joint} was never checked at {wanted}")
+
+    def test_a_blocked_sweep_is_dropped_not_driven(self):
+        joint = 1
+
+        def collision_free(pose):
+            # Anything that moves this joint past a third of the way is barred.
+            return abs(float(np.asarray(pose, dtype=float)[joint])) < 3.0
+
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=30.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=collision_free)
+        self.assertFalse([s for s in sweeps if s.joint == joint])
+
+    def test_a_refused_scene_yields_no_sweeps_rather_than_unchecked_ones(self):
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=lambda _pose: False)
+        self.assertEqual(sweeps, [])
+
+    def test_the_choice_is_repeatable(self):
+        first = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, seed=4)
+        again = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, seed=4)
+        self.assertEqual([s.start_deg for s in first],
+                         [s.start_deg for s in again])
+
+    def test_every_sweep_stays_inside_the_usable_range(self):
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=40.0, speeds_deg_s=(5.0,),
+            postures=3)
+        low, high = self.limits.usable()
+        for sweep in sweeps:
+            start = np.asarray(sweep.start_deg, dtype=float)
+            end = start.copy()
+            end[sweep.joint] += sweep.amplitude_deg
+            self.assertTrue(np.all(start >= low - 1e-6), sweep.joint)
+            self.assertTrue(np.all(end <= high + 1e-6), sweep.joint)
+
+
 class FourierDesignTest(unittest.TestCase):
     def setUp(self):
         self.arm = arm_model()

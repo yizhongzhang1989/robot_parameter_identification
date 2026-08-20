@@ -178,6 +178,10 @@ class FrictionSweep:
     start_deg: list[float]
     amplitude_deg: float
     speeds_deg_s: list[float]
+    # Gravity torque on this joint at this posture. Recorded because it is the
+    # variable the posture was chosen to spread, and without it the run cannot
+    # say what load its friction was measured under.
+    gravity_nm: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -185,30 +189,91 @@ class FrictionSweep:
             "start_deg": [round(v, 3) for v in self.start_deg],
             "amplitude_deg": self.amplitude_deg,
             "speeds_deg_s": list(self.speeds_deg_s),
+            "gravity_nm": round(self.gravity_nm, 4),
         }
+
+
+def _sweep_free(base, joint: int, room: float, collision_free,
+                steps: int = 24) -> bool:
+    """The whole pass, not just where it starts.
+
+    A posture that clears at the centre can still put the arm through the bench
+    thirty degrees later, and the sweep spends its whole length there.
+    """
+    if collision_free is None:
+        return True
+    start = np.asarray(base, dtype=float).copy()
+    end = start.copy()
+    start[joint] -= room / 2.0
+    end[joint] += room / 2.0
+    if not collision_free(start) or not collision_free(end):
+        return False
+    return _path_free(start, end, collision_free, steps)
 
 
 def design_friction_sweeps(
     arm: ident.ArmModel, limits: DesignLimits, amplitude_deg: float = 20.0,
     speeds_deg_s: tuple[float, ...] = (2.0, 5.0, 8.0),
-    home_deg: np.ndarray | None = None,
+    home_deg: np.ndarray | None = None, postures: int = 1,
+    collision_free=None, candidates: int = 160, seed: int = 0,
 ) -> list[FrictionSweep]:
-    """Sweep each joint about a pose where its gravity term barely changes."""
+    """Sweep each joint about poses that span the load it has to carry.
+
+    One posture measures a joint under one gravity load, and which load that is
+    depends on where the other joints happen to be. On this arm joint one
+    carries 0.17 Nm at home and up to 4.5 Nm with the arm extended, so friction
+    fitted at home alone describes a small corner of its working range, while
+    joint two barely varies and one posture would have served it.
+    """
     low, high = limits.usable()
     base = np.zeros(arm.joint_count) if home_deg is None else np.asarray(
         home_deg, dtype=float)
     base = np.clip(base, low, high)
     speeds = [speed for speed in speeds_deg_s
               if 0.0 < speed <= limits.maximum_speed_deg_s]
+    rng = np.random.default_rng(seed)
     sweeps = []
     for joint in range(arm.joint_count):
         room = min(amplitude_deg, (high[joint] - low[joint]) / 2.0 - 1.0)
         if room <= 1.0:
             continue
-        start = base.copy()
-        start[joint] = np.clip(base[joint] - room / 2.0, low[joint], high[joint])
-        sweeps.append(FrictionSweep(joint, start.tolist(), float(room), speeds))
+        centre = float(np.clip(base[joint], low[joint] + room / 2.0,
+                               high[joint] - room / 2.0))
+        for posture in _sweep_postures(arm, joint, base, centre, room, low,
+                                       high, postures, collision_free,
+                                       candidates, rng):
+            start = posture.copy()
+            start[joint] = centre - room / 2.0
+            sweeps.append(FrictionSweep(
+                joint, start.tolist(), float(room), speeds,
+                gravity_nm=abs(float(arm.inverse_dynamics(posture)[joint]))))
     return sweeps
+
+
+def _sweep_postures(arm, joint, base, centre, room, low, high, wanted,
+                    collision_free, candidates, rng):
+    """Collision-free postures for one joint, spread over its gravity load."""
+    found = []
+    home = base.copy()
+    home[joint] = centre
+    if _sweep_free(home, joint, room, collision_free):
+        found.append((abs(float(arm.inverse_dynamics(home)[joint])), home))
+    if wanted > 1:
+        for _ in range(candidates):
+            pose = rng.uniform(low, high)
+            pose[joint] = centre
+            if not _sweep_free(pose, joint, room, collision_free):
+                continue
+            found.append((abs(float(arm.inverse_dynamics(pose)[joint])), pose))
+    if not found:
+        return []
+    found.sort(key=lambda item: item[0])
+    if len(found) <= wanted:
+        return [pose for _torque, pose in found]
+    # Evenly spaced by load rather than by chance, so the lightest and the
+    # heaviest the arm can reach are both represented.
+    picks = np.linspace(0, len(found) - 1, wanted).round().astype(int)
+    return [found[index][1] for index in dict.fromkeys(picks.tolist())]
 
 
 @dataclass
