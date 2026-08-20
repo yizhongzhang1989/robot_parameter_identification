@@ -255,5 +255,69 @@ class TransitionWidthTest(unittest.TestCase):
         self.assertEqual(fit.components.coulomb_transition_deg_s, self.WIDTH)
 
 
+class StribeckSelectionTest(unittest.TestCase):
+    """The column is offered to every joint and taken by the ones whose data
+    wants it. Forced on the whole arm it cost three of seven joints up to five
+    per cent of their validation error."""
+
+    WIDTH = 1.8
+    COULOMB = 0.30
+    VISCOUS = 0.004
+
+    def _data(self, extra, rng, decay=1.6):
+        regressors, velocities, currents = [], [], []
+        speeds = [s for base in (0.3, 0.6, 1.2, 2.5, 5.0, 10.0, 20.0, 40.0)
+                  for s in (base, -base)]
+        for speed in speeds:
+            for _ in range(8):
+                pose = rng.normal(size=4)
+                row = np.zeros((1, 4))
+                row[0] = pose
+                regressors.append(row)
+                velocities.append(speed)
+                effort = (float(pose @ np.array([0.5, -0.2, 0.1, 0.3]))
+                          + self.COULOMB * np.tanh(speed / self.WIDTH)
+                          + extra * np.sign(speed) * np.exp(-abs(speed) / decay)
+                          + self.VISCOUS * speed
+                          + rng.normal(scale=0.003))
+                currents.append(effort)
+        return regressors, velocities, currents
+
+    def _fit(self, extra):
+        rng = np.random.default_rng(4)
+        regressors, velocities, currents = self._data(extra, rng)
+        components = ident.ModelComponents(
+            coulomb_transition_deg_s=self.WIDTH, stribeck_search=True,
+            stribeck_speed_deg_s=1.6)
+        return ident.fit_joint(0, regressors, velocities, currents,
+                               components=components, maximum_condition=1e6)
+
+    def test_a_joint_with_stribeck_takes_the_column(self):
+        fit = self._fit(0.25)
+        self.assertTrue(fit.components.stribeck)
+        self.assertGreater(fit.friction.get("stribeck", 0.0), 0.1)
+
+    def test_a_joint_without_it_declines(self):
+        fit = self._fit(0.0)
+        self.assertFalse(fit.components.stribeck)
+        self.assertNotIn("stribeck", fit.friction)
+
+    def test_declining_leaves_the_other_terms_alone(self):
+        fit = self._fit(0.0)
+        self.assertAlmostEqual(fit.friction["coulomb"], self.COULOMB, delta=0.05)
+
+    def test_the_choice_is_repeatable(self):
+        self.assertEqual(self._fit(0.25).components.stribeck,
+                         self._fit(0.25).components.stribeck)
+
+    def test_the_search_is_off_unless_asked(self):
+        rng = np.random.default_rng(4)
+        regressors, velocities, currents = self._data(0.25, rng)
+        fit = ident.fit_joint(0, regressors, velocities, currents,
+                              components=ident.ModelComponents(),
+                              maximum_condition=1e6)
+        self.assertFalse(fit.components.stribeck)
+
+
 if __name__ == "__main__":
     unittest.main()

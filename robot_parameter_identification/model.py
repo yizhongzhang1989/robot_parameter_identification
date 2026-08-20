@@ -30,6 +30,13 @@ class ModelComponents:
     coulomb_transition_search: tuple[float, ...] = ()
     actuator_inertia: bool = False
     stribeck: bool = False
+    # Offer the column and let each joint's data decide. Measured on this arm:
+    # it earns its place on the three loaded pitch joints and costs the four
+    # roll joints, so switching it on or off for the whole arm is wrong either
+    # way. On the joints that do not want it the non-negativity constraint
+    # already drives it to zero; the selection stops the ones that land on a
+    # small positive value by luck from keeping it.
+    stribeck_search: bool = False
     # Stribeck is only linear once this is fixed, so it is a setting, not a fit.
     stribeck_speed_deg_s: float = 2.0
     # Friction that grows with transmitted load. Its column needs a load

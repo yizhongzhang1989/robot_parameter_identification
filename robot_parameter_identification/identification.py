@@ -30,6 +30,14 @@ MINIMUM_TRANSITION_SAMPLES = 12
 # near the noise is the split between Coulomb and viscous drifting, not a
 # better measurement of the reversal.
 TRANSITION_GAIN = 0.05
+# Folds and margin for deciding whether a joint wants a Stribeck column.
+# Adding a column almost never worsens the error it was fitted on, so the
+# question is only ever whether it helps on data held back. A quarter of a
+# per cent of improvement is not an answer: on hardware the joints that went
+# on to validate better gained 1.8 to 25 per cent here, and those that
+# validated worse gained under one.
+STRIBECK_FOLDS = 4
+STRIBECK_GAIN = 0.015
 
 PARAMETERS_PER_LINK = 10
 FRICTION_COLUMNS = ("coulomb", "viscous", "offset")
@@ -375,6 +383,49 @@ def _solve(rigid: np.ndarray, velocities: np.ndarray, accelerations: np.ndarray,
     return outcome
 
 
+def _choose_stribeck(rigid, velocities, accelerations, components, target,
+                     tolerance, maximum_condition, rigid_width, seed):
+    """Keep the Stribeck column only if held-back data says the joint wants it.
+
+    Measured on this arm the column is worth thirty-five per cent of the
+    validation error on the worst-loaded joint and costs five per cent on a
+    lightly loaded one, so the choice belongs to the joint rather than to the
+    arm.
+    """
+    if not getattr(components, "stribeck_search", False):
+        return components
+    rows = target.size
+    if rows < STRIBECK_FOLDS * 8:
+        return replace(components, stribeck_search=False)
+
+    order = np.random.default_rng(seed).permutation(rows)
+    folds = np.array_split(order, STRIBECK_FOLDS)
+    scores = {}
+    for enabled in (False, True):
+        trial = replace(components, stribeck=enabled, stribeck_search=False)
+        errors = []
+        for index in range(STRIBECK_FOLDS):
+            test = folds[index]
+            keep = np.concatenate(
+                [f for position, f in enumerate(folds) if position != index])
+            outcome = _solve(rigid[keep], velocities[keep],
+                             accelerations[keep], trial, target[keep],
+                             tolerance, maximum_condition, rigid_width)
+            if outcome is None:
+                errors = None
+                break
+            stacked = _stack(rigid, velocities, accelerations, trial,
+                             np.zeros(rows))
+            _, columns, solution, _rank, _condition = outcome
+            error = target[test] - stacked[np.ix_(test, columns)] @ solution
+            errors.append(float(np.sqrt(np.mean(error ** 2))))
+        scores[enabled] = None if not errors else float(np.mean(errors))
+    plain, extra = scores.get(False), scores.get(True)
+    if plain is None or extra is None or extra > plain * (1.0 - STRIBECK_GAIN):
+        return replace(components, stribeck=False, stribeck_search=False)
+    return replace(components, stribeck=True, stribeck_search=False)
+
+
 def _fit_transition(rigid, velocities, accelerations, components, target,
                     tolerance, maximum_condition, rigid_width, mask=None):
     """Solve once per candidate reversal width and keep the best.
@@ -447,7 +498,6 @@ def fit_joint(
             friction=False, offset=False)
     accelerations = (
         [0.0] * len(velocities) if accelerations is None else list(accelerations))
-    extra_names = components.column_names()
 
     rigid = np.asarray(
         [np.asarray(regressor[joint], dtype=float) for regressor in regressors],
@@ -456,6 +506,11 @@ def fit_joint(
     velocities = np.asarray(velocities, dtype=float)
     accelerations = np.asarray(accelerations, dtype=float)
     target = np.asarray(currents, dtype=float)
+
+    components = _choose_stribeck(rigid, velocities, accelerations, components,
+                                  target, tolerance, maximum_condition,
+                                  rigid_width, seed)
+    extra_names = components.column_names()
 
     outcome = _fit_transition(rigid, velocities, accelerations, components,
                               target, tolerance, maximum_condition,

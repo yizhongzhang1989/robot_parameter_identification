@@ -232,7 +232,10 @@ class CampaignPlan:
     # with one non-negative column instead of a cancelling pair. Left available
     # because a different transmission may genuinely show static > dynamic.
     stribeck: bool = False
-    stribeck_speed_deg_s: float = 2.0
+    # Offered to every joint; each one's data decides. On this arm three of
+    # seven take it and the rest are better without.
+    stribeck_search: bool = True
+    stribeck_speed_deg_s: float = 1.6
     load_friction: bool = False
     seed: int = 0
 
@@ -268,6 +271,7 @@ class CampaignPlan:
             coulomb_transition_deg_s=self.coulomb_transition_deg_s,
             coulomb_transition_search=tuple(self.coulomb_transition_search),
             stribeck=self.stribeck,
+            stribeck_search=self.stribeck_search,
             stribeck_speed_deg_s=self.stribeck_speed_deg_s,
             load_friction=self.load_friction)
 
