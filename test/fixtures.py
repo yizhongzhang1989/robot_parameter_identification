@@ -57,9 +57,13 @@ def synthetic_urdf(joints: int = JOINT_COUNT, prefix: str = PREFIX,
         axis = axes[(index - 1) % len(axes)]
         offset_x, offset_y = laterals[(index - 1) % len(laterals)]
         mass = 3.1 - 0.32 * index
+        # A rigid body's principal moments obey the triangle inequality, and
+        # shrinking iyy while ixx grew broke it from the fourth link on, making
+        # half the fixture arm physically impossible. Every moment grows now, at
+        # different rates, so the links stay distinct and stay real.
         ixx = 0.031 + 0.004 * index
-        iyy = 0.024 - 0.002 * index
-        izz = 0.017 + 0.003 * index
+        iyy = 0.024 + 0.003 * index
+        izz = 0.017 + 0.005 * index
         offset = 0.10 if index == 1 else 0.18 + 0.02 * (index % 3)
         length = 0.16 + 0.02 * (index % 4)
         origin = (f'<origin xyz="{offset_x} {offset_y} {offset}" rpy="{tilt}"/>'

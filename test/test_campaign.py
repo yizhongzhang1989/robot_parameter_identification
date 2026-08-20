@@ -7,11 +7,21 @@ import numpy as np
 
 try:
     from robot_parameter_identification import campaign
-    from robot_parameter_identification.plants import simulation
     from test_identification import arm_model
     from fixtures import rm75_profile, scene_path, GAINS, COULOMB, VISCOUS
 except ImportError as error:
-    raise unittest.SkipTest(f"campaign needs pinocchio and mujoco: {error}") from error
+    raise unittest.SkipTest(f"campaign needs pinocchio: {error}") from error
+
+try:
+    from robot_parameter_identification.plants import simulation
+except ImportError as error:
+    # Only the end-to-end simulated run needs this. Taking the whole module
+    # down with it is how every guard, cap and phase test in this file stopped
+    # running unnoticed when the MuJoCo plant was removed.
+    simulation = None
+    SIMULATION_MISSING = str(error)
+else:
+    SIMULATION_MISSING = ""
 
 class ScriptedPlant:
     """Analytic stand-in so guard behaviour can be tested without a simulator."""
@@ -189,6 +199,47 @@ class PhaseBookkeepingTest(unittest.TestCase):
         self.assertGreater(peak, 0.0)
 
 
+class BlindSceneRefusesUnscreenedPosturesTest(unittest.TestCase):
+    """A scene whose link meshes failed to load keeps answering, and answers
+    clear to everything. Home survives that because it is where the arm already
+    is; postures drawn from the whole range do not."""
+
+    class Scene:
+        def __init__(self, sees_arm: bool):
+            self.sees_arm = sees_arm
+
+        def geometry_report(self) -> dict:
+            return {"self_collision_checked": self.sees_arm,
+                    "robot_shapes": 4 if self.sees_arm else 0}
+
+        def collision_free(self, _pose_deg) -> bool:
+            return True
+
+    def _run(self, scene) -> dict:
+        plant = ScriptedPlant()
+        plant.collision_model = scene
+        run = campaign.Campaign(arm_model(), plant,
+                                small_plan(friction_postures=3))
+        return run.run_friction().detail
+
+    def test_a_blind_scene_falls_back_to_home_and_says_so(self):
+        detail = self._run(self.Scene(sees_arm=False))
+        self.assertEqual(detail["postures"], 1)
+        self.assertIn("collision geometry unavailable", detail["downgraded"])
+
+    def test_a_seeing_scene_sweeps_every_posture(self):
+        detail = self._run(self.Scene(sees_arm=True))
+        self.assertEqual(detail["postures"], 3)
+        self.assertNotIn("downgraded", detail)
+
+    def test_no_scene_at_all_is_treated_as_blind(self):
+        plant = ScriptedPlant()
+        self.assertIsNone(getattr(plant, "collision_model", None))
+        run = campaign.Campaign(arm_model(), plant,
+                                small_plan(friction_postures=3))
+        self.assertEqual(run.run_friction().detail["postures"], 1)
+
+
 class GuardTest(unittest.TestCase):
     def setUp(self):
         self.arm = arm_model()
@@ -247,12 +298,17 @@ class MonitorTest(unittest.TestCase):
             monitor=StubMonitor(self.limits)).run()
         self.assertIsNone(result.aborted)
 
-    def test_monitor_is_skipped_when_telemetry_is_incomplete(self):
+    def test_a_measured_over_current_trips_even_when_other_signals_are_missing(self):
+        """The current reading is real whether or not the bus voltage is
+        published, and this arm does not publish it. Standing the over-current
+        guard down because an unrelated channel is absent would disable it on
+        exactly the hardware it is there to protect."""
         plant = ScriptedPlant(current_a=99.0, instrumented=False)
         result = campaign.Campaign(
             self.arm, plant, small_plan(),
             monitor=StubMonitor(self.limits)).run()
-        self.assertIsNone(result.aborted)
+        self.assertIsNotNone(result.aborted)
+        self.assertIn("current", result.aborted)
 
     def test_monitor_sees_every_instrumented_frame(self):
         monitor = StubMonitor(self.limits)
@@ -278,6 +334,7 @@ class MonitorTest(unittest.TestCase):
             self.assertLess(float(np.max(np.abs(record.position_deg))), 40.0)
 
 
+@unittest.skipIf(simulation is None, f"needs the simulated plant: {SIMULATION_MISSING}")
 class MujocoCampaignTest(unittest.TestCase):
     """The gate that must pass before the arm is allowed to move."""
 

@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 try:
-    from robot_parameter_identification.plants import trajectory_controller as hardware
+    from robot_parameter_identification.plants import ros_control as hardware
     from fixtures import rm75_profile
 except ImportError as error:
     raise unittest.SkipTest(f"hardware module unavailable: {error}") from error
@@ -140,19 +140,39 @@ class FakeClient:
 
 
 class FakeRclpy:
-    """Pumps a scripted telemetry stream every time the plant spins."""
+    """Pumps a scripted telemetry stream every time the plant spins.
 
-    def __init__(self, plant, frames):
+    ``frames`` may be a list to replay or a callable taking the tick index, in
+    which case the stream never runs out. A finite list does: hold_pose alone
+    can spin tens of thousands of times, and a fake that then repeats its last
+    frame forever hands the fit a motionless arm.
+    """
+
+    def __init__(self, plant, frames, period_s=0.005):
         self.plant = plant
-        self.frames = list(frames)
+        self.make = frames if callable(frames) else None
+        self.frames = [] if self.make else list(frames)
         self.index = 0
+        self.period_s = period_s
 
     def _tick(self):
-        if self.frames:
-            self.plant._latest = self.frames[
-                min(self.index, len(self.frames) - 1)]
-            self.plant._latest_at = __import__("time").monotonic()
-            self.index += 1
+        if self.make is None:
+            if not self.frames:
+                return
+            arrived = dict(self.frames[min(self.index, len(self.frames) - 1)])
+        else:
+            arrived = dict(self.make(self.index))
+        # The real callback stamps each frame from the message header and, while
+        # a motion is being captured, appends it to the buffer the fit reads.
+        # A fake that only sets _latest leaves every windowed phase with nothing
+        # to fit, which is not a stand-in for the driver but for a dead topic.
+        arrived.setdefault("stamp_s", self.index * self.period_s)
+        self.plant._latest = arrived
+        self.plant._latest_at = __import__("time").monotonic()
+        with self.plant._lock:
+            if self.plant._buffering:
+                self.plant._buffer.append(arrived)
+        self.index += 1
 
     def spin_once(self, _node, timeout_sec=0.0):
         self._tick()
@@ -228,24 +248,37 @@ class MotionTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.plant.hold_pose(np.zeros(JOINTS))
 
-    def test_track_attaches_differentiated_acceleration(self):
-        speeds = [np.full(JOINTS, value) for value in (0.0, 1.0, 2.0, 3.0, 4.0)]
-        self.plant._client = FakeClient(self.result, spins_until_done=6)
-        self.plant._rclpy = FakeRclpy(
-            self.plant, [frame(speed=speed) for speed in speeds])
+    def test_track_fits_acceleration_out_of_the_captured_window(self):
+        """Phase C exists to measure inertia, and inertia is read off the
+        acceleration. It now comes from the same quadratic fit as the speed
+        rather than from differentiating the drive's quantised velocity
+        channel, so drive a known parabola through and check it comes back."""
+        period_s = 0.005
+        wanted = 4.0  # deg/s^2
+
+        def parabola(index):
+            time_s = index * period_s
+            return frame(position=np.full(JOINTS, 0.5 * wanted * time_s ** 2),
+                         speed=np.full(JOINTS, wanted * time_s))
+
+        self.plant._client = FakeClient(self.result, spins_until_done=80)
+        self.plant._rclpy = FakeRclpy(self.plant, parabola, period_s=period_s)
 
         class Design:
             duration_s = 1.0
 
             def sample(self, time_s):
-                position = np.full(JOINTS, time_s)
-                return position, np.full(JOINTS, 1.0), np.zeros(JOINTS)
+                position = np.full(JOINTS, 0.5 * wanted * time_s ** 2)
+                return position, np.full(JOINTS, wanted * time_s), np.zeros(JOINTS)
 
         frames = list(self.plant.track(Design(), rate_hz=10.0))
-        self.assertGreaterEqual(len(frames), 3)
-        self.assertIn("acceleration_deg_s2", frames[0])
-        self.assertTrue(
-            all(np.all(np.isfinite(f["acceleration_deg_s2"])) for f in frames))
+        self.assertGreaterEqual(len(frames), 3, "too few windows to fit")
+        for fitted in frames:
+            self.assertIn("acceleration_deg_s2", fitted)
+            found = np.asarray(fitted["acceleration_deg_s2"], dtype=float)
+            self.assertTrue(np.all(np.isfinite(found)))
+            self.assertTrue(np.allclose(found, wanted, atol=1e-6),
+                            f"fitted {found[0]:.4f}, drove {wanted}")
 
     def test_track_refuses_to_report_too_few_frames(self):
         """Silently returning nothing would poison the inertia fit."""

@@ -17,6 +17,12 @@ def design_limits(arm, **overrides):
     return excitation.DesignLimits(low, high, **overrides)
 
 
+def CLEAR(_pose):  # noqa: N802 - reads as a constant at the call sites
+    """A screen that exists and finds nothing wrong, which is not the same as
+    having no screen: the second cannot vouch for a posture at all."""
+    return True
+
+
 class LimitTest(unittest.TestCase):
     def setUp(self):
         self.arm = arm_model()
@@ -108,6 +114,18 @@ class MultiPostureSweepTest(unittest.TestCase):
             margin_deg=5.0, maximum_speed_deg_s=60.0,
             maximum_acceleration_deg_s2=240.0)
 
+    def test_without_a_screen_only_home_is_swept(self):
+        """Nothing could have made a drawn posture safe, so none is driven."""
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3)
+        self.assertEqual(len(sweeps), self.arm.joint_count)
+        for sweep in sweeps:
+            posture = np.asarray(sweep.start_deg, dtype=float)
+            posture[sweep.joint] = 0.0
+            self.assertTrue(np.allclose(posture, 0.0),
+                            f"joint {sweep.joint} left home unscreened")
+
     def test_one_posture_reproduces_the_old_design(self):
         sweeps = excitation.design_friction_sweeps(
             self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,))
@@ -116,7 +134,7 @@ class MultiPostureSweepTest(unittest.TestCase):
     def test_three_postures_give_three_sweeps_per_joint(self):
         sweeps = excitation.design_friction_sweeps(
             self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
-            postures=3)
+            postures=3, collision_free=CLEAR)
         for joint in range(self.arm.joint_count):
             mine = [s for s in sweeps if s.joint == joint]
             self.assertEqual(len(mine), 3, f"joint {joint}")
@@ -124,7 +142,7 @@ class MultiPostureSweepTest(unittest.TestCase):
     def test_the_postures_differ_in_load(self):
         sweeps = excitation.design_friction_sweeps(
             self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
-            postures=3)
+            postures=3, collision_free=CLEAR)
         spread = []
         for joint in range(self.arm.joint_count):
             loads = [s.gravity_nm for s in sweeps if s.joint == joint]
@@ -176,17 +194,17 @@ class MultiPostureSweepTest(unittest.TestCase):
     def test_the_choice_is_repeatable(self):
         first = excitation.design_friction_sweeps(
             self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
-            postures=3, seed=4)
+            postures=3, collision_free=CLEAR, seed=4)
         again = excitation.design_friction_sweeps(
             self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
-            postures=3, seed=4)
+            postures=3, collision_free=CLEAR, seed=4)
         self.assertEqual([s.start_deg for s in first],
                          [s.start_deg for s in again])
 
     def test_every_sweep_stays_inside_the_usable_range(self):
         sweeps = excitation.design_friction_sweeps(
             self.arm, self.limits, amplitude_deg=40.0, speeds_deg_s=(5.0,),
-            postures=3)
+            postures=3, collision_free=CLEAR)
         low, high = self.limits.usable()
         for sweep in sweeps:
             start = np.asarray(sweep.start_deg, dtype=float)
@@ -194,6 +212,65 @@ class MultiPostureSweepTest(unittest.TestCase):
             end[sweep.joint] += sweep.amplitude_deg
             self.assertTrue(np.all(start >= low - 1e-6), sweep.joint)
             self.assertTrue(np.all(end <= high + 1e-6), sweep.joint)
+
+    def test_the_recorded_load_is_the_load_at_the_posture(self):
+        """The sweep starts half an amplitude before the posture it was chosen
+        for, so the load has to be read at the posture, not at the start."""
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=CLEAR)
+        for sweep in sweeps:
+            posture = np.asarray(sweep.start_deg, dtype=float)
+            posture[sweep.joint] += sweep.amplitude_deg / 2.0
+            expected = self.arm.joint_loads(posture)[sweep.joint]
+            self.assertTrue(np.allclose(sweep.load, expected, atol=1e-9),
+                            f"joint {sweep.joint}: {sweep.load} vs {expected}")
+
+    def test_postures_spread_load_a_torque_alone_would_miss(self):
+        """Choosing on gravity torque picks arbitrarily wherever that torque is
+        the same in every pose, so require every joint to move in some term."""
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=CLEAR)
+        for joint in range(self.arm.joint_count):
+            loads = np.array([s.load for s in sweeps if s.joint == joint])
+            span = loads.max(axis=0) - loads.min(axis=0)
+            self.assertGreater(span.max(), 0.0, f"joint {joint} never moved")
+
+
+class JointLoadTest(unittest.TestCase):
+    """What a joint carries is four numbers, and they do not move together."""
+
+    def setUp(self):
+        self.arm = arm_model()
+
+    def test_the_axial_term_is_the_inverse_dynamics_torque(self):
+        rng = np.random.default_rng(0)
+        for _ in range(8):
+            pose = rng.uniform(-60.0, 60.0, self.arm.joint_count)
+            axial = self.arm.joint_loads(pose)[:, 0]
+            expected = np.abs(self.arm.inverse_dynamics(pose))
+            self.assertTrue(np.allclose(axial, expected, atol=1e-9),
+                            f"{axial} vs {expected}")
+
+    def test_the_terms_are_reported_per_joint(self):
+        loads = self.arm.joint_loads(np.zeros(self.arm.joint_count))
+        self.assertEqual(loads.shape, (self.arm.joint_count, 4))
+        self.assertTrue(np.all(loads >= 0.0))
+
+    def test_the_force_only_changes_direction_not_size(self):
+        """The force through a joint is the weight of everything past it, the
+        same in every pose. Its size is therefore useless for telling postures
+        apart; what moves is how it is shared between radial and thrust, which
+        is why both are kept and neither is summed away."""
+        rng = np.random.default_rng(1)
+        loads = np.array([self.arm.joint_loads(
+            rng.uniform(-80.0, 80.0, self.arm.joint_count)) for _ in range(40)])
+        size = np.hypot(loads[:, :, 1], loads[:, :, 2])
+        spread = size.max(axis=0) - size.min(axis=0)
+        self.assertLess(spread.max(), 1e-6, f"force size moved by {spread}")
+        split = loads[:, :, 1].max(axis=0) - loads[:, :, 1].min(axis=0)
+        self.assertGreater(split.max(), 1e-3, "no joint changed its load split")
 
 
 class FourierDesignTest(unittest.TestCase):

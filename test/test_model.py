@@ -6,11 +6,20 @@ import numpy as np
 
 try:
     from robot_parameter_identification import consistency, identification as ident, model
-    from robot_parameter_identification.plants import simulation
     from test_identification import arm_model
     from fixtures import rm75_profile, scene_path, GAINS, COULOMB, VISCOUS
 except ImportError as error:
-    raise unittest.SkipTest(f"needs pinocchio and mujoco: {error}") from error
+    raise unittest.SkipTest(f"needs pinocchio: {error}") from error
+
+try:
+    from robot_parameter_identification.plants import simulation
+except ImportError as error:
+    # Only the simulated round trips need this. Taking the module down with it
+    # is how the rest of these tests stopped running unnoticed.
+    simulation = None
+    SIMULATION_MISSING = str(error)
+else:
+    SIMULATION_MISSING = ""
 
 
 class ComponentsTest(unittest.TestCase):
@@ -152,6 +161,7 @@ class ConsistencyTest(unittest.TestCase):
         self.assertIn("not implemented", summary["projection"])
 
 
+@unittest.skipIf(simulation is None, f"needs the simulated plant: {SIMULATION_MISSING}")
 class StribeckRecoveryTest(unittest.TestCase):
     """The column must recover an effect the plant genuinely has.
 
@@ -250,6 +260,7 @@ class StribeckRecoveryTest(unittest.TestCase):
         self.assertTrue(entry["components"]["actuator_inertia"])
 
 
+@unittest.skipIf(simulation is None, f"needs the simulated plant: {SIMULATION_MISSING}")
 class LoadFrictionRecoveryTest(unittest.TestCase):
     """Friction proportional to transmitted load needs an iterated fit.
 
@@ -323,6 +334,7 @@ class LoadFrictionRecoveryTest(unittest.TestCase):
             fit.residual_rms_a, delta=1e-9)
 
 
+@unittest.skipIf(simulation is None, f"needs the simulated plant: {SIMULATION_MISSING}")
 class PhysicalFrictionSignTest(unittest.TestCase):
     """Friction coefficients that physics forbids must never be returned.
 
