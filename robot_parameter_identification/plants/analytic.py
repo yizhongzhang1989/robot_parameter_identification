@@ -100,6 +100,17 @@ class AnalyticPlant:
             return True
         return bool(self.collision_scene.collision_free(pose_deg))
 
+    @property
+    def collision_model(self):
+        """The same scene under the name the hardware plant uses.
+
+        A rehearsal exists to exercise the run that follows it. While the two
+        plants disagreed on what to call this, anything asking the plant what
+        its scene can see got nothing here, and the rehearsal quietly designed a
+        seven-sweep campaign to rehearse a twenty-one-sweep one.
+        """
+        return self.collision_scene
+
     def hold_pose(self, pose_deg) -> dict:
         self._clock += 0.5
         return self._sample(pose_deg, np.zeros(self.joint_count),

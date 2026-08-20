@@ -239,6 +239,21 @@ class BlindSceneRefusesUnscreenedPosturesTest(unittest.TestCase):
                                 small_plan(friction_postures=3))
         self.assertEqual(run.run_friction().detail["postures"], 1)
 
+    def test_the_rehearsal_plant_answers_the_same_question_as_hardware(self):
+        """The rehearsal exists to exercise the run that follows it. If the two
+        plants expose their scene under different names, the gate reads blind on
+        one of them and the rehearsal designs a different campaign than the one
+        it is meant to rehearse."""
+        from robot_parameter_identification.plants.analytic import AnalyticPlant
+
+        scene = self.Scene(sees_arm=True)
+        rehearsal = AnalyticPlant(arm_model().model, rm75_profile(),
+                                  collision_scene=scene)
+        self.assertIs(rehearsal.collision_model, scene)
+        run = campaign.Campaign(arm_model(), rehearsal,
+                                small_plan(friction_postures=3))
+        self.assertTrue(run._self_collision_checked())
+
 
 class GuardTest(unittest.TestCase):
     def setUp(self):
