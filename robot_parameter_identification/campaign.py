@@ -27,6 +27,7 @@ import time
 import numpy as np
 
 from . import excitation, identification as ident
+from .interfaces import MotionFailed
 from .model import ModelComponents
 from .profile import RobotProfile
 
@@ -241,6 +242,10 @@ class CampaignPlan:
     stribeck_search: bool = True
     stribeck_speed_deg_s: float = 1.6
     load_friction: bool = False
+    # Motions the arm may refuse before the run is called off. A few gaps in a
+    # ladder of thousands cost almost nothing; an arm refusing everything is
+    # not producing a dataset and should not be left running for hours.
+    skip_budget: int = 40
     seed: int = 0
 
     def design_limits(self, arm: ident.ArmModel,
@@ -316,6 +321,9 @@ class CampaignResult:
     validation_rms_a: list[float] = field(default_factory=list)
     validation_samples: int = 0
     aborted: str | None = None
+    # Motions the arm refused. A run with gaps in it is still a run, but the
+    # report must not present it as one that measured everything it planned to.
+    skipped: list = field(default_factory=list)
     # The fitted regressions themselves, kept out of as_dict because they are
     # arrays, not a document. Diagnostics need them to predict per observation.
     fits: list = field(default_factory=list, repr=False)
@@ -353,6 +361,7 @@ class CampaignResult:
             "validation_rms_a": [round(v, 5) for v in self.validation_rms_a],
             "validation_samples": self.validation_samples,
             "aborted": self.aborted,
+            "skipped": self.skipped,
             "complete": self.complete,
             "verdict": self.verdict(),
         }
@@ -662,6 +671,7 @@ class Campaign:
         self.limits = self.plan.design_limits(arm, self._plant_limits())
         self.observations: list[Observation] = []
         self.reports: list[PhaseReport] = []
+        self.skipped: list[dict] = []
         self.aborted: str | None = None
         self._started = self.clock()
 
@@ -771,6 +781,32 @@ class Campaign:
         self.reports.append(report)
         return report, self.clock()
 
+    def _attempt(self, report: PhaseReport, what: str, motion) -> bool:
+        """Run one motion, and let the campaign outlive it failing.
+
+        A pass that will not run is one row of several thousand. Ending the run
+        over it throws away every hour already spent and asks the operator to
+        start again, which is a worse outcome than a gap in the ladder. Failures
+        are counted, and enough of them still stops the run: an arm refusing
+        everything is not producing a dataset, it is producing a log.
+        """
+        try:
+            motion()
+            return True
+        except MotionFailed as failure:
+            self.skipped.append({"phase": report.phase, "motion": what,
+                                 "reason": str(failure)})
+            report.detail.setdefault("skipped", []).append(
+                {"motion": what, "reason": str(failure)})
+            self.progress(report.phase, {"skipped": what,
+                                         "reason": str(failure),
+                                         "skipped_total": len(self.skipped)})
+            if len(self.skipped) > self.plan.skip_budget:
+                raise Abort(
+                    f"{len(self.skipped)} motions failed, over the budget of "
+                    f"{self.plan.skip_budget}: {failure}") from failure
+            return False
+
     def _probe(self, pose_deg) -> list:
         """Gravity samples at a pose, with friction forced to a known sign.
 
@@ -811,8 +847,11 @@ class Campaign:
             report.detail["poses"] = len(design.poses_deg)
             for index, pose in enumerate(design.poses_deg):
                 target = np.asarray(pose, dtype=float)
-                for sample in self._probe(target):
-                    self._record(PHASE_GRAVITY, sample, report)
+                self._attempt(
+                    report, f"pose {index + 1}",
+                    lambda target=target: [
+                        self._record(PHASE_GRAVITY, sample, report)
+                        for sample in self._probe(target)])
                 self.progress(PHASE_GRAVITY, {
                     "pose": index + 1, "poses": len(design.poses_deg)})
         finally:
@@ -847,9 +886,15 @@ class Campaign:
                             origin = np.asarray(sweep.start_deg, dtype=float)
                             origin = origin.copy()
                             origin[sweep.joint] = centre - distance / 2.0
-                            for sample in self.plant.traverse(
-                                    sweep.joint, origin, distance, speed):
-                                self._record(PHASE_FRICTION, sample, report)
+                            self._attempt(
+                                report,
+                                f"j{sweep.joint + 1} {speed:g} deg/s "
+                                f"{'+' if distance > 0 else '-'}",
+                                lambda joint=sweep.joint, origin=origin,
+                                distance=distance, speed=speed: [
+                                    self._record(PHASE_FRICTION, sample, report)
+                                    for sample in self.plant.traverse(
+                                        joint, origin, distance, speed)])
                 self.progress(PHASE_FRICTION, {
                     "joint": sweep.joint + 1,
                     "sweep": index + 1, "sweeps": len(sweeps)})
@@ -873,13 +918,19 @@ class Campaign:
 
             report.detail = {"trajectory": trajectory.as_dict()}
             emitted = 0
-            for sample in self.plant.track(trajectory, self.plan.sample_rate_hz):
-                self._record(
-                    PHASE_INERTIA, sample, report,
-                    sample.get("acceleration_deg_s2"))
-                emitted += 1
-                if emitted % 20 == 0:
-                    self.progress(PHASE_INERTIA, {"samples": emitted})
+
+            def follow():
+                nonlocal emitted
+                for sample in self.plant.track(
+                        trajectory, self.plan.sample_rate_hz):
+                    self._record(
+                        PHASE_INERTIA, sample, report,
+                        sample.get("acceleration_deg_s2"))
+                    emitted += 1
+                    if emitted % 20 == 0:
+                        self.progress(PHASE_INERTIA, {"samples": emitted})
+
+            self._attempt(report, "fourier trajectory", follow)
         finally:
             report.duration_s = self.clock() - start
         return report
@@ -904,9 +955,12 @@ class Campaign:
                 pose = rng.uniform(low, high)
                 if admissible is not None and not admissible(pose):
                     continue
-                sample = self.plant.hold_pose(pose)
-                self._record(PHASE_VALIDATION, sample, report)
-                accepted += 1
+                if self._attempt(
+                        report, f"validation pose {accepted + 1}",
+                        lambda pose=pose: self._record(
+                            PHASE_VALIDATION, self.plant.hold_pose(pose),
+                            report)):
+                    accepted += 1
             report.detail = {"poses": accepted, "candidates": attempts}
 
             report.detail["speeds_deg_s"] = list(self._validation_speeds())
@@ -915,6 +969,13 @@ class Campaign:
             home = self._validation_home(rng, admissible)
             report.detail["sweep_home_deg"] = [round(v, 3) for v in home]
             swept = 0
+
+            def sweep_once(joint, origin, arc, speed):
+                nonlocal swept
+                for frame in self.plant.traverse(joint, origin, arc, speed):
+                    self._record(PHASE_VALIDATION, frame, report)
+                    swept += 1
+
             for sweep in excitation.design_friction_sweeps(
                     self.arm, self.limits,
                     amplitude_deg=self.plan.friction_amplitude_deg,
@@ -922,10 +983,12 @@ class Campaign:
                     home_deg=home):
                 for speed in sweep.speeds_deg_s:
                     origin = np.asarray(sweep.start_deg, dtype=float)
-                    for frame in self.plant.traverse(
-                            sweep.joint, origin, sweep.amplitude_deg, speed):
-                        self._record(PHASE_VALIDATION, frame, report)
-                        swept += 1
+                    self._attempt(
+                        report,
+                        f"validation j{sweep.joint + 1} {speed:g} deg/s",
+                        lambda joint=sweep.joint, origin=origin,
+                        arc=sweep.amplitude_deg, speed=speed: sweep_once(
+                            joint, origin, arc, speed))
             report.detail["sweep_samples"] = swept
 
             trajectory = excitation.design_fourier_trajectory(
@@ -1028,7 +1091,7 @@ class Campaign:
         return result
 
     def run(self) -> CampaignResult:
-        """All four phases; an abort keeps whatever was already measured."""
+        """All four phases; anything that stops one keeps what it measured."""
         self.aborted = None
         for phase in (self.run_gravity, self.run_friction,
                       self.run_inertia, self.run_validation):
@@ -1038,10 +1101,19 @@ class Campaign:
                 self.aborted = str(stop)
                 self.reports[-1].aborted = self.aborted
                 break
+            except Exception as error:  # noqa: BLE001 - see below
+                # Hours of measurement are not worth less because the last
+                # minute of it failed. Whatever went wrong is recorded and the
+                # data already taken goes on to be fitted and written, rather
+                # than being discarded on the way out.
+                self.aborted = f"{self.reports[-1].phase}: {error}"
+                self.reports[-1].aborted = str(error)
+                break
             if report.aborted:
                 self.aborted = f"{report.phase}: {report.aborted}"
                 break
         result = self.fit()
         if self.aborted:
             result.aborted = self.aborted
+        result.skipped = list(self.skipped)
         return result

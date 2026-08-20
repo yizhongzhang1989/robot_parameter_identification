@@ -7,6 +7,7 @@ import urllib.request
 
 try:
     from robot_parameter_identification import identification as ident
+    from robot_parameter_identification import campaign as campaign_module
     from robot_parameter_identification.dashboard.http_server import (
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
@@ -422,6 +423,87 @@ class RehearsalEndToEndTest(unittest.TestCase):
             friction = entry["friction"]
             self.assertGreaterEqual(friction["coulomb"], 0.0)
             self.assertGreaterEqual(friction["viscous"], 0.0)
+
+
+class SalvageTest(unittest.TestCase):
+    """A run that dies in its third hour still holds three hours of readings.
+
+    Those were being discarded because the exception arrived on the way out,
+    which asked the operator to spend the hours again.
+    """
+
+    def _service(self, tmp):
+        service = IdentificationService(DashboardConfig(output_directory=tmp))
+        service.adopt_description(synthetic_urdf())
+        service.adopt_driven_joints(
+            [f"{PREFIX}joint{index}" for index in range(1, 4)])
+        service.plan = service.plan.__class__(
+            static_poses=4, static_candidates=20, settle_samples=1,
+            friction_speeds_deg_s=(2.0,), fourier_harmonics=2,
+            fourier_duration_s=2.0, fourier_attempts=8, sample_rate_hz=10.0,
+            validation_poses=2, validation_trajectory_s=2.0, seed=1)
+        return service
+
+    def _run_until_idle(self, service):
+        import time
+
+        deadline = time.monotonic() + 120
+        while service.running() and time.monotonic() < deadline:
+            time.sleep(0.2)
+
+    def test_measurements_survive_a_plant_that_dies_mid_run(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            service._build_plant = self._dying(service)
+            self.assertTrue(service.start("rehearsal")["ok"])
+            self._run_until_idle(service)
+
+            written = [p for p in Path(tmp).iterdir() if p.is_dir()]
+            self.assertTrue(written, "the run wrote nothing at all")
+            rows = (written[0] / "observations.csv").read_text().splitlines()
+            self.assertGreater(len(rows), 1, "no observations were kept")
+            self.assertIn("driver went away",
+                          str(service.snapshot()["result"]["aborted"]))
+
+    def test_measurements_survive_even_when_the_fit_cannot_run(self):
+        """The fit needs phases the run never reached. The measurements do not,
+        and they are the expensive part."""
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            service._build_plant = self._dying(service)
+            with mock.patch.object(
+                    campaign_module.Campaign, "fit",
+                    side_effect=ValueError("not enough rows to fit")):
+                self.assertTrue(service.start("rehearsal")["ok"])
+                self._run_until_idle(service)
+
+            written = [p for p in Path(tmp).iterdir() if p.is_dir()]
+            self.assertTrue(written, "the run wrote nothing at all")
+            rows = (written[0] / "observations.csv").read_text().splitlines()
+            self.assertGreater(len(rows), 1, "no observations were kept")
+            notes = " ".join(service.snapshot()["notes"])
+            self.assertIn("salvaged unfitted", notes)
+
+    def _dying(self, service):
+        original = service._build_plant
+
+        def build(mode):
+            plant = original(mode)
+
+            def traverse(*_args, **_kwargs):
+                raise RuntimeError("the driver went away")
+
+            plant.traverse = traverse
+            return plant
+
+        return build
 
 
 class StopTest(unittest.TestCase):

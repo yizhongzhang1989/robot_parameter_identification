@@ -426,6 +426,7 @@ class IdentificationService:
 
     def _run(self, mode: str) -> None:
         plant = None
+        run = None
         try:
             plant = self._build_plant(mode)
             run = campaign_module.Campaign(
@@ -442,11 +443,40 @@ class IdentificationService:
             self.progress = {"mode": mode, "phase": "failed",
                              "error": str(error),
                              "traceback": traceback.format_exc()[-2000:]}
+            self._salvage(mode, run, plant, error)
         finally:
             self._release(plant)
             with self._lock:
                 self._state = IDLE
                 self._activity = ""
+
+    def _salvage(self, mode: str, run, plant, error: Exception) -> None:
+        """Write what was measured before the failure.
+
+        A run that dies in its third hour still holds three hours of readings.
+        Discarding them because the exception arrived on the way out means the
+        operator is asked to spend those hours again, which is the one outcome
+        the data was collected to avoid.
+        """
+        observations = list(getattr(run, "observations", None) or [])
+        if not observations:
+            return
+        try:
+            result = run.fit()
+            result.aborted = str(error)
+            result.skipped = list(getattr(run, "skipped", []))
+            self._finish(mode, result, observations,
+                         getattr(plant, "raw_frames", None))
+            self.note(f"{mode} run salvaged: {len(observations)} observations "
+                      "kept and fitted")
+        except Exception as second:  # noqa: BLE001 - the raw data still matters
+            # The fit needs phases the run never reached. The measurements do
+            # not, and they are the expensive part.
+            self._write({"mode": mode, "aborted": str(error),
+                         "fit_failed": str(second)},
+                        mode, observations, getattr(plant, "raw_frames", None))
+            self.note(f"{mode} run salvaged unfitted: {len(observations)} "
+                      f"observations kept, fit failed: {second}")
 
     def _monitor(self):
         """The drive guards, with the voltage window only when it was supplied.

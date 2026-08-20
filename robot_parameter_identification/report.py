@@ -204,6 +204,9 @@ TEXT = {
         "zh": "本次运行没有记录判定结果，因此以下内容均未经检验。",
     },
     "verdict.aborted": {"en": "Run stopped early", "zh": "运行被提前中止"},
+    "verdict.skipped": {"en": "Motions the arm refused, and the run went on "
+                              "without them",
+                        "zh": "机械臂拒绝执行、运行跳过后继续的动作"},
 
     "summary.head": {"en": "This run", "zh": "本次运行"},
     "summary.mode": {"en": "mode", "zh": "运行方式"},
@@ -559,12 +562,18 @@ function verdictSection() {
     <td>${esc(NAMES[i] || j.joint)}</td>
     <td><span class="pill ${j.state}">${t('verdict.' + j.state)}</span></td>
     <td>${esc(j.reason || '')}</td></tr>`).join('');
+  const skipped = P.skipped || [];
+  const gaps = skipped.length ? `<p class="say" style="color:var(--warn)">
+      ${t('verdict.skipped')}: ${skipped.length} &mdash;
+      ${esc(skipped.slice(0, 4).map(s => s.motion).join(', '))}${
+        skipped.length > 4 ? ' &hellip;' : ''}</p>` : '';
   return `<section>
     <h2 data-i18n="verdict.head"></h2>
     <p class="big"><span class="pill ${state}">${t('verdict.' + state)}</span></p>
     <p class="say">${t('verdict.' + state + '.say')}</p>
     ${P.aborted ? `<p class="say" style="color:var(--bad)">
       ${t('verdict.aborted')}: ${esc(P.aborted)}</p>` : ''}
+    ${gaps}
     <table><thead><tr>
       <th data-i18n="col.joint"></th><th data-i18n="col.state"></th>
       <th data-i18n="col.reason"></th></tr></thead><tbody>${rows}</tbody></table>

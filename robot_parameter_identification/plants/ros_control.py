@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 
-from ..interfaces import SignalMap
+from ..interfaces import MotionFailed, SignalMap
 from ..profile import RobotProfile
 
 # A quintic zero-velocity endpoint trajectory peaks near 1.875x its average
@@ -174,6 +174,11 @@ class HardwareConfig:
     keep_raw_frames: bool = True
     require_neutral_start: bool = True
     goal_timeout_margin_s: float = 8.0
+    # Arms refuse or drop the odd goal for reasons that have cleared by the time
+    # you ask again. Retrying costs seconds; treating it as fatal costs the
+    # hours of measurement already taken.
+    motion_attempts: int = 3
+    motion_retry_s: float = 1.5
 
 
 class TelemetryUnavailable(RuntimeError):
@@ -471,14 +476,46 @@ class HardwarePlant:
         return goal
 
     def _execute(self, points, on_frame=None):
+        """Send one trajectory, retrying while the arm is still fit to try."""
+        attempts = max(1, int(self.config.motion_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                self._attempt(points, on_frame)
+                return
+            except MotionFailed as failure:
+                if attempt >= attempts:
+                    raise MotionFailed(
+                        f"{failure} after {attempts} attempts") from failure
+                # Re-commanding an arm that has faulted is how a bad moment
+                # becomes a worse one, so the drives have to say they are ready
+                # before the next attempt; if they cannot, this raises instead.
+                self._require_fit_to_move()
+                self._spin_for(self.config.motion_retry_s)
+
+    def _require_fit_to_move(self) -> None:
+        """Refuse to re-command an arm that is faulted, disabled or silent."""
+        frame = self._require_sample()
+        for index, code in enumerate(frame.get("fault_code") or []):
+            if code:
+                raise RuntimeError(
+                    f"joint{index + 1} reports fault code {int(code)}")
+        for index, live in enumerate(frame.get("enabled") or []):
+            if not live:
+                raise RuntimeError(f"joint{index + 1} is not enabled")
+
+    def _attempt(self, points, on_frame=None):
         """Send one trajectory and pump telemetry until the controller is done."""
         goal = self._goal(points)
         duration = points[-1][2]
         send_future = self._client.send_goal_async(goal)
         self._wait(send_future, 5.0)
         handle = send_future.result()
-        if handle is None or not handle.accepted:
-            raise RuntimeError("trajectory was rejected by the controller")
+        if handle is None:
+            # Not the same thing as a refusal, and saying so matters: the
+            # controller may well be running the goal it never acknowledged.
+            raise MotionFailed("the controller did not answer the goal in 5 s")
+        if not handle.accepted:
+            raise MotionFailed("the controller rejected the trajectory")
 
         result_future = handle.get_result_async()
         started = time.monotonic()
@@ -503,7 +540,7 @@ class HardwarePlant:
                     next_sample = now + period
                     capture(now)
                 if now - started > duration + self.config.goal_timeout_margin_s:
-                    raise RuntimeError("trajectory timed out")
+                    raise MotionFailed("the trajectory overran its deadline")
         except BaseException:
             cancel = handle.cancel_goal_async()
             self._wait(cancel, 3.0)
@@ -513,7 +550,7 @@ class HardwarePlant:
         if wrapped is None or (
                 wrapped.result.error_code
                 != self._action_type.Result.SUCCESSFUL):
-            raise RuntimeError("trajectory did not complete successfully")
+            raise MotionFailed("the trajectory did not complete successfully")
 
     def hold_pose(self, pose_deg) -> dict:
         """Move there, let the servo settle, and average a few frames at rest."""

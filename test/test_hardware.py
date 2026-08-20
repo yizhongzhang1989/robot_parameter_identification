@@ -295,6 +295,100 @@ class MotionTest(unittest.TestCase):
             list(self.plant.track(Design(), rate_hz=10.0))
 
 
+class RefusedGoalTest(unittest.TestCase):
+    """Arms drop and refuse the odd goal. Retrying costs seconds; giving up
+    costs whatever the run had already measured."""
+
+    def setUp(self):
+        self.plant = hardware.HardwarePlant(
+            rm75_profile(),
+            hardware.HardwareConfig(settle_s=0.0, settle_samples=1,
+                                    stream_rate_hz=1000.0,
+                                    motion_retry_s=0.0))
+        self.result = type("R", (), {
+            "result": type("Inner", (), {
+                "error_code": FollowJointTrajectory.Result.SUCCESSFUL})()})()
+        self.plant._action_type = FollowJointTrajectory
+        self.plant._node = object()
+        self.plant._rclpy = FakeRclpy(self.plant, [frame()])
+        self.plant._latest = frame()
+        self.plant._latest_at = __import__("time").monotonic()
+
+    class Balky:
+        """Refuses its first `refusals` goals, then behaves."""
+
+        def __init__(self, result, refusals=0, silent=0):
+            self.result = result
+            self.refusals = refusals
+            self.silent = silent
+            self.sent = 0
+
+        def send_goal_async(self, _goal):
+            self.sent += 1
+            if self.sent <= self.silent:
+                return FakeFuture(None)      # no answer at all
+            handle = FakeHandle(self.result)
+            if self.sent <= self.silent + self.refusals:
+                handle.accepted = False
+            return FakeFuture(handle)
+
+    def _move(self):
+        self.plant._execute([(np.zeros(JOINTS), np.zeros(JOINTS), 1.0)])
+
+    def test_a_refused_goal_is_retried_not_fatal(self):
+        self.plant._client = self.Balky(self.result, refusals=1)
+        self._move()
+        self.assertEqual(self.plant._client.sent, 2)
+
+    def test_an_unanswered_goal_is_retried_too(self):
+        """A goal the controller never acknowledged is not a goal it refused,
+        and the five-second wait expiring says nothing about the arm."""
+        self.plant._client = self.Balky(self.result, silent=1)
+        self._move()
+        self.assertEqual(self.plant._client.sent, 2)
+
+    def test_the_two_failures_are_not_reported_as_the_same_thing(self):
+        seen = []
+        for kwargs in ({"refusals": 9}, {"silent": 9}):
+            self.plant._client = self.Balky(self.result, **kwargs)
+            with self.assertRaises(hardware.MotionFailed) as caught:
+                self._move()
+            seen.append(str(caught.exception))
+        self.assertNotEqual(seen[0], seen[1], seen)
+        self.assertIn("rejected", seen[0])
+        self.assertIn("did not answer", seen[1])
+
+    def test_it_gives_up_after_the_configured_attempts(self):
+        self.plant.config.motion_attempts = 3
+        self.plant._client = self.Balky(self.result, refusals=99)
+        with self.assertRaises(hardware.MotionFailed):
+            self._move()
+        self.assertEqual(self.plant._client.sent, 3)
+
+    def test_a_faulted_arm_is_not_re_commanded(self):
+        """Retrying into a fault is how a bad moment becomes a worse one."""
+        faulted = frame()
+        faulted["fault_code"] = [0, 0, 7, 0, 0, 0, 0]
+        self.plant._rclpy = FakeRclpy(self.plant, [faulted])
+        self.plant._latest = faulted
+        self.plant._client = self.Balky(self.result, refusals=99)
+        with self.assertRaises(RuntimeError) as caught:
+            self._move()
+        self.assertIn("fault code 7", str(caught.exception))
+        self.assertEqual(self.plant._client.sent, 1, "retried into a fault")
+
+    def test_a_disabled_drive_is_not_re_commanded(self):
+        off = frame()
+        off["enabled"] = [True, True, True, True, False, True, True]
+        self.plant._rclpy = FakeRclpy(self.plant, [off])
+        self.plant._latest = off
+        self.plant._client = self.Balky(self.result, refusals=99)
+        with self.assertRaises(RuntimeError) as caught:
+            self._move()
+        self.assertIn("joint5 is not enabled", str(caught.exception))
+        self.assertEqual(self.plant._client.sent, 1)
+
+
 class StaleTelemetryTest(unittest.TestCase):
     def test_stale_sample_is_not_returned(self):
         plant = hardware.HardwarePlant(rm75_profile(), )

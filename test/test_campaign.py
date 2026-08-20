@@ -7,6 +7,7 @@ import numpy as np
 
 try:
     from robot_parameter_identification import campaign
+    from robot_parameter_identification.interfaces import MotionFailed
     from test_identification import arm_model
     from fixtures import rm75_profile, scene_path, GAINS, COULOMB, VISCOUS
 except ImportError as error:
@@ -197,6 +198,76 @@ class PhaseBookkeepingTest(unittest.TestCase):
         peak = max(max(np.abs(r.acceleration_deg_s2))
                    for r in self.campaign.observations)
         self.assertGreater(peak, 0.0)
+
+
+class RefusedMotionsTest(unittest.TestCase):
+    """An arm refuses the odd motion. That is a gap in the data, not a reason
+    to throw away the hours already spent measuring."""
+
+    class Balky(ScriptedPlant):
+        """Fails a chosen slice of its motions, then works again."""
+
+        def __init__(self, fail_traverses=(), fail_holds=(), **kwargs):
+            super().__init__(**kwargs)
+            self.fail_traverses = set(fail_traverses)
+            self.fail_holds = set(fail_holds)
+            self.traverses = 0
+            self.holds = 0
+
+        def hold_pose(self, pose_deg):
+            self.holds += 1
+            if self.holds in self.fail_holds:
+                raise MotionFailed("the controller rejected the trajectory")
+            return super().hold_pose(pose_deg)
+
+        def traverse(self, joint, start_deg, distance_deg, speed_deg_s):
+            self.traverses += 1
+            if self.traverses in self.fail_traverses:
+                raise MotionFailed("the controller did not answer the goal")
+            yield from super().traverse(joint, start_deg, distance_deg,
+                                        speed_deg_s)
+
+    def test_a_refused_pass_is_skipped_and_the_sweep_carries_on(self):
+        plant = self.Balky(fail_traverses={2, 3})
+        run = campaign.Campaign(arm_model(), plant, small_plan())
+        report = run.run_friction()
+        self.assertIsNone(report.aborted)
+        self.assertEqual(len(report.detail["skipped"]), 2)
+        self.assertGreater(report.observations, 0)
+        self.assertGreater(plant.traverses, 3, "stopped at the first refusal")
+
+    def test_the_run_survives_and_still_fits(self):
+        plant = self.Balky(fail_traverses={2}, fail_holds={3})
+        result = campaign.Campaign(arm_model(), plant, small_plan()).run()
+        self.assertIsNone(result.aborted)
+        self.assertTrue(result.joints, "nothing was fitted")
+        self.assertEqual(len(result.skipped), 2)
+        self.assertIn("motion", result.skipped[0])
+
+    def test_an_arm_refusing_everything_still_stops_the_run(self):
+        """Continuing past a fault forever would leave the arm cycling for
+        hours producing nothing."""
+        plant = self.Balky(fail_traverses=set(range(1, 5000)))
+        run = campaign.Campaign(arm_model(), plant,
+                                small_plan(skip_budget=5))
+        result = run.run()
+        self.assertIsNotNone(result.aborted)
+        self.assertIn("over the budget", result.aborted)
+
+    def test_what_was_measured_before_the_failure_is_kept(self):
+        """The whole point: a run that dies late keeps what it took early."""
+
+        class Collapses(ScriptedPlant):
+            def traverse(self, joint, start_deg, distance_deg, speed_deg_s):
+                raise RuntimeError("the driver went away")
+
+        run = campaign.Campaign(arm_model(), Collapses(), small_plan())
+        result = run.run()
+        self.assertIsNotNone(result.aborted)
+        self.assertIn("driver went away", result.aborted)
+        gravity = [r for r in run.observations
+                   if r.phase == campaign.PHASE_GRAVITY]
+        self.assertTrue(gravity, "phase A was measured and then discarded")
 
 
 class BlindSceneRefusesUnscreenedPosturesTest(unittest.TestCase):

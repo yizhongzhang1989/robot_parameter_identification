@@ -34,6 +34,17 @@ EFFORT_UNITS = tuple(EFFORT_UNIT_BY_SOURCE.values())
 
 # Without position and the selected effort channel the campaign cannot run.
 REQUIRED_SIGNALS = ("position",)
+
+
+class MotionFailed(RuntimeError):
+    """One motion did not run, and the arm is still fit to attempt the next.
+
+    Kept apart from the errors that mean stop, because most of what an arm does
+    wrong is momentary: a goal refused while the controller is between
+    trajectories, or an acknowledgement that arrives late. Drives reporting a
+    fault is not this, and raises through.
+    """
+
 # These improve the fit or the safety envelope but each has a fallback.
 OPTIONAL_SIGNALS = ("velocity", "temperature", "voltage", "enabled",
                     "fault_code")
