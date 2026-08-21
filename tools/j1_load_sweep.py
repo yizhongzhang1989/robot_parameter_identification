@@ -11,14 +11,14 @@ moves its own load: a seventy degree pass centred on zero takes the torque from
 2.9 Nm down to 0.2 and back up to 2.7, which is the joint's entire range inside
 a single pass. "One sweep at one load" is not something that exists there.
 
-It does exist at ninety degrees, where the sine is stationary. Centred there a
-ten degree pass holds the load to 0.8 per cent, twenty degrees to 2.2, forty to
-7.5. That is the trade this experiment cannot escape: a pass needs room to
-accelerate, cruise and stop, so holding the load still costs top speed. Rather
-than pick one compromise, the arc is sized per speed as the campaign sizes it,
-the resulting drift is computed for every pass, and passes whose drift exceeds
-``--drift-limit`` are dropped and named. The friction minimum this is meant to
-resolve sits between 3 and 13 deg/s, well inside what a steady load allows.
+It does exist at ninety degrees, where the sine is stationary, and it survives
+even a seventy degree pass. A pass is not a measurement: the plant fits one
+window from the middle of the motion, sized so the joint crosses six degrees at
+most while it is open, and the ramps at either end are driven and then thrown
+away. Centred on ninety, that window moves the load by 0.019 Nm at the heaviest
+level -- four per cent of the gap between levels -- whatever the speed. Judging
+the whole pass instead, which is the obvious thing to do and the wrong one, held
+this experiment to 24 deg/s for the sake of an excursion nothing ever sampled.
 
 Every pose and every arc is screened against the collision scene before the arm
 moves, and the screen is proved able to reject before it is believed.
@@ -120,9 +120,23 @@ def design_levels(arm: ident.ArmModel, count: int, centre: float) -> list[dict]:
     return levels
 
 
-def arc_drift(arm: ident.ArmModel, centre: float, two: float,
-              arc: float) -> tuple[float, float]:
-    """Mean load over a pass and how far it moves across it."""
+def window_arc_deg(speed: float, config: HardwareConfig) -> float:
+    """How much joint angle the fitted sample actually spans.
+
+    A pass is not a measurement. The plant fits one window from the middle of
+    the motion, and sizes it so the joint crosses at most ``window_arc_deg``
+    while it is open, so the ramps at either end are driven but never sampled.
+    """
+    speed = abs(float(speed))
+    if speed <= 0.0:
+        return 0.0
+    span = min(max(config.window_arc_deg / speed, config.window_span_s),
+               config.window_maximum_span_s)
+    return speed * span
+
+
+def load_over(arm, centre: float, two: float, arc: float):
+    """Mean load across an arc and how far it moves over it."""
     values = [load_of(arm, centre + offset, two)
               for offset in np.linspace(-arc / 2.0, arc / 2.0, 21)]
     return float(np.mean(values)), float(max(values) - min(values))
@@ -142,65 +156,50 @@ def screen(arm, scene, centre: float, two: float, arc: float,
         for offset in np.linspace(-arc / 2.0, arc / 2.0, steps))
 
 
-def plan_passes(arm, scene, levels, speeds, centre, drift_share, ceiling):
+def plan_passes(arm, scene, levels, speeds, centre, drift_share, ceiling,
+                config):
     """Every pass to drive, with its arc and the load it will actually hold.
 
-    One arc cap for all ten levels, not one per level. The experiment exists to
-    compare curves across loads, and a level that reached a higher speed than
-    its neighbour would differ from it for that reason as much as for any
-    physical one.
+    The load has to hold still over the window that is fitted, not over the
+    whole pass. Judging the pass instead is what capped this experiment at 24
+    deg/s: a sixty degree pass swings the load by a newton metre, but it swings
+    it during the ramps, which are driven and then thrown away. The window sits
+    in the middle of the motion, on the stationary point, and spans six degrees
+    at most -- 0.007 Nm at the heaviest level, whatever the speed.
 
     Drift is judged against the gap between levels rather than against each
-    level's own size. The absolute swing is nearly the same at every level --
-    0.06 Nm across a twenty degree arc, whether the joint carries 0.17 Nm or
-    4.89 -- so a percentage test is vacuous at the top and impossible at the
-    bottom, where it left the lightest level with five passes and a top speed
-    of 1.4 deg/s.
+    level's own size. The absolute swing is nearly the same at every level, so a
+    percentage test is vacuous at the top and impossible at the bottom.
     """
     loads = [level["load_nm"] for level in levels]
     spacing = ((max(loads) - min(loads)) / (len(loads) - 1)
                if len(loads) > 1 else max(loads))
     allowed = drift_share * spacing
 
-    def worst(arc: float) -> float:
-        return max(arc_drift(arm, centre, level["partner_deg"], arc)[1]
-                   for level in levels)
-
-    low, high = 1.0, ceiling
-    if worst(high) > allowed:
-        for _ in range(40):
-            middle = 0.5 * (low + high)
-            if worst(middle) > allowed:
-                high = middle
-            else:
-                low = middle
-        cap = low
-    else:
-        cap = ceiling
-
     passes, refused = [], []
-    kept_speeds = []
-    for speed in speeds:
-        arc = campaign.pass_amplitude_deg(speed, ceiling)
-        if arc > cap:
-            refused.append({"speed_deg_s": speed, "arc_deg": round(arc, 2),
-                            "why": "needs a longer arc than the load allows"})
-            continue
-        kept_speeds.append((speed, arc))
     for index, level in enumerate(levels):
         two = level["partner_deg"]
-        for speed, arc in kept_speeds:
-            mean, drift = arc_drift(arm, centre, two, arc)
+        for speed in speeds:
+            arc = campaign.pass_amplitude_deg(speed, ceiling)
+            window = window_arc_deg(speed, config)
+            mean, drift = load_over(arm, centre, two, window)
+            if drift > allowed:
+                refused.append({"level": index + 1, "speed_deg_s": speed,
+                                "window_deg": round(window, 2),
+                                "drift_nm": round(drift, 4),
+                                "why": "load moves across the fitted window"})
+                continue
             if not screen(arm, scene, centre, two, arc):
                 refused.append({"level": index + 1, "speed_deg_s": speed,
                                 "arc_deg": round(arc, 2), "why": "collision"})
                 continue
             passes.append({"level": index + 1, "partner_deg": two,
                            "speed_deg_s": speed, "arc_deg": round(arc, 3),
+                           "window_deg": round(window, 3),
                            "load_nm": round(mean, 4),
                            "load_drift_nm": round(drift, 4),
                            "load_drift": round(drift / max(mean, 1e-9), 4)})
-    return passes, refused, cap, allowed
+    return passes, refused, allowed
 
 
 def main(argv=None) -> int:
@@ -216,7 +215,7 @@ def main(argv=None) -> int:
     parser.add_argument("--centre", type=float, default=STATIONARY_DEG)
     parser.add_argument("--speeds", type=int, default=18)
     parser.add_argument("--slowest", type=float, default=0.5)
-    parser.add_argument("--fastest", type=float, default=40.0)
+    parser.add_argument("--fastest", type=float, default=60.0)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--drift-limit", type=float, default=0.35,
                         help="largest load swing across a pass, as a fraction "
@@ -234,23 +233,27 @@ def main(argv=None) -> int:
     levels = design_levels(arm, args.levels, args.centre)
     speeds = [round(float(s), 3) for s in np.geomspace(
         args.slowest, args.fastest, args.speeds)]
-    passes, refused, cap, allowed = plan_passes(
+    config = HardwareConfig(action=args.action,
+                            maximum_speed_deg_s=max(args.fastest, 10.0),
+                            require_neutral_start=True)
+    passes, refused, allowed = plan_passes(
         arm, scene, levels, speeds, args.centre, args.drift_limit,
-        args.arc_ceiling)
+        args.arc_ceiling, config)
 
     print(f"joint {names[JOINT]}, load set by {names[PARTNER]}")
     print(f"sweep centred at {args.centre:g} deg, where the load is stationary")
-    print(f"arc capped at {cap:.1f} deg so no pass moves its load by more "
-          f"than {allowed:.3f} Nm")
+    print(f"the fitted window may move the load by at most {allowed:.3f} Nm; "
+          "the ramps outside it are driven, not measured")
     print(f"\n{'level':>6}{'j2 deg':>9}{'load Nm':>10}{'drift Nm':>10}"
-          f"{'passes':>8}{'fastest':>9}")
+          f"{'passes':>8}{'fastest':>9}{'widest arc':>12}")
     for index, level in enumerate(levels):
         mine = [p for p in passes if p["level"] == index + 1]
         fastest = max((p["speed_deg_s"] for p in mine), default=0.0)
         drift = max((p["load_drift_nm"] for p in mine), default=0.0)
+        arc = max((p["arc_deg"] for p in mine), default=0.0)
         print(f"{index + 1:>6}{level['partner_deg']:>9.1f}"
               f"{level['load_nm']:>10.3f}{drift:>10.3f}"
-              f"{len(mine):>8}{fastest:>9.1f}")
+              f"{len(mine):>8}{fastest:>9.1f}{arc:>12.1f}")
     if refused:
         print(f"\n{len(refused)} passes refused; fastest kept is "
               f"{max(p['speed_deg_s'] for p in passes):g} deg/s")
@@ -275,12 +278,7 @@ def main(argv=None) -> int:
     profile = autoprofile.derive_profile(
         urdf, names, workspace_limit_deg=caps,
         speed_limit_deg_s=max(args.fastest, 10.0))
-    plant = HardwarePlant(
-        profile,
-        config=HardwareConfig(action=args.action,
-                              maximum_speed_deg_s=max(args.fastest, 10.0),
-                              require_neutral_start=True),
-        collision_model=scene)
+    plant = HardwarePlant(profile, config=config, collision_model=scene)
     plant.open()
 
     folder = Path(args.output) / time.strftime("j1-%Y%m%d-%H%M%S")
