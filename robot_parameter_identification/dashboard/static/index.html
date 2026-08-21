@@ -109,6 +109,22 @@
     </div>
 
     <div class="card">
+      <h2 data-i18n="sweep.title">Load sweep</h2>
+      <p class="hint" data-i18n="sweep.hint">Drives a speed ladder at a series
+        of gravity loads, one joint at a time. The levels are searched for, not
+        set: how hard gravity can load a joint depends on where every other
+        joint stands, and on how far its own axis is from vertical. Joints it
+        cannot load are swept once and said so.</p>
+      <div class="row">
+        <button id="btn-sweep" class="danger" disabled
+                data-i18n="sweep.start">Sweep loads</button>
+        <label class="inline"><input type="checkbox" id="sweep-resume">
+          <span data-i18n="sweep.resume">resume the last one</span></label>
+      </div>
+      <div id="sweep-line" class="muted"></div>
+    </div>
+
+    <div class="card">
       <h2 data-i18n="live.title">Live telemetry</h2>
       <p class="hint" data-i18n="live.hint">Straight from the state topic, one
         row per joint.</p>

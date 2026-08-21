@@ -171,6 +171,10 @@ $('btn-rehearse').addEventListener('click', () => post('/api/campaign', { mode: 
 $('btn-hardware').addEventListener('click', () => post('/api/campaign', { mode: 'hardware' }));
 $('btn-home').addEventListener('click', () => post('/api/home', {}));
 $('btn-stop').addEventListener('click', () => post('/api/stop', {}));
+$('btn-sweep').addEventListener('click', () => post('/api/campaign', {
+  mode: 'load_sweep',
+  options: { resume: $('sweep-resume').checked },
+}));
 
 /* ---------------- render ---------------- */
 
@@ -232,6 +236,34 @@ function phaseLabel(name) {
   return text === key ? name : text;
 }
 
+/** The sweep has its own progress shape: it reports a joint and a level rather
+ * than one of the campaign's phases, so it gets its own line instead of being
+ * forced through a phase bar that has no box for it. */
+function renderSweep(snapshot) {
+  const progress = snapshot.progress || {};
+  const line = $('sweep-line');
+  if (progress.mode !== 'load_sweep') { line.textContent = ''; return; }
+  if (progress.phase === 'designing') {
+    line.textContent = t('sweep.designing', { j: progress.joint || '—' });
+    return;
+  }
+  if (progress.phase === 'complete' || progress.phase === 'failed') {
+    line.textContent = progress.phase === 'failed'
+      ? t('sweep.failed', { v: progress.error || '' })
+      : t('sweep.done', { n: progress.driven, s: progress.skipped });
+    return;
+  }
+  const share = progress.total
+    ? Math.round(100 * (progress.passes || 0) / progress.total) : 0;
+  line.textContent = t('sweep.running', {
+    j: progress.joint_name || progress.joint,
+    l: progress.level, L: progress.levels,
+    v: progress.speed_deg_s,
+    n: progress.driven || 0, t: progress.total || 0, p: share,
+    m: Math.round((progress.elapsed_s || 0) / 60),
+  });
+}
+
 function renderRun(snapshot) {
   const running = snapshot.state === 'running';
   $('run-state').textContent = running
@@ -243,6 +275,11 @@ function renderRun(snapshot) {
   // would only block recovering an arm the plant already refuses to arm.
   $('btn-home').disabled = running || !snapshot.have_model;
   $('btn-stop').disabled = !running;
+  // The sweep fits nothing, so the rehearsal gate does not apply to it either.
+  // What it does need is a collision screen with the arm actually in it, which
+  // it proves for itself before planning any motion.
+  $('btn-sweep').disabled = running || !snapshot.have_model;
+  renderSweep(snapshot);
   $('ack-hint').textContent = snapshot.rehearsal_passed
     ? t('run.armed') : t('run.locked');
 

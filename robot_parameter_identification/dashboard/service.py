@@ -18,8 +18,10 @@ import numpy as np
 from .. import autoprofile
 from .. import campaign as campaign_module
 from .. import excitation, identification as ident
+from .. import loadsweep as loadsweep_module
 from .. import report as report_module
 from ..interfaces import CommandSpec, TelemetrySpec
+from ..loadsweep_run import LoadSweepRun
 from ..model import ModelComponents
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
@@ -104,6 +106,7 @@ class IdentificationService:
         self._lock = threading.RLock()
         self._started_at = 0.0
         self._samples: list[dict] = []
+        self._options: dict = {}
 
     # -- model -----------------------------------------------------------
 
@@ -325,7 +328,7 @@ class IdentificationService:
 
     # -- campaign --------------------------------------------------------
 
-    def start(self, mode: str) -> dict:
+    def start(self, mode: str, options: dict | None = None) -> dict:
         if not self.have_model():
             return {"ok": False, "message": "no /robot_description yet"}
         if self.profile is None:
@@ -340,10 +343,12 @@ class IdentificationService:
                         "message": "rehearse first: a dry run must pass "
                                    "before the arm is allowed to move"}
             self._state = RUNNING
-            self._activity = f"campaign_{mode}"
+            self._activity = ("load_sweep" if mode == "load_sweep"
+                              else f"campaign_{mode}")
             self._abort.clear()
             self._started_at = time.monotonic()
             self._samples = []
+            self._options = dict(options or {})
             # The previous run's verdict is not this run's; leaving it up reads
             # as though the campaign now moving has already passed.
             self.result = None
@@ -425,6 +430,9 @@ class IdentificationService:
         return self._state == RUNNING
 
     def _run(self, mode: str) -> None:
+        if mode == "load_sweep":
+            self._run_load_sweep()
+            return
         plant = None
         run = None
         try:
@@ -444,6 +452,109 @@ class IdentificationService:
                              "error": str(error),
                              "traceback": traceback.format_exc()[-2000:]}
             self._salvage(mode, run, plant, error)
+        finally:
+            self._release(plant)
+            with self._lock:
+                self._state = IDLE
+                self._activity = ""
+
+    def _sweep_plan(self) -> loadsweep_module.SweepPlan:
+        """The requested sweep, with anything unspecified left at its default."""
+        plan = loadsweep_module.SweepPlan()
+        for key, value in (getattr(self, "_options", None) or {}).items():
+            if key == "resume" or not hasattr(plan, key):
+                continue
+            current = getattr(plan, key)
+            try:
+                if key == "joints":
+                    setattr(plan, key, tuple(int(v) for v in value))
+                elif isinstance(current, bool):
+                    setattr(plan, key, bool(value))
+                elif isinstance(current, int):
+                    setattr(plan, key, int(value))
+                elif isinstance(current, float):
+                    setattr(plan, key, float(value))
+            except (TypeError, ValueError):
+                self.note(f"ignoring load sweep option {key}={value!r}")
+        return plan
+
+    def _sweep_folder(self) -> Path:
+        """Where this sweep writes, continuing an earlier one when asked."""
+        root = Path(self.config.output_directory) / "load_sweep"
+        resume = (getattr(self, "_options", None) or {}).get("resume")
+        if resume:
+            if isinstance(resume, str) and resume not in ("", "latest", "true"):
+                return root / resume
+            existing = sorted((p for p in root.glob("sweep-*") if p.is_dir()),
+                              key=lambda p: p.stat().st_mtime, reverse=True)
+            if existing:
+                return existing[0]
+            self.note("no earlier sweep to resume; starting a new one")
+        return root / time.strftime("sweep-%Y%m%d-%H%M%S")
+
+    def _run_load_sweep(self) -> None:
+        """Sweep every joint at every load gravity can be made to put on it.
+
+        Separate from the campaign because it answers a different question. The
+        campaign fits one friction number per joint from whatever postures the
+        excitation happened to visit; this drives a speed ladder at a designed
+        series of loads, so the load dependence is measured rather than
+        inferred from three points that were chosen for conditioning.
+        """
+        plant = None
+        run = None
+        try:
+            if self.bridge is None:
+                raise RuntimeError("no ROS bridge; cannot drive hardware")
+            # Before anything is planned, prove the screen can refuse. A scene
+            # with no geometry passes every pose, and this sweep sends joints
+            # to postures found by searching the whole workspace.
+            loadsweep_module.proven_scene(self.scene, self.arm.joint_count)
+            plan = self._sweep_plan()
+            limits = self.plan.design_limits(self.arm)
+            from ..plants.ros_control import HardwareConfig  # noqa: PLC0415
+
+            self._on_progress("designing", {"joint": 0})
+            designs = loadsweep_module.design_all(
+                self.arm, self.scene, plan, HardwareConfig(),
+                limits.lower_deg, limits.upper_deg,
+                progress=self._on_progress)
+            passes = sum(len(d.passes) for d in designs)
+            hours = loadsweep_module.estimate_seconds(designs, plan) / 3600.0
+            for design in designs:
+                self.note(f"joint {design.joint + 1}: "
+                          f"{len(design.levels)} levels over "
+                          f"{design.span_nm:.3f} Nm, {len(design.passes)} passes"
+                          + (f" -- {design.note}" if design.note else ""))
+            self.note(f"{passes} passes designed, about {hours:.1f} hours")
+            if not passes:
+                raise RuntimeError("nothing to drive: no pose survived the "
+                                   "load, limit and collision screens")
+
+            folder = self._sweep_folder()
+            plant = self.bridge.hardware_plant(
+                self.profile, self.scene,
+                maximum_speed_deg_s=plan.transit_speed_deg_s)
+            run = LoadSweepRun(self.arm, plant, plan, designs, folder,
+                               progress=self._on_progress,
+                               should_stop=self._abort.is_set,
+                               note=self.note, scene=self.scene)
+            outcome = run.run()
+            self.note(f"load sweep finished: {outcome['driven']} passes driven, "
+                      f"{len(outcome['skipped'])} skipped, written to {folder}")
+            with self._lock:
+                self.progress = {
+                    "mode": "load_sweep", "phase": "complete",
+                    "elapsed_s": time.monotonic() - self._started_at,
+                    "driven": outcome["driven"],
+                    "skipped": len(outcome["skipped"]),
+                    "folder": str(folder)}
+        except Exception as error:  # noqa: BLE001 - a crash must not be silent
+            self.note(f"load sweep failed: {error}")
+            self.progress = {"mode": "load_sweep", "phase": "failed",
+                             "error": str(error),
+                             "driven": getattr(run, "driven", 0),
+                             "traceback": traceback.format_exc()[-2000:]}
         finally:
             self._release(plant)
             with self._lock:

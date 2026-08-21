@@ -72,6 +72,34 @@ const DICT = {
   'run.failed': { en: 'failed', zh: '失败' },
   'run.stopped': { en: 'stopped', zh: '已停止' },
 
+  /* ---- load sweep ---- */
+  'sweep.title': { en: 'Load sweep', zh: '负载扫掠' },
+  'sweep.hint': {
+    en: 'Drives a speed ladder at a series of gravity loads, one joint at a '
+      + 'time. The levels are searched for, not set: how hard gravity can load '
+      + 'a joint depends on where every other joint stands, and on how far its '
+      + 'own axis is from vertical. Joints it cannot load are swept once and '
+      + 'said so.',
+    zh: '逐个关节，在一系列重力负载下跑一遍速度阶梯。负载等级是搜索出来的，不是设定的：'
+      + '重力能给一个关节多大负载，取决于其余每个关节停在哪里，也取决于它自己的轴离竖直'
+      + '方向有多远。无法加载的关节只扫一次，并如实说明。',
+  },
+  'sweep.start': { en: 'Sweep loads', zh: '开始扫掠' },
+  'sweep.resume': { en: 'resume the last one', zh: '续跑上一次' },
+  'sweep.designing': {
+    en: 'searching postures for joint {j}…',
+    zh: '正在为关节 {j} 搜索位形…',
+  },
+  'sweep.running': {
+    en: '{j}, level {l}/{L} at {v}°/s — {n}/{t} passes ({p}%), {m} min',
+    zh: '{j}，第 {l}/{L} 级，{v}°/s — 已驱动 {n}/{t} 次（{p}%），{m} 分钟',
+  },
+  'sweep.done': {
+    en: 'finished: {n} passes driven, {s} skipped',
+    zh: '完成：驱动 {n} 次，跳过 {s} 次',
+  },
+  'sweep.failed': { en: 'failed: {v}', zh: '失败：{v}' },
+
   'phase.A_gravity': { en: 'gravity', zh: '重力' },
   'phase.B_friction': { en: 'friction', zh: '摩擦' },
   'phase.C_inertia': { en: 'inertia', zh: '惯性' },
