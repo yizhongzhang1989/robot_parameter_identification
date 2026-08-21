@@ -102,6 +102,10 @@ def grid(table, joint):
         kept.append(level)
     if not stack:
         return None
+    # Eight parameters against three points is not a fit, it is an
+    # interpolation that reports zero residual and means nothing.
+    if len(speeds) < 6:
+        return None
     return {"speeds": np.array(speeds, dtype=float),
             "stack": np.array(stack, dtype=float),
             "loads": np.array(loads, dtype=float), "levels": kept}
@@ -221,10 +225,10 @@ def main(argv=None) -> int:
                                         data["loads"][index])
             friction = float(np.mean(np.abs(measured))) / AMPS_PER_NM
             error = float(np.sqrt(np.mean(residual ** 2))) / AMPS_PER_NM
+            share = f"{100 * error / friction:>6.1f}%" if friction > 1e-9 else "     -"
+            gain = f"{friction / error:>7.1f}x" if error > 1e-6 else "      -"
             print(f"{name if which == 'light' else '':>18}"
-                  f"{friction:>13.3f}{error:>13.4f}"
-                  f"{100 * error / max(friction, 1e-9):>6.1f}%"
-                  f"{friction / max(error, 1e-9):>6.1f}x"
+                  f"{friction:>13.3f}{error:>13.4f}{share}{gain}"
                   f"   {which}, {data['loads'][index]:.2f} Nm")
 
     print("\nDoes friction rise with load, and by how much")
