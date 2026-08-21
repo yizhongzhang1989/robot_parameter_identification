@@ -317,8 +317,9 @@ def main(argv=None):
                              markersize=2.5, alpha=0.9, label=mark)
                 axes[1].plot([p[0] for p in points],
                              [p[1] - gravity_of[level] for p in points],
-                             "o", color=colours[index], markersize=3.0,
-                             alpha=0.95, label=mark)
+                             "o", color=colours[index], markersize=3.4,
+                             markeredgecolor="white", markeredgewidth=0.3,
+                             zorder=5, label=mark)
             if whole is not None:
                 # The law drawn through the measurement it was fitted to. It is
                 # odd in speed by construction, so where the two branches are
@@ -326,13 +327,25 @@ def main(argv=None):
                 # gap is the part of the reading friction does not explain.
                 reach = max(abs(p[0]) for _d, pts in branches(level)
                             for p in pts)
-                fine = np.linspace(-reach, reach, 401)
-                axes[1].plot(fine, global_curve(whole, fine, load), "-",
-                             color=colours[index], linewidth=1.1, alpha=0.75)
+                fine = np.concatenate([
+                    -np.geomspace(reach, 0.02, 300), np.geomspace(0.02, reach, 300)])
+                curve = global_curve(whole, fine, load)
+                # Cased in black: in the load colour alone the line is the same
+                # colour as the dots it has to be told apart from.
+                axes[1].plot(fine, curve, "-", color="black", linewidth=2.6,
+                             alpha=0.45, zorder=3, solid_capstyle="round")
+                axes[1].plot(fine, curve, "-", color=colours[index],
+                             linewidth=1.4, zorder=4)
         for axis in (axes[0], axes[1]):
             axis.axvline(0.0, color="#999", linewidth=0.8, zorder=0)
-            axis.set_xlabel("joint speed (deg/s), both directions")
-            axis.grid(alpha=0.25)
+            # Log either side of zero. The ladder is log-spaced, so on a linear
+            # axis fifteen of the eighteen rungs pile into the middle tenth of
+            # it and the low-speed structure this experiment exists to resolve
+            # cannot be seen at all.
+            axis.set_xscale("symlog", linthresh=1.0, linscale=0.4)
+            axis.set_xlabel("joint speed (deg/s), both directions, log either "
+                            "side of zero")
+            axis.grid(alpha=0.25, which="both")
             axis.legend(fontsize=7, ncol=2)
         axes[1].axhline(0.0, color="#999", linewidth=0.8, zorder=0)
         axes[0].set_ylabel("measured current (A)")
