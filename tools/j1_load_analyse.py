@@ -111,6 +111,49 @@ def fit_curve(speed, friction):
             "rms": float(np.sqrt(np.mean(found.fun ** 2)))}
 
 
+def fit_global(speeds, stack, loads):
+    """One law for the whole joint, with load as a parameter.
+
+    The per-level fits are the diagnostic; this is the deliverable. Width and
+    viscous belong to the joint and are shared, because they are properties of
+    it rather than of what it happens to be carrying. Letting the width fit per
+    level instead lets it collapse from 1.06 to 0.05 across the loads and hand
+    the low-speed shape to the dip term, which then reports a load dependence
+    that is an artefact of the trade.
+    """
+    from scipy.optimize import least_squares  # noqa: PLC0415
+
+    def model(theta):
+        width, viscous, c0, ck, d0, dk, vs0, vsk = theta
+        return np.array([
+            (c0 + ck * load) * np.tanh(speeds / max(width, 1e-3))
+            + (d0 + dk * load) * np.exp(
+                -speeds / max(vs0 + vsk * load, 1e-3))
+            + viscous * speeds
+            for load in loads])
+
+    found = least_squares(
+        lambda t: (model(t) - stack).ravel(),
+        [0.8, 0.004, 0.24, 0.12, 0.04, 0.19, 0.5, 0.25],
+        bounds=([0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0],
+                [20.0, 1.0, 5.0, 5.0, 5.0, 5.0, 200.0, 50.0]))
+    width, viscous, c0, ck, d0, dk, vs0, vsk = found.x
+    return {"width": width, "viscous": viscous, "c0": c0, "ck": ck,
+            "d0": d0, "dk": dk, "vs0": vs0, "vsk": vsk,
+            "rms": float(np.sqrt(np.mean(found.fun ** 2)))}
+
+
+def global_curve(model, speed, load):
+    """The law over signed speed, which is where the measurement lives."""
+    speed = np.asarray(speed, dtype=float)
+    return ((model["c0"] + model["ck"] * load)
+            * np.tanh(speed / model["width"])
+            + (model["d0"] + model["dk"] * load)
+            * np.exp(-np.abs(speed) / (model["vs0"] + model["vsk"] * load))
+            * np.sign(speed)
+            + model["viscous"] * speed)
+
+
 def report_against_load(summary, field, label):
     load = np.array([s["load"] for s in summary])
     values = np.array([s[field] for s in summary])
@@ -186,6 +229,40 @@ def main(argv=None):
                              ("viscous", "viscous")):
             report_against_load(summary, field, label)
 
+    whole = None
+    if len(summary) >= 3:
+        rungs = curve_of(table, levels[0])[0]
+        stack = np.array([curve_of(table, level)[1] for level in levels])
+        carried = np.array([s["load"] for s in summary])
+        whole = fit_global(rungs, stack, carried)
+        print("\nOne law for the joint, load as a parameter")
+        print(f"  friction(v, L) = ({whole['c0']:.4f} + {whole['ck']:.4f} L)"
+              f" tanh(v / {whole['width']:.3f})")
+        print(f"                 + ({whole['d0']:.4f} + {whole['dk']:.4f} L)"
+              f" exp(-|v| / ({whole['vs0']:.3f} + {whole['vsk']:.3f} L))"
+              " sign(v)")
+        print(f"                 + {whole['viscous']:.5f} v"
+              "          [A, v in deg/s, L in Nm]")
+        print(f"  rms {whole['rms']:.4f} A over {stack.size} points, "
+              f"{100 * whole['rms'] / float(np.mean(np.abs(stack))):.1f}% of "
+              "the mean friction")
+
+        # The gravity-removed panel shows dots either side of that line, and
+        # the gap is two different things. Only one of them is fit error.
+        print("\nWhy the dots sit off the line, split into what the law can\n"
+              "fit and what it structurally cannot: no function that reverses\n"
+              "with direction can produce a term that does not.")
+        print(f"{'load Nm':>9}{'odd (fit error)':>17}{'even (asymmetry)':>18}"
+              f"{'even share':>12}")
+        for index, level in enumerate(levels):
+            odd = stack[index] - global_curve(whole, rungs, carried[index])
+            even = [r["gravity"] for r in table if r["level"] == level]
+            even = np.array(even) - float(np.mean(even))
+            o = float(np.sqrt(np.mean(odd ** 2)))
+            e = float(np.sqrt(np.mean(even ** 2)))
+            print(f"{carried[index]:>9.2f}{o:>17.4f}{e:>18.4f}"
+                  f"{100 * e ** 2 / (o ** 2 + e ** 2):>11.0f}%")
+
     print("\nThe half-sum, which is gravity and not friction. It should not "
           "move with speed;\nif it does, the gravity estimate is speed "
           "dependent and the split above is contaminated.")
@@ -240,8 +317,18 @@ def main(argv=None):
                              markersize=2.5, alpha=0.9, label=mark)
                 axes[1].plot([p[0] for p in points],
                              [p[1] - gravity_of[level] for p in points],
-                             "-o", color=colours[index], linewidth=1.2,
-                             markersize=2.5, alpha=0.9, label=mark)
+                             "o", color=colours[index], markersize=3.0,
+                             alpha=0.95, label=mark)
+            if whole is not None:
+                # The law drawn through the measurement it was fitted to. It is
+                # odd in speed by construction, so where the two branches are
+                # not mirror images it can only split the difference, and that
+                # gap is the part of the reading friction does not explain.
+                reach = max(abs(p[0]) for _d, pts in branches(level)
+                            for p in pts)
+                fine = np.linspace(-reach, reach, 401)
+                axes[1].plot(fine, global_curve(whole, fine, load), "-",
+                             color=colours[index], linewidth=1.1, alpha=0.75)
         for axis in (axes[0], axes[1]):
             axis.axvline(0.0, color="#999", linewidth=0.8, zorder=0)
             axis.set_xlabel("joint speed (deg/s), both directions")
@@ -253,7 +340,7 @@ def main(argv=None):
                           "the gap between branches is twice the friction")
         axes[1].set_ylabel("current less gravity (A)")
         axes[1].set_title("Gravity removed, one constant per posture\n"
-                          "everything left should reverse with direction")
+                          "dots measured, lines the one fitted law")
 
         for index, level in enumerate(levels):
             speed, friction, _g = curve_of(table, level)
