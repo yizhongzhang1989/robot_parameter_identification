@@ -232,6 +232,8 @@ TEXT = {
     },
     "col.joint": {"en": "joint", "zh": "关节"},
     "col.coulomb": {"en": "Coulomb", "zh": "库仑摩擦"},
+    "col.load": {"en": "per unit load", "zh": "随载荷增量"},
+    "col.kept": {"en": "extra columns kept", "zh": "保留的附加项"},
     "col.viscous": {"en": "viscous", "zh": "粘滞摩擦"},
     "col.offset": {"en": "offset", "zh": "偏置"},
     "col.train": {"en": "training RMS", "zh": "训练均方根"},
@@ -285,11 +287,14 @@ TEXT = {
               "但速度几乎都很低。",
     },
     "charts.friction.curve": {
-        "en": "the fitted model, coulomb x tanh(speed / transition) + viscous x "
-              "speed + offset. A good fit runs through the middle of the cloud "
-              "at every speed, not just on average.",
-        "zh": "拟合模型：库仑 x tanh(速度 / 过渡宽度) + 粘滞 x 速度 + 偏置。"
-              "拟合良好时，曲线在每个速度处都穿过点云中部，而不只是总体居中。",
+        "en": "the fitted model, (coulomb + load term) x tanh(speed / "
+              "transition) + viscous x speed + offset. Where a joint kept a "
+              "load term there are two lines, drawn at the lightest and "
+              "heaviest load measured; the model is the band between them, and "
+              "the points should fall inside it rather than on either line.",
+        "zh": "拟合模型：(库仑 + 载荷项) x tanh(速度 / 过渡宽度) + 粘滞 x 速度 + "
+              "偏置。若该关节保留了载荷项，则画出两条线，分别对应实测到的最轻与"
+              "最重载荷；模型是两线之间的带，数据点应落在带内，而非贴住某一条线。",
     },
     "charts.friction.warn": {
         "en": "The two groups differ in pose as well as in speed, so a step "
@@ -600,12 +605,21 @@ function summarySection() {
 function jointSection() {
   const rows = JOINTS.map((entry, i) => {
     const f = entry.friction || {};
+    const parts = entry.components || {};
     const bad = (f.coulomb ?? 0) < 0 || (f.viscous ?? 0) < 0;
+    // Two joints with the same Coulomb figure are not the same model if one of
+    // them also carries a load term, so the columns it kept are named here.
+    const kept = [parts.load_friction ? 'load' : null,
+                  parts.stribeck ? 'stribeck' : null,
+                  parts.actuator_inertia ? 'rotor' : null]
+                 .filter(Boolean).join(' + ') || t('none');
     return `<tr>
       <td>${esc(NAMES[i] || i + 1)}</td>
       <td class="n"${bad ? ' style="color:var(--bad)"' : ''}>${num(f.coulomb)}</td>
+      <td class="n">${parts.load_friction ? num(f.load_friction) : '—'}</td>
       <td class="n"${bad ? ' style="color:var(--bad)"' : ''}>${num(f.viscous, 5)}</td>
       <td class="n">${num(f.offset)}</td>
+      <td>${esc(kept)}</td>
       <td class="n">${num(entry.residual_rms_a, 4)}</td>
       <td class="n">${num(entry.holdout_rms_a, 4)}</td>
       <td class="n">${num(entry.validation_rms_a, 4)}</td>
@@ -618,8 +632,10 @@ function jointSection() {
     <table><thead><tr>
       <th data-i18n="col.joint"></th>
       <th class="n">${t('col.coulomb')} (${UNIT})</th>
+      <th class="n">${t('col.load')} (${UNIT}/${UNIT})</th>
       <th class="n">${t('col.viscous')} (${UNIT}/(°/s))</th>
       <th class="n">${t('col.offset')} (${UNIT})</th>
+      <th data-i18n="col.kept"></th>
       <th class="n" data-i18n="col.train"></th>
       <th class="n" data-i18n="col.holdout"></th>
       <th class="n" data-i18n="col.valid"></th>
@@ -840,24 +856,40 @@ function formatTick(value, step) {
   return value.toFixed(digits);
 }
 
-function frictionCurve(entry, maxSpeed) {
+function frictionCurve(entry, maxSpeed, load) {
   const f = entry.friction || {};
   const transition = (entry.components || {}).coulomb_transition_deg_s || 0;
+  const carried = Math.abs(load || 0) * (f.load_friction || 0);
   const curve = [];
   for (let i = 0; i <= 160; i += 1) {
     const v = -maxSpeed + (2 * maxSpeed * i) / 160;
     const rev = transition > 0 ? Math.tanh(v / transition) : Math.sign(v);
-    curve.push([v, (f.coulomb || 0) * rev + (f.viscous || 0) * v + (f.offset || 0)]);
+    curve.push([v, ((f.coulomb || 0) + carried) * rev
+                   + (f.viscous || 0) * v + (f.offset || 0)]);
   }
   return curve;
+}
+
+// Once friction depends on what the joint carries there is no single curve to
+// draw, so the light and heavy ends of the loads actually measured are drawn
+// and the band between them is the model.
+function frictionLoads(entry, points) {
+  if (!((entry.components || {}).load_friction)) return [0];
+  const loads = points.map((s) => Math.abs(s.load || 0)).sort((a, b) => a - b);
+  if (!loads.length) return [0];
+  const low = loads[Math.floor(loads.length * 0.05)];
+  const high = loads[Math.floor(loads.length * 0.95)];
+  return high - low > 1e-6 ? [low, high] : [high];
 }
 
 function frictionSpan(index) {
   const entry = JOINTS[index] || {};
   const points = (P.friction_samples || [])[index] || [];
   const maxSpeed = Math.max(10, ...points.map((s) => Math.abs(s.speed)));
-  const values = frictionCurve(entry, maxSpeed).map((p) => p[1])
-    .concat(points.map((s) => s.effort));
+  let values = points.map((s) => s.effort);
+  frictionLoads(entry, points).forEach((load) => {
+    values = values.concat(frictionCurve(entry, maxSpeed, load).map((p) => p[1]));
+  });
   return { low: Math.min(...values), high: Math.max(...values) };
 }
 
@@ -867,8 +899,10 @@ function drawFriction(canvas, entry, samples, label, forced) {
   const points = samples || [];
   const speeds = points.map((s) => s.speed);
   const maxSpeed = Math.max(10, ...speeds.map(Math.abs));
-  const curve = frictionCurve(entry, maxSpeed);
-  const values = curve.map((p) => p[1]).concat(points.map((s) => s.effort));
+  const loads = frictionLoads(entry, points);
+  const curves = loads.map((load) => frictionCurve(entry, maxSpeed, load));
+  let values = points.map((s) => s.effort);
+  curves.forEach((curve) => { values = values.concat(curve.map((p) => p[1])); });
   const low = forced ? forced.low : Math.min(...values);
   const high = forced ? forced.high : Math.max(...values);
   const span = (high - low) || 1;
@@ -882,9 +916,14 @@ function drawFriction(canvas, entry, samples, label, forced) {
   points.forEach((s) => { if (!s.sweep) ctx.fillRect(sx(s.speed) - 1, sy(s.effort) - 1, 2, 2); });
   ctx.fillStyle = 'rgba(120,220,150,.9)';
   points.forEach((s) => { if (s.sweep) ctx.fillRect(sx(s.speed) - 1.5, sy(s.effort) - 1.5, 3, 3); });
-  ctx.strokeStyle = '#e0b341'; ctx.lineWidth = 1.8; ctx.beginPath();
-  curve.forEach(([v, e], i) => { const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-  ctx.stroke();
+  ctx.strokeStyle = '#e0b341'; ctx.lineWidth = 1.8;
+  curves.forEach((curve, index) => {
+    ctx.setLineDash(index === 0 && curves.length > 1 ? [5, 4] : []);
+    ctx.beginPath();
+    curve.forEach(([v, e], i) => { const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
   const f = entry.friction || {};
   caption(ctx, box, `${label}   c ${(f.coulomb || 0).toFixed(3)} ${UNIT}`
     + `   v ${(f.viscous || 0).toFixed(4)} ${UNIT}/(°/s)`);

@@ -626,7 +626,8 @@ class IdentificationService:
                 whole = ident.predict_joint(
                     fit, regressor, speed, acceleration=acceleration)
                 point = {"speed": round(speed, 3),
-                         "effort": round(measured - rigid, 4)}
+                         "effort": round(measured - rigid, 4),
+                         "load": round(rigid, 4)}
                 error = {"speed": round(speed, 3),
                          "residual": round(measured - whole, 4)}
                 if _swept_here(record, index):

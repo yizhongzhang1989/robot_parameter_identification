@@ -242,6 +242,10 @@ class CampaignPlan:
     stribeck_search: bool = True
     stribeck_speed_deg_s: float = 1.6
     load_friction: bool = False
+    # Offered to every joint and decided per joint. Measured on three postures
+    # per joint it is worth twenty-nine per cent of the validation error on the
+    # heaviest and nothing on the wrist, which carries no load in any pose.
+    load_friction_search: bool = True
     # Motions the arm may refuse before the run is called off. A few gaps in a
     # ladder of thousands cost almost nothing; an arm refusing everything is
     # not producing a dataset and should not be left running for hours.
@@ -282,7 +286,8 @@ class CampaignPlan:
             stribeck=self.stribeck,
             stribeck_search=self.stribeck_search,
             stribeck_speed_deg_s=self.stribeck_speed_deg_s,
-            load_friction=self.load_friction)
+            load_friction=self.load_friction,
+            load_friction_search=self.load_friction_search)
 
 
 @dataclass

@@ -334,6 +334,75 @@ class LoadFrictionRecoveryTest(unittest.TestCase):
             fit.residual_rms_a, delta=1e-9)
 
 
+class LoadColumnSelectionTest(unittest.TestCase):
+    """Choosing the load column, on data built here rather than simulated.
+
+    The recovery tests below need the simulated plant and are skipped without
+    it, which is how two tests written for this behaviour ran nowhere at all.
+    """
+
+    JOINT = 1
+    COULOMB = 0.30
+    RATIO = 0.20
+
+    def setUp(self):
+        arm = arm_model()
+        rng = np.random.default_rng(0)
+        self.rigid, self.speeds, self.target = [], [], []
+        for _ in range(300):
+            pose = rng.uniform(-70.0, 70.0, arm.joint_count)
+            speed = float(rng.choice([-1.0, 1.0]) * rng.uniform(0.5, 60.0))
+            velocity = np.zeros(arm.joint_count)
+            velocity[self.JOINT] = speed
+            row = np.asarray(
+                arm.torque_regressor(pose, velocity)[self.JOINT], dtype=float)
+            load = float(row @ arm.inertial_parameters())
+            self.rigid.append(row)
+            self.speeds.append(speed)
+            self.target.append(
+                load + np.sign(speed) * (self.COULOMB + self.RATIO * abs(load))
+                + float(rng.normal(0.0, 0.002)))
+        self.rigid = np.asarray(self.rigid, dtype=float)
+        self.speeds = np.asarray(self.speeds, dtype=float)
+        self.target = np.asarray(self.target, dtype=float)
+        self.blank = np.zeros_like(self.speeds)
+
+    def test_a_zero_load_leaves_the_column_empty(self):
+        """The trap the fold scoring fell into: with no load estimate the
+        column is identically zero, so it can never look useful."""
+        stacked = ident._stack(
+            self.rigid, self.speeds, self.blank,
+            model.ModelComponents(load_friction=True), self.blank)
+        self.assertTrue(np.allclose(stacked[:, -2], 0.0))
+
+    def test_the_search_keeps_a_column_the_data_needs(self):
+        picked = ident._choose_column(
+            "load_friction", "load_friction_search", self.rigid, self.speeds,
+            self.blank, model.ModelComponents(load_friction_search=True),
+            self.target, 1e-6, 1.0e3, self.rigid.shape[1], 0)
+        self.assertTrue(picked.load_friction, "declined a column it needs")
+        self.assertFalse(picked.load_friction_search)
+
+    def test_the_search_drops_a_column_the_data_does_not_need(self):
+        plain = self.target - np.array(
+            [np.sign(s) * self.RATIO * abs(r @ arm_model().inertial_parameters())
+             for s, r in zip(self.speeds, self.rigid)])
+        picked = ident._choose_column(
+            "load_friction", "load_friction_search", self.rigid, self.speeds,
+            self.blank, model.ModelComponents(load_friction_search=True),
+            plain, 1e-6, 1.0e3, self.rigid.shape[1], 0)
+        self.assertFalse(picked.load_friction, "kept a column it does not need")
+
+    def test_the_recovered_ratio_is_the_injected_one(self):
+        fit = ident.fit_joint(
+            self.JOINT, list(self.rigid[:, None, :].repeat(
+                arm_model().joint_count, axis=1)),
+            list(self.speeds), list(self.target),
+            components=model.ModelComponents(load_friction=True))
+        self.assertAlmostEqual(fit.friction["load_friction"], self.RATIO,
+                               delta=0.05)
+
+
 @unittest.skipIf(simulation is None, f"needs the simulated plant: {SIMULATION_MISSING}")
 class PhysicalFrictionSignTest(unittest.TestCase):
     """Friction coefficients that physics forbids must never be returned.

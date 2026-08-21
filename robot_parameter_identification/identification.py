@@ -420,24 +420,37 @@ def _solve(rigid: np.ndarray, velocities: np.ndarray, accelerations: np.ndarray,
 
 def _choose_stribeck(rigid, velocities, accelerations, components, target,
                      tolerance, maximum_condition, rigid_width, seed):
-    """Keep the Stribeck column only if held-back data says the joint wants it.
+    """Keep the optional friction columns each joint's held-back data wants.
 
-    Measured on this arm the column is worth thirty-five per cent of the
-    validation error on the worst-loaded joint and costs five per cent on a
-    lightly loaded one, so the choice belongs to the joint rather than to the
-    arm.
+    Adding a column almost never worsens the error it was fitted on, so the
+    only question worth asking is whether it helps on rows kept back. Asked per
+    joint because the answer differs per joint: measured on this arm the load
+    column is worth twenty-seven per cent of the validation error on the
+    heaviest joint and nothing at all on the wrist, which carries no load in
+    any pose.
     """
-    if not getattr(components, "stribeck_search", False):
+    for name, switch in (("stribeck", "stribeck_search"),
+                         ("load_friction", "load_friction_search")):
+        components = _choose_column(
+            name, switch, rigid, velocities, accelerations, components, target,
+            tolerance, maximum_condition, rigid_width, seed)
+    return components
+
+
+def _choose_column(name, switch, rigid, velocities, accelerations, components,
+                   target, tolerance, maximum_condition, rigid_width, seed):
+    """Cross-validate one optional column and keep it only if it earns its place."""
+    if not getattr(components, switch, False):
         return components
     rows = target.size
     if rows < STRIBECK_FOLDS * 8:
-        return replace(components, stribeck_search=False)
+        return replace(components, **{switch: False})
 
     order = np.random.default_rng(seed).permutation(rows)
     folds = np.array_split(order, STRIBECK_FOLDS)
     scores = {}
     for enabled in (False, True):
-        trial = replace(components, stribeck=enabled, stribeck_search=False)
+        trial = replace(components, **{name: enabled, switch: False})
         errors = []
         for index in range(STRIBECK_FOLDS):
             test = folds[index]
@@ -449,16 +462,21 @@ def _choose_stribeck(rigid, velocities, accelerations, components, target,
             if outcome is None:
                 errors = None
                 break
-            stacked = _stack(rigid, velocities, accelerations, trial,
-                             np.zeros(rows))
             _, columns, solution, _rank, _condition = outcome
-            error = target[test] - stacked[np.ix_(test, columns)] @ solution
+            # The held-out load must come from the training fit, or the fold is
+            # scored with a column that already saw it.
+            blank = _stack(rigid[test], velocities[test], accelerations[test],
+                           trial, np.zeros(test.size))
+            loads = _rigid_current(blank, columns, solution, rigid_width)
+            scored = _stack(rigid[test], velocities[test], accelerations[test],
+                            trial, loads)
+            error = target[test] - scored[:, columns] @ solution
             errors.append(float(np.sqrt(np.mean(error ** 2))))
         scores[enabled] = None if not errors else float(np.mean(errors))
     plain, extra = scores.get(False), scores.get(True)
     if plain is None or extra is None or extra > plain * (1.0 - STRIBECK_GAIN):
-        return replace(components, stribeck=False, stribeck_search=False)
-    return replace(components, stribeck=True, stribeck_search=False)
+        return replace(components, **{name: False, switch: False})
+    return replace(components, **{name: True, switch: False})
 
 
 def _fit_transition(rigid, velocities, accelerations, components, target,
@@ -483,31 +501,33 @@ def _fit_transition(rigid, velocities, accelerations, components, target,
     default = replace(components, coulomb_transition_search=())
     baseline = _solve(rigid, velocities, accelerations, default, target,
                       tolerance, maximum_condition, rigid_width)
-    if not candidates or baseline is None:
-        return None if baseline is None else (default, baseline)
+    if baseline is None:
+        return None
     if mask is None or int(np.count_nonzero(mask)) < MINIMUM_TRANSITION_SAMPLES:
         return (default, baseline)
 
     mask = np.asarray(mask, dtype=bool)
     speeds = np.abs(np.asarray(velocities, dtype=float))[mask]
-    reference = _residual_of(baseline, target, mask)
-    best = None
-    for width in candidates:
-        # Below this the tanh column is saturated at every sample present, so
-        # nothing distinguishes one such candidate from another.
-        if int(np.count_nonzero(speeds <= 3.0 * width)) < 4:
-            continue
-        trial = replace(default, coulomb_transition_deg_s=float(width))
-        outcome = _solve(rigid, velocities, accelerations, trial, target,
-                         tolerance, maximum_condition, rigid_width)
-        if outcome is None:
-            continue
-        residual = _residual_of(outcome, target, mask)
-        if best is None or residual < best[0]:
-            best = (residual, trial, outcome)
-    if best is None or best[0] > reference * (1.0 - TRANSITION_GAIN):
-        return (default, baseline)
-    return (best[1], best[2])
+    best = (default, baseline)
+    if candidates:
+        reference = _residual_of(baseline, target, mask)
+        found = None
+        for width in candidates:
+            # Below this the tanh column is saturated at every sample present,
+            # so nothing distinguishes one such candidate from another.
+            if int(np.count_nonzero(speeds <= 3.0 * width)) < 4:
+                continue
+            trial = replace(default, coulomb_transition_deg_s=float(width))
+            outcome = _solve(rigid, velocities, accelerations, trial, target,
+                             tolerance, maximum_condition, rigid_width)
+            if outcome is None:
+                continue
+            residual = _residual_of(outcome, target, mask)
+            if found is None or residual < found[0]:
+                found = (residual, trial, outcome)
+        if found is not None and found[0] <= reference * (1.0 - TRANSITION_GAIN):
+            best = (found[1], found[2])
+    return best
 
 
 def _residual_of(outcome, target, mask=None) -> float:

@@ -39,9 +39,14 @@ class ModelComponents:
     stribeck_search: bool = False
     # Stribeck is only linear once this is fixed, so it is a setting, not a fit.
     stribeck_speed_deg_s: float = 2.0
-    # Friction that grows with transmitted load. Its column needs a load
-    # estimate, which is itself being fitted, so this one costs an iteration.
+    # Friction that grows with transmitted load, as a gearbox's efficiency loss
+    # would. Its column needs a load estimate, which is itself being fitted, so
+    # this one costs an iteration.
     load_friction: bool = False
+    # Offer it and let each joint decide, as with Stribeck. It was measured off
+    # by default because every sweep used to be taken at one posture, where a
+    # joint's load barely moves and the column had nothing to fit.
+    load_friction_search: bool = False
 
     def column_names(self) -> tuple[str, ...]:
         names: list[str] = []
@@ -100,17 +105,9 @@ def extra_row(velocity_deg_s: float, acceleration_deg_s2: float = 0.0,
                  else np.sign(velocity_deg_s))
         values.extend((float(shape), float(velocity_deg_s)))
     if components.stribeck:
-        # A curvature term for the friction-speed curve. Named for the classic
-        # Stribeck dip, but this arm fits it *negative*, and only by pairing it
-        # with an inflated Coulomb that it then cancels. Prefer
-        # coulomb_transition_deg_s, which produces the same saturating shape
-        # from a single column that stays non-negative.
         decay = np.exp(-abs(velocity_deg_s) / components.stribeck_speed_deg_s)
         values.append(float(np.sign(velocity_deg_s) * decay))
     if components.load_friction:
-        # Friction proportional to transmitted load, as a gearbox's efficiency
-        # loss would be. Measured on this arm within phase A (R2 up to 0.97) but
-        # it does *not* generalise to phase D, so it ships off by default.
         values.append(float(np.sign(velocity_deg_s) * abs(load_a)))
     if components.actuator_inertia:
         # Reflected rotor and gearbox inertia. Without this column it is
