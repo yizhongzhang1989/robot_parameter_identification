@@ -200,29 +200,67 @@ def main(argv=None):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        figure, axes = plt.subplots(1, 2, figsize=(13.5, 5.4))
+        figure, axes = plt.subplots(1, 3, figsize=(19.5, 5.6))
         colours = plt.cm.viridis(np.linspace(0, 0.92, len(levels)))
+
+        # Both directions, nothing removed. The friction panel beside it is a
+        # half-difference, which folds the two branches onto one line and hides
+        # everything the raw measurement can still be asked about.
+        for index, level in enumerate(levels):
+            mine = [r for r in rows if r["level"] == level]
+            load = float(np.mean([r["load_here_nm"] for r in mine]))
+            for direction in ("+", "-"):
+                # Average the repeats first; drawing them as separate points
+                # and joining them turns three readings of one rung into a
+                # zigzag that looks like structure.
+                rungs = {}
+                for row in mine:
+                    if row["direction"] != direction:
+                        continue
+                    rungs.setdefault(row["speed_deg_s"], []).append(row)
+                points = sorted(
+                    (float(np.mean([r["velocity_deg_s"] for r in group])),
+                     float(np.mean([r["effort"] for r in group])))
+                    for group in rungs.values())
+                axes[0].plot([p[0] for p in points], [p[1] for p in points],
+                             "-o", color=colours[index], linewidth=1.2,
+                             markersize=2.5, alpha=0.9,
+                             label=f"{load:.2f} N\u00b7m"
+                             if direction == "+" else None)
+        axes[0].axvline(0.0, color="#999", linewidth=0.8, zorder=0)
+        axes[0].set_xlabel("joint speed (deg/s), both directions")
+        axes[0].set_ylabel("measured current (A)")
+        axes[0].set_title("As measured, gravity still in it\n"
+                          "the gap between branches is twice the friction")
+        axes[0].grid(alpha=0.25)
+        axes[0].legend(fontsize=7, ncol=2)
+
         for index, level in enumerate(levels):
             speed, friction, _g = curve_of(table, level)
             load = float(np.mean([r["load"] for r in table
                                   if r["level"] == level]))
-            axes[0].plot(speed, friction, "-o", color=colours[index],
+            axes[1].plot(speed, friction, "-o", color=colours[index],
                          markersize=3.5, label=f"{load:.2f} N\u00b7m")
-        axes[0].set_xscale("log")
-        axes[0].set_xlabel("speed (deg/s, log)")
-        axes[0].set_ylabel("friction (A)")
-        axes[0].set_title("Friction against speed, one curve per load")
-        axes[0].grid(alpha=0.25, which="both")
-        axes[0].legend(fontsize=8, ncol=2)
+        axes[1].set_xscale("log")
+        axes[1].set_xlabel("speed (deg/s, log)")
+        axes[1].set_ylabel("friction (A)")
+        axes[1].set_title("Half the difference between the branches\n"
+                          "which is the friction, gravity cancelled")
+        axes[1].grid(alpha=0.25, which="both")
+        axes[1].legend(fontsize=7, ncol=2)
         if summary:
-            axes[1].plot([s["load"] for s in summary],
-                         [s["coulomb"] for s in summary], "-o", color="#4da3ff",
-                         label="Coulomb level (slow)")
-            axes[1].set_xlabel("load (N\u00b7m)")
-            axes[1].set_ylabel("friction (A)")
-            axes[1].set_title("Coulomb level against load")
-            axes[1].grid(alpha=0.25)
-            axes[1].legend(fontsize=9)
+            load = np.array([s["load"] for s in summary])
+            coulomb = np.array([s["coulomb"] for s in summary])
+            axes[2].plot(load, coulomb, "o", color="#4da3ff",
+                         label="fitted Coulomb")
+            slope, intercept = np.polyfit(load, coulomb, 1)
+            axes[2].plot(load, intercept + slope * load, "-", color="#e0b341",
+                         label=f"{intercept:.3f} + {slope:.3f} x load")
+            axes[2].set_xlabel("load (N\u00b7m)")
+            axes[2].set_ylabel("friction (A)")
+            axes[2].set_title("Coulomb against load")
+            axes[2].grid(alpha=0.25)
+            axes[2].legend(fontsize=9)
         figure.tight_layout()
         figure.savefig(args.plot, dpi=150)
         print(f"\nwrote {args.plot}")
