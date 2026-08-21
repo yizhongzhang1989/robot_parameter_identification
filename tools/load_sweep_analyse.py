@@ -111,8 +111,18 @@ def grid(table, joint):
             "loads": np.array(loads, dtype=float), "levels": kept}
 
 
-def fit(speeds, stack, loads, with_load=True):
-    """One law for the joint, load as a parameter when there is a load axis."""
+def fit(speeds, stack, loads, load_terms="full"):
+    """One law for the joint, load as a parameter where the levels support one.
+
+    ``load_terms`` is "full" when there are enough levels to see the shape
+    change with load, "coulomb" when there are only two and the offset between
+    them is all that can honestly be claimed, and "none" when the load could
+    not be varied at all. Two levels cannot tell a straight line from the first
+    half of a curve, but they can certainly tell one line from another, and
+    refusing the offset does not make the joint load independent: it books a
+    real and plainly visible separation as residual, and then reports a
+    seventeen per cent error that is nothing of the kind.
+    """
     from scipy.optimize import least_squares  # noqa: PLC0415
 
     def model(theta):
@@ -125,18 +135,22 @@ def fit(speeds, stack, loads, with_load=True):
             for load in loads])
 
     high = [20.0, 1.0, 5.0, 5.0, 5.0, 5.0, 200.0, 50.0]
-    if not with_load:
-        # No load axis: a slope fitted across levels that differ by less than
-        # the noise is not a measurement of anything.
-        high[3] = high[5] = high[7] = 1e-9
+    start = [0.8, 0.004, 0.24, 0.12, 0.04, 0.19, 0.5, 0.25]
+    if load_terms != "full":
+        # How the Stribeck amplitude and its speed move with load cannot be
+        # told from two levels. The offset between them can.
+        high[5] = high[7] = 1e-9
+        start[5] = start[7] = 0.0
+    if load_terms == "none":
+        high[3] = 1e-9
+        start[3] = 0.0
     found = least_squares(
-        lambda t: (model(t) - stack).ravel(),
-        [0.8, 0.004, 0.24, 0.12 if with_load else 0.0, 0.04,
-         0.19 if with_load else 0.0, 0.5, 0.25 if with_load else 0.0],
+        lambda t: (model(t) - stack).ravel(), start,
         bounds=([0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0], high))
     width, viscous, c0, ck, d0, dk, vs0, vsk = found.x
     return {"width": width, "viscous": viscous, "c0": c0, "ck": ck,
             "d0": d0, "dk": dk, "vs0": vs0, "vsk": vsk,
+            "load_terms": load_terms,
             "rms": float(np.sqrt(np.mean(found.fun ** 2)))}
 
 
@@ -203,8 +217,10 @@ def main(argv=None) -> int:
         if data is None:
             print(f"{entry['name']:>18}      -  not enough measured yet")
             continue
-        loadable = entry["loadable"] and len(data["levels"]) >= 3
-        model = fit(data["speeds"], data["stack"], data["loads"], loadable)
+        loadable = entry["loadable"] and len(data["levels"]) >= 2
+        terms = ("none" if not loadable
+                 else "full" if len(data["levels"]) >= 3 else "coulomb")
+        model = fit(data["speeds"], data["stack"], data["loads"], terms)
         fits[joint] = (model, data, loadable)
         mean = float(np.mean(np.abs(data["stack"])))
         print(f"{entry['name']:>18}{len(data['levels']):>7}"
@@ -233,16 +249,19 @@ def main(argv=None) -> int:
 
     print("\nDoes friction rise with load, and by how much")
     print(f"{'joint':>18}{'A per Nm':>10}{'as a share of the load':>24}"
-          f"{'over span':>11}")
+          f"{'over span':>11}   how well pinned down")
     for joint, (model, data, loadable) in sorted(fits.items()):
         name = manifest["joints"][joint]["name"]
         if not loadable:
             print(f"{name:>18}         -  load could not be varied")
             continue
         span = data["loads"].max() - data["loads"].min()
+        how = ("two levels only: an offset, not a shape"
+               if model["load_terms"] == "coulomb"
+               else f"{len(data['levels'])} levels")
         print(f"{name:>18}{model['ck']:>10.4f}"
               f"{model['ck'] / AMPS_PER_NM:>23.1%}"
-              f"{model['ck'] * span / AMPS_PER_NM:>10.3f} Nm")
+              f"{model['ck'] * span / AMPS_PER_NM:>10.3f} Nm   {how}")
 
     if args.plot:
         draw(args.plot, manifest, fits)
