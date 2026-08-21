@@ -87,6 +87,29 @@ class SweepPlan:
     refine_steps: int = 300
     # Spent per level looking for a steadier posture at the same load.
     settle_steps: int = 250
+    # Trade axial rungs for a second axis: half as many loads, each held at a
+    # low and a high tilting moment.
+    #
+    # Off by default, because it does not deliver what it was written for.
+    # Gravity loads a joint four ways at once and the first run of this sweep
+    # had them so nearly collinear that regressing friction on all four had a
+    # condition number of 433 -- the split was arithmetic, not measurement.
+    # This was the attempt to break that. It helps (joint one 53 -> 29, joint
+    # four 23 -> 12) but not enough to trust a split, and it makes joint three
+    # worse, 5 -> 9, by imposing a pattern where the plain design happened to
+    # have none.
+    #
+    # The reason it cannot do better is the drift budget it has to obey. A
+    # posture only measures one load if the load holds still while the joint
+    # sweeps, which means sitting at an extremum of the moment about the axis
+    # -- and there the axial and tilting components are locked to each other.
+    # Screening for usable postures raises |corr(axial, tilt)| from 0.48 to
+    # 0.90 on joint four. The constraint that makes the measurement clean is
+    # the one that confounds it, so posture alone will not separate these
+    # terms on this arm; that needs an external payload, or a design that
+    # deliberately sweeps through a load excursion and uses the per-sample
+    # load already recorded with every row.
+    decorrelate: bool = False
     seed: int = 0
     # Empty means every joint.
     joints: tuple[int, ...] = ()
@@ -282,7 +305,7 @@ def _extremise(arm, joint, start, lower, upper, sign, steps, rng, usable):
 
 
 def _settle(arm, joint, start, target, tolerance, window, lower, upper, steps,
-            rng, room_ok, bounds=None):
+            rng, room_ok, bounds=None, tilt_band=None):
     """Hold the load and quieten it: same level, steadier posture.
 
     The load on a joint goes as the sine of its own angle plus a phase the
@@ -310,6 +333,13 @@ def _settle(arm, joint, start, target, tolerance, window, lower, upper, steps,
         if bounds is not None and not bounds[0] <= mean <= bounds[1]:
             scale *= 0.99
             continue
+        # Quietening the load must not undo the tilt the level was placed at,
+        # or the decorrelation is lost to the very next refinement.
+        if tilt_band is not None:
+            here = load_terms(arm, trial, joint)[3]
+            if not tilt_band[0] <= here <= tilt_band[1]:
+                scale *= 0.99
+                continue
         if abs(mean - target) > tolerance or drift >= value:
             scale *= 0.99
             continue
@@ -409,22 +439,46 @@ def design_joint(arm, scene, joint: int, plan: SweepPlan, config,
     wanted = (np.linspace(low, high, count) if count > 1
               else np.array([float(np.median(values))]))
 
-    allowed = max(plan.drift_share * (span / max(count - 1, 1)), 1e-4) \
-        if count > 1 else allowed
+    # Where the levels go in the load plane. Spanning the axial torque alone
+    # leaves the other three terms free to follow it, and on this arm they do:
+    # the first run of this sweep had them so nearly collinear that regressing
+    # friction on all four had a condition number of 433, which is a way of
+    # saying the split was arithmetic and not measurement. Decorrelating trades
+    # axial rungs for a second axis -- half as many loads, each held at a low
+    # and a high tilting moment -- which is what makes the two separable. It is
+    # affordable because at a fixed axial torque this arm can still move the
+    # tilt through 4 Nm at the shoulder and 1.2 at the elbow.
+    tilts = np.array([load_terms(arm, pose, joint)[3] for pose in keep])
+    if plan.decorrelate and count >= 4 and tilts.std() > 1e-6:
+        rungs = int(np.ceil(count / 2))
+        quiet, loud = (float(np.percentile(tilts, 20)),
+                       float(np.percentile(tilts, 80)))
+        targets = [(float(a), t) for a in np.linspace(low, high, rungs)
+                   for t in (quiet, loud)][:count]
+        gap = (high - low) / max(rungs - 1, 1)
+    else:
+        targets = [(float(a), None) for a in wanted]
+        gap = span / max(count - 1, 1) if count > 1 else max(span, 1e-6)
+
+    allowed = max(plan.drift_share * gap, 1e-4) if count > 1 else allowed
     taken: list[int] = []
-    gap = span / max(count - 1, 1) if count > 1 else max(span, 1e-6)
-    for index, target in enumerate(wanted):
-        # Among the poses that sit at this load, take the steadiest one. Any
-        # candidate within a sixth of the gap is the same level as far as the
-        # analysis is concerned, so the tie is worth spending on drift: a pose
-        # whose load barely moves while the joint sweeps is a cleaner
-        # measurement of that load than one merely closer to a round number.
+    for index, (target, aim) in enumerate(targets):
+        # Among the poses that sit at this load, take the one nearest the tilt
+        # this level is meant to hold, or the steadiest one when no tilt is
+        # asked for. Any candidate within a sixth of the gap is the same level
+        # as far as the analysis is concerned, so the tie is worth spending.
         near = [k for k in range(len(keep))
                 if k not in taken and abs(values[k] - target) <= gap / 6.0]
-        ranked = sorted(near, key=lambda k: (
-            -sum(1 for a in arcs.values()
-                 if _room(keep[k], joint, a, lower, upper)),
-            load_across(arm, keep[k], joint, widest_window, points=5)[1], k))
+        if aim is None:
+            ranked = sorted(near, key=lambda k: (
+                -sum(1 for a in arcs.values()
+                     if _room(keep[k], joint, a, lower, upper)),
+                load_across(arm, keep[k], joint, widest_window, points=5)[1], k))
+        else:
+            ranked = sorted(near, key=lambda k: (
+                -sum(1 for a in arcs.values()
+                     if _room(keep[k], joint, a, lower, upper)),
+                abs(tilts[k] - aim), k))
         ranked += sorted((k for k in range(len(keep)) if k not in taken
                           and k not in near),
                          key=lambda k: (abs(values[k] - target), k))
@@ -454,11 +508,16 @@ def design_joint(arm, scene, joint: int, plan: SweepPlan, config,
         pose, quietest = None, float("inf")
         for candidate in clear:
             start = np.asarray(keep[candidate], dtype=float)
+            band = None
+            if aim is not None:
+                width = max(0.15 * (tilts.max() - tilts.min()), 1e-3)
+                here = tilts[candidate]
+                band = (here - width, here + width)
             settled = _settle(arm, joint, start, float(target), gap / 6.0,
                               widest_window, lower, upper, plan.settle_steps,
                               rng, lambda p: _room(p, joint, required,
                                                    lower, upper),
-                              bounds=(low, high))
+                              bounds=(low, high), tilt_band=band)
             for option in (settled, start):
                 drift = load_across(arm, option, joint, widest_window,
                                     points=9)[1]
