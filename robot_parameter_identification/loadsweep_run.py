@@ -120,6 +120,28 @@ class LoadSweepRun:
             "no collision free path to the next posture, directly or "
             "through neutral")
 
+    def _moved(self, joint: int, frames, wanted: float) -> str:
+        """Empty if the joint really went at the speed it was asked to.
+
+        A drive can accept a goal, report itself enabled and unfaulted, and
+        then not move: the arm holds position, the controller succeeds, and the
+        pass is recorded as a measurement of a joint that never turned. Seen on
+        this robot with both arms holding 23 V and two amps against gravity
+        while a ten degree command produced a third of a degree. Nothing else
+        in the stack notices, because every part of it did its job.
+
+        Judged on the fitted window rather than the goal, because the window is
+        what becomes a row.
+        """
+        if not frames:
+            return "the arm returned no samples"
+        speeds = [abs(float(frame["speed_deg_s"][joint])) for frame in frames]
+        fastest = max(speeds)
+        if fastest < 0.5 * abs(wanted):
+            return (f"the joint moved at {fastest:.3f} deg/s when it was asked "
+                    f"for {abs(wanted):.3f}; the arm is not following commands")
+        return ""
+
     def _drive(self, joint: int, level, entry: dict, distance: float,
                repeat: int) -> list[dict] | None:
         """One pass, retried, or None if the arm would not do it."""
@@ -130,16 +152,19 @@ class LoadSweepRun:
             if self._should_stop():
                 return None
             try:
-                return list(self.plant.traverse(
+                frames = list(self.plant.traverse(
                     joint, origin, distance, entry["speed_deg_s"]))
+                last = self._moved(joint, frames, entry["speed_deg_s"])
+                if not last:
+                    return frames
             except MotionFailed as failure:
                 last = str(failure)
-                if attempt < self.plan.pass_attempts:
-                    self._note(f"joint {joint + 1} level {level.index} at "
-                               f"{entry['speed_deg_s']:g} deg/s: {failure}; "
-                               f"retrying ({attempt}/{self.plan.pass_attempts})")
-                    time.sleep(self.plan.pass_retry_s)
-                    self._recover()
+            if attempt < self.plan.pass_attempts:
+                self._note(f"joint {joint + 1} level {level.index} at "
+                           f"{entry['speed_deg_s']:g} deg/s: {last}; "
+                           f"retrying ({attempt}/{self.plan.pass_attempts})")
+                time.sleep(self.plan.pass_retry_s)
+                self._recover()
         self.skipped.append({
             "joint": joint + 1, "level": level.index,
             "speed_deg_s": entry["speed_deg_s"], "repeat": repeat,

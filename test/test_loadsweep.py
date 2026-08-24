@@ -268,6 +268,27 @@ class RunTest(unittest.TestCase):
             self.assertEqual(outcome["skipped"], [])
             self.assertGreater(outcome["driven"], 0)
 
+    def test_an_arm_that_accepts_goals_without_moving_is_not_measured(self):
+        """The failure mode that has no error in it: the drive reports itself
+        enabled and unfaulted, the controller reports the goal succeeded, and
+        the joint never turns. Every part did its job and the row is fiction."""
+
+        class Stalled(FakePlant):
+            def traverse(self, joint, start_deg, distance_deg, speed_deg_s):
+                for frame in super().traverse(joint, start_deg, distance_deg,
+                                              speed_deg_s):
+                    frame["speed_deg_s"] = [0.01] * self.joints
+                    yield frame
+
+        with tempfile.TemporaryDirectory() as folder:
+            plant = Stalled(self.arm.joint_count)
+            _, outcome, _ = self.run_sweep(folder, plant=plant)
+            self.assertEqual(outcome["driven"], 0)
+            self.assertTrue(outcome["skipped"])
+            self.assertIn("not following commands", outcome["skipped"][0]["why"])
+            self.assertFalse(
+                (Path(folder) / loadsweep.RECORDS_NAME).read_text("utf-8").strip())
+
     def test_the_arm_is_parked_even_when_the_sweep_throws(self):
         class Exploding(FakePlant):
             def traverse(self, *args, **kwargs):
