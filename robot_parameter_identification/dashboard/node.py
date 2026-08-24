@@ -89,6 +89,8 @@ class DashboardNode(Node):
         self._sample: dict | None = None
         self._sample_at = 0.0
         self._observed: set = set()
+        # Joints this dashboard does not drive, in radians by name.
+        self._elsewhere: dict[str, float] = {}
         self._visuals: list[dict] = []
         self._package_dirs: dict[str, Path] = {}
 
@@ -161,6 +163,10 @@ class DashboardNode(Node):
         signals = self._spec.signals
         wanted = self._joint_names()
         by_name = dict(zip(message.joint_names, message.interface_values))
+        self._note_everything_else(
+            {name: dict(zip(entry.interface_names, entry.values)).get(
+                signals.position)
+             for name, entry in by_name.items()}, wanted)
         roles = {"position": signals.position, "effort": signals.effort}
         roles.update(signals.optional_interfaces())
         rows: dict[str, list[float]] = {}
@@ -180,6 +186,9 @@ class DashboardNode(Node):
     def _on_joint_state(self, message) -> None:
         wanted = self._joint_names()
         index = {name: i for i, name in enumerate(message.name)}
+        self._note_everything_else(
+            {name: float(message.position[i]) for name, i in index.items()
+             if i < len(message.position)}, wanted)
         rows: dict[str, list[float]] = {}
         for name in wanted:
             position = index.get(name)
@@ -203,6 +212,25 @@ class DashboardNode(Node):
         if self.service.arm is not None:
             return list(self.service.arm.joint_names)
         return []
+
+    def _note_everything_else(self, positions: dict, driven: list) -> None:
+        """Where the rest of the robot is, in radians, by joint name.
+
+        This dashboard drives one arm, but it draws the whole robot and its
+        collision scene holds every link the URDF ships. Without this the other
+        arm is pinned at the pose it was reduced against -- drawn at neutral
+        wherever it actually is, and, more to the point, screened there too.
+        """
+        elsewhere = {name: float(value) for name, value in positions.items()
+                     if name not in driven and value is not None
+                     and np.isfinite(value)}
+        if elsewhere:
+            with self._lock:
+                self._elsewhere = elsewhere
+
+    def elsewhere(self) -> dict:
+        with self._lock:
+            return dict(self._elsewhere)
 
     def _store(self, rows: dict[str, list[float]], count: int) -> None:
         if count == 0 or len(rows.get("position", [])) != count:

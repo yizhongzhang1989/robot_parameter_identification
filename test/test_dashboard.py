@@ -1,6 +1,7 @@
 """The dashboard surface, exercised without ROS and without a robot."""
 
 import json
+import math
 import unittest
 import urllib.error
 import urllib.request
@@ -284,6 +285,95 @@ class ViewerStateTest(unittest.TestCase):
         self.assertIn(f"{PREFIX}link1", payload["link_tf"])
         self.assertEqual(len(payload["link_tf"][f"{PREFIX}link1"]), 16)
         self.assertEqual(len(payload["obstacles"]), 1)
+
+
+class TwoArmViewTest(unittest.TestCase):
+    """This dashboard drives one arm and draws the whole robot.
+
+    On the real robot each dashboard was animating only its own seven links
+    while drawing all sixteen, so the other arm sat at neutral in the picture
+    however far it had actually been driven.
+    """
+
+    class Bridge:
+        def __init__(self, elsewhere):
+            self._elsewhere = elsewhere
+
+        def hardware_plant(self, profile, scene, **kwargs):
+            raise AssertionError("no motion in this test")
+
+        def health(self):
+            return {"telemetry_ok": True, "action_ok": True,
+                    "sample_age_s": 0.01, "description_ok": True}
+
+        def latest_sample(self):
+            return {"position_deg": [0.0] * 7}
+
+        def elsewhere(self):
+            return dict(self._elsewhere)
+
+    def build(self, elsewhere):
+        made = IdentificationService(DashboardConfig(),
+                                     bridge=self.Bridge(elsewhere),
+                                     profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        return made
+
+    def test_a_joint_this_dashboard_does_not_drive_is_drawn_where_it_is(self):
+        still = self.build({})
+        moved = self.build({f"{PREFIX}joint1": math.radians(60.0)})
+        # joint1 IS driven here, so the two must agree: the sample wins.
+        self.assertEqual(still.viewer_state()["link_tf"][f"{PREFIX}link1"],
+                         moved.viewer_state()["link_tf"][f"{PREFIX}link1"])
+
+    def test_the_driven_sample_beats_the_raw_topic_for_its_own_joints(self):
+        made = self.build({f"{PREFIX}joint1": math.radians(60.0)})
+        self.assertEqual(made.whole_pose_deg()[f"{PREFIX}joint1"], 0.0)
+
+    def test_undriven_joints_reach_the_pose_used_for_drawing(self):
+        made = self.build({"other_arm_joint1": math.radians(45.0)})
+        self.assertAlmostEqual(made.whole_pose_deg()["other_arm_joint1"],
+                               45.0, places=6)
+
+    def test_a_bridge_without_the_capability_still_draws(self):
+        made = service()
+        self.assertTrue(made.viewer_state()["have_model"])
+
+
+class ElsewhereGateTest(unittest.TestCase):
+    """The collision screen pins every joint it does not drive at neutral."""
+
+    class Bridge(TwoArmViewTest.Bridge):
+        pass
+
+    def build(self, elsewhere):
+        made = IdentificationService(DashboardConfig(),
+                                     bridge=self.Bridge(elsewhere),
+                                     profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        made.rehearsal_passed = True
+        return made
+
+    def test_driving_is_refused_when_another_joint_is_off_neutral(self):
+        made = self.build({"other_arm_joint2": math.radians(60.0)})
+        answer = made.start("load_sweep")
+        self.assertFalse(answer["ok"])
+        self.assertIn("other_arm_joint2", answer["message"])
+        self.assertIn("neutral", answer["message"])
+
+    def test_a_joint_this_dashboard_drives_does_not_trip_the_gate(self):
+        made = self.build({f"{PREFIX}joint1": math.radians(60.0)})
+        self.assertEqual(made.elsewhere_off_neutral(), [])
+
+    def test_small_offsets_are_tolerated(self):
+        made = self.build({"other_arm_joint2": math.radians(0.4)})
+        self.assertEqual(made.elsewhere_off_neutral(), [])
+
+    def test_the_rehearsal_is_not_gated_on_the_other_arm(self):
+        # It moves nothing, so where the other arm stands cannot matter.
+        made = self.build({"other_arm_joint2": math.radians(60.0)})
+        self.assertTrue(made.start("rehearsal")["ok"])
+        made.stop()
 
 
 class RehearsalEndToEndTest(unittest.TestCase):

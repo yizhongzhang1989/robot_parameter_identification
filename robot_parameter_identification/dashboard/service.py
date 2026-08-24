@@ -88,6 +88,7 @@ class IdentificationService:
         self.bridge = bridge
         self.profile = profile
         self.arm: ident.ArmModel | None = None
+        self.whole: ident.ArmModel | None = None
         self.scene: ObstacleScene | None = None
         self.urdf_text = ""
         self.driven_joints: list[str] = []
@@ -163,6 +164,14 @@ class IdentificationService:
             self.arm = arm
             self.profile = profile
             self.profile_source = source
+            # The picture and the collision scene cover the whole robot, not
+            # just the arm this dashboard drives, so the drawing needs a model
+            # that still has the other arm's joints in it.
+            try:
+                self.whole = ident.ArmModel.from_urdf_text(self.urdf_text, "")
+            except Exception as error:  # noqa: BLE001 - drawing is not the job
+                self.whole = None
+                self.note(f"whole-robot view unavailable: {error}")
             previous = self.scene.as_list() if self.scene else []
             self.scene = ObstacleScene(arm.model, urdf_text=self.urdf_text)
             if previous:
@@ -306,6 +315,23 @@ class IdentificationService:
 
     # -- 3D view ---------------------------------------------------------
 
+    def whole_pose_deg(self) -> dict:
+        """Every joint this dashboard can see, in degrees, by name.
+
+        The driven joints come from the fitted sample; the rest come straight
+        off the state topic. Both arms are on one robot and one bus, so a
+        dashboard that only knows its own seven draws the other arm wherever it
+        happened to be reduced against -- which is neutral, and is a picture of
+        a robot that does not exist.
+        """
+        pose = {name: float(np.degrees(value)) for name, value in
+                (self.bridge.elsewhere() if self.bridge is not None else {}).items()}
+        sample = self.latest_sample()
+        if sample and self.arm is not None:
+            pose.update(dict(zip(self.arm.joint_names,
+                                 (float(v) for v in sample["position_deg"]))))
+        return pose
+
     def viewer_state(self) -> dict:
         """Everything the 3D canvas needs for one frame."""
         if self.arm is None:
@@ -313,12 +339,21 @@ class IdentificationService:
         sample = self.latest_sample()
         pose = np.asarray(sample["position_deg"], dtype=float) if sample \
             else np.zeros(self.arm.joint_count)
+        transforms = None
+        if self.whole is not None:
+            everywhere = self.whole_pose_deg()
+            if everywhere:
+                transforms = self.whole.link_transforms(
+                    [everywhere.get(name, 0.0)
+                     for name in self.whole.joint_names])
+        if transforms is None:
+            transforms = (self.arm.link_transforms(pose)
+                          if hasattr(self.arm, "link_transforms") else {})
         payload = {
             "have_model": True,
             "joint_names": list(self.arm.joint_names),
             "joint_values_deg": pose.tolist(),
-            "link_tf": self.arm.link_transforms(pose)
-            if hasattr(self.arm, "link_transforms") else {},
+            "link_tf": transforms,
             "obstacles": self.scene.placements(pose) if self.scene else [],
             "frames": self.frame_names(),
         }
@@ -327,6 +362,29 @@ class IdentificationService:
         return payload
 
     # -- campaign --------------------------------------------------------
+
+    def elsewhere_off_neutral(self, tolerance_deg: float = 5.0) -> list[dict]:
+        """Joints this dashboard does not drive that are not where the screen
+        thinks they are.
+
+        The collision scene carries every link the URDF ships -- sixteen on
+        this robot, both arms -- but it is built on a model reduced against the
+        neutral configuration, so the arm this dashboard does not drive is
+        pinned at zero inside the screen. Park that arm somewhere else and the
+        screen will cheerfully clear a path straight through it. Nothing else
+        catches this: the geometry is loaded, the pair count is right, and the
+        screen refuses folded poses exactly as it should.
+        """
+        driven = set(self.arm.joint_names) if self.arm is not None else set()
+        astray = []
+        for name, radians in (self.bridge.elsewhere()
+                              if self.bridge is not None else {}).items():
+            if name in driven:
+                continue
+            degrees = float(np.degrees(radians))
+            if abs(degrees) > tolerance_deg:
+                astray.append({"joint": name, "at_deg": round(degrees, 2)})
+        return sorted(astray, key=lambda item: -abs(item["at_deg"]))
 
     def start(self, mode: str, options: dict | None = None) -> dict:
         if not self.have_model():
@@ -342,6 +400,17 @@ class IdentificationService:
                 return {"ok": False,
                         "message": "rehearse first: a dry run must pass "
                                    "before the arm is allowed to move"}
+            if mode in ("hardware", "load_sweep"):
+                astray = self.elsewhere_off_neutral()
+                if astray:
+                    where = ", ".join(f"{item['joint']} at {item['at_deg']:g} deg"
+                                      for item in astray[:4])
+                    return {"ok": False,
+                            "message": "the collision screen places every joint "
+                                       "this dashboard does not drive at neutral, "
+                                       f"and these are not: {where}. Home them "
+                                       "before driving, or the screen will clear "
+                                       "a path through them."}
             self._state = RUNNING
             self._activity = ("load_sweep" if mode == "load_sweep"
                               else f"campaign_{mode}")
