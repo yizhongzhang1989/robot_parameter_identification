@@ -14,6 +14,7 @@ import numpy as np
 
 from robot_parameter_identification import identification as ident
 from robot_parameter_identification import loadsweep
+from robot_parameter_identification import loadsweep_report
 from robot_parameter_identification.interfaces import MotionFailed
 from robot_parameter_identification.loadsweep_run import (LoadSweepRun,
                                                           TransitBlocked)
@@ -298,6 +299,76 @@ class RunTest(unittest.TestCase):
                                folder, should_stop=lambda: True)
             outcome = run.run()
             self.assertEqual(outcome["driven"], 0)
+
+    def test_a_report_is_written_beside_the_records(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.run_sweep(folder)
+            page = Path(folder) / loadsweep_report.REPORT_NAME
+            self.assertTrue(page.is_file())
+            text = page.read_text(encoding="utf-8")
+            self.assertIn("<canvas", text)
+            # Both languages ship inside the page; neither can go stale
+            # against the other because there is no second file.
+            self.assertIn("负载扫掠报告", text)
+            self.assertIn("Load sweep", text)
+
+    def test_the_signed_torque_is_recorded_not_just_its_size(self):
+        """joint_loads reports magnitudes, which cannot calibrate anything
+        once the search picks postures either side of zero."""
+        with tempfile.TemporaryDirectory() as folder:
+            self.run_sweep(folder)
+            first = json.loads((Path(folder) / loadsweep.RECORDS_NAME)
+                               .read_text("utf-8").splitlines()[0])
+            self.assertIn("axial_signed_nm", first["load"])
+            self.assertGreaterEqual(first["load"]["axial_nm"], 0.0)
+
+
+class ReportTest(unittest.TestCase):
+    """What the page says about data it cannot honestly speak for."""
+
+    def setUp(self):
+        self.arm = build_arm()
+        self.scene = ObstacleScene(self.arm.model, urdf_text=synthetic_urdf())
+        self.plan = loadsweep.SweepPlan(search_samples=400, refine_steps=20,
+                                        speeds=8, repeats=1, maximum_levels=2)
+        self.designs = [loadsweep.design_joint(
+            self.arm, self.scene, 1, self.plan, HardwareConfig(),
+            *self.arm.limits_deg())]
+
+    def story(self, folder):
+        run = LoadSweepRun(self.arm, FakePlant(self.arm.joint_count),
+                           self.plan, self.designs, folder)
+        run.run()
+        return loadsweep_report.summarise(folder)
+
+    def test_a_torque_constant_that_does_not_fit_is_borrowed_not_invented(self):
+        """The fake plant returns the same current at every posture, so its
+        gravity current cannot track its gravity torque and nothing about it
+        is calibrated. Reporting a slope anyway is how joint three came to be
+        credited with friction worth 1370 per cent of its load."""
+        with tempfile.TemporaryDirectory() as folder:
+            story = self.story(folder)
+            for joint in story["joints"]:
+                self.assertTrue(joint["amps_per_nm_borrowed"])
+                self.assertIsNone(joint["amps_per_nm"])
+                self.assertGreater(joint["amps_per_nm_used"], 0.0)
+
+    def test_the_page_stands_alone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            page = loadsweep_report.render(self.story(folder))
+            self.assertNotIn("<script src", page)
+            self.assertNotIn("http://", page)
+            self.assertIn("</html>", page)
+
+    def test_a_run_with_no_records_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = LoadSweepRun(self.arm, FakePlant(self.arm.joint_count),
+                               self.plan, self.designs, folder,
+                               should_stop=lambda: True)
+            run.run()
+            story = loadsweep_report.summarise(folder)
+            self.assertEqual(story["records"], 0)
+            self.assertTrue(loadsweep_report.render(story))
 
 
 if __name__ == "__main__":

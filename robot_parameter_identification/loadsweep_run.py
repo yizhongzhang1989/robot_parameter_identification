@@ -152,6 +152,12 @@ class LoadSweepRun:
             here = pose_with(level.pose_deg, joint,
                              float(frame["position_deg"][joint]))
             terms = load_terms(self.arm, here, joint)
+            # Signed as well as absolute. joint_loads reports magnitudes,
+            # which is right for a bearing load and wrong for calibration: the
+            # current spent holding gravity reverses when the torque does, so
+            # regressing it against a magnitude is meaningless as soon as the
+            # search picks postures either side of zero. It does.
+            signed = float(self.arm.inverse_dynamics(here)[joint])
             self.recorder.write({
                 "schema": SCHEMA,
                 "key": key,
@@ -178,6 +184,7 @@ class LoadSweepRun:
                 # a later question about radial force does not need the arm
                 # back.
                 "load": {"axial_nm": round(float(terms[0]), 5),
+                         "axial_signed_nm": round(signed, 5),
                          "radial_n": round(float(terms[1]), 4),
                          "thrust_n": round(float(terms[2]), 4),
                          "tilt_nm": round(float(terms[3]), 5)},
@@ -278,6 +285,14 @@ class LoadSweepRun:
                 self.plant.park()
             except Exception as error:  # noqa: BLE001 - already unwinding
                 self._note(f"could not park at the end: {error}")
+            # Written even when the run was cut short, because a sweep that
+            # stopped in its fifth hour still measured four.
+            try:
+                from .loadsweep_report import write_report  # noqa: PLC0415
+
+                self._note(f"report written to {write_report(self.folder)}")
+            except Exception as error:  # noqa: BLE001 - the data still matters
+                self._note(f"could not write the report: {error}")
         return {"driven": self.driven, "skipped": self.skipped,
                 "folder": str(self.folder),
                 "elapsed_s": time.monotonic() - self.started_at}

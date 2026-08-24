@@ -818,7 +818,12 @@ class IdentificationService:
             self.note(f"could not write result: {error}")
 
     def runs(self, limit: int = 12) -> list[dict]:
-        """Result folders that hold a readable report, newest first."""
+        """Result folders that hold a readable report, newest first.
+
+        One level deep as well as at the top, because a load sweep files
+        itself under ``load_sweep/`` and would otherwise write a report the
+        dashboard never offers a link to.
+        """
         directory = Path(self.config.output_directory)
         if not directory.is_dir():
             return []
@@ -830,13 +835,22 @@ class IdentificationService:
         for entry in entries:
             if not entry.is_dir():
                 continue
-            if not (entry / report_module.REPORT_NAME).is_file():
-                continue
-            found.append({
-                "name": entry.name,
-                "report": f"/runs/{entry.name}/{report_module.REPORT_NAME}",
-                "modified": entry.stat().st_mtime,
-            })
+            if (entry / report_module.REPORT_NAME).is_file():
+                nested = [entry]
+            else:
+                try:
+                    nested = [child for child in entry.iterdir()
+                              if child.is_dir()
+                              and (child / report_module.REPORT_NAME).is_file()]
+                except OSError:
+                    continue
+            for folder in nested:
+                name = str(folder.relative_to(directory))
+                found.append({
+                    "name": name,
+                    "report": f"/runs/{name}/{report_module.REPORT_NAME}",
+                    "modified": folder.stat().st_mtime,
+                })
         found.sort(key=lambda item: item["modified"], reverse=True)
         return found[:limit]
 
