@@ -72,6 +72,25 @@ const DICT = {
   'run.failed': { en: 'failed', zh: '失败' },
   'run.stopped': { en: 'stopped', zh: '已停止' },
 
+  /* ---- optimal excitation ---- */
+  'optimal.title': { en: 'Optimal excitation identification', zh: '最优激励轨迹辨识' },
+  'optimal.hint': {
+    en: 'Load-conditioned 0.1–2°/s constant-speed subtrajectories identify steady friction; distinct multi-joint Fourier trajectories selected against the cumulative regressor identify rigid dynamics. Separate Fourier trajectories are used only for validation and comparison.',
+    zh: '在不同负载下以 0.1–2°/s 运行恒速子轨迹，用于辨识稳态摩擦；按累计回归量选择彼此不同的多关节傅里叶轨迹，用于辨识刚体动力学。另设独立傅里叶轨迹，仅用于验证和对比。',
+  },
+  'optimal.training': { en: 'training trajectories', zh: '训练轨迹数' },
+  'optimal.validation': { en: 'validation trajectories', zh: '验证轨迹数' },
+  'optimal.duration': { en: 'seconds each', zh: '每条时长（秒）' },
+  'optimal.postures': { en: 'low-speed load postures', zh: '低速负载位形数' },
+  'optimal.repeats': { en: 'passes per direction', zh: '每方向重复次数' },
+  'optimal.frequency': { en: 'Fourier base frequency (Hz)', zh: '傅里叶基频（Hz）' },
+  'optimal.reuse': {
+    en: 'reuse latest completed low-speed phase',
+    zh: '复用最近一次已完成的低速阶段',
+  },
+  'optimal.start': { en: 'Run optimal excitation', zh: '开始最优激励辨识' },
+  'optimal.trajectory': { en: 'trajectory', zh: '轨迹' },
+
   /* ---- load sweep ---- */
   'sweep.title': { en: 'Load sweep', zh: '负载扫掠' },
   'sweep.hint': {
@@ -153,11 +172,26 @@ const DICT = {
       + 'error can always be made small.',
     zh: '每个关节的残差。真正说明问题的是验证误差：训练误差总是可以做小。',
   },
+  'compare.title': { en: 'Optimal excitation vs load sweep', zh: '最优激励与负载扫掠对比' },
+  'compare.hint': {
+    en: 'Both models are scored on the same Fourier validation trajectories, which neither model trained on.',
+    zh: '两个模型均在同一组傅里叶验证轨迹上评分，双方都未使用这些数据训练。',
+  },
+  'compare.met': { en: 'target met', zh: '目标达成' },
+  'compare.missed': { en: 'target not met', zh: '目标未达成' },
+  'compare.unavailable': { en: 'comparison unavailable', zh: '无法进行对比' },
+  'compare.mean': { en: 'mean optimal / sweep', zh: '平均误差（最优激励 / 扫掠）' },
+  'compare.worst': { en: 'worst optimal / sweep', zh: '最差误差（最优激励 / 扫掠）' },
+  'compare.optimal': { en: 'optimal RMS', zh: '最优激励 RMS' },
+  'compare.sweep': { en: 'sweep RMS', zh: '扫掠 RMS' },
+  'compare.improvement': { en: 'improvement', zh: '改善幅度' },
   'friction.title': { en: 'Friction curve', zh: '摩擦曲线' },
   'friction.hint': {
     en: 'Fitted curve against the samples it was fitted to. Sweep samples are '
-      + 'drawn apart: only there does speed vary while pose does not.',
-    zh: '拟合曲线与其所用样本的对比。扫掠样本单独着色：只有在扫掠段速度变化而位姿不变。',
+      + 'drawn apart. For trajectory samples, dark-to-bright blue indicates '
+      + 'light-to-heavy rigid-body effort; the yellow band is the fitted load range.',
+    zh: '拟合曲线与其所用样本的对比。扫掠样本单独着色。轨迹样本由深蓝到亮蓝表示'
+      + '刚体驱动量由轻到重，黄色阴影为拟合载荷范围。',
   },
   'friction.joint': { en: 'joint', zh: '关节' },
   'residual.title': { en: 'Residual against speed', zh: '残差-速度关系' },

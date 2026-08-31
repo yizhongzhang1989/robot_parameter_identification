@@ -106,26 +106,58 @@ export function drawErrors(canvas, result, unit) {
 
 /* ---------------- friction curve over its own samples ---------------- */
 
+export function frictionValue(entry, velocity, load) {
+  const friction = entry?.friction || {};
+  const components = entry?.components || {};
+  const transition = components.coulomb_transition_deg_s ?? 0;
+  const stribeckSpeed = components.stribeck_speed_deg_s || 1;
+  const sign = Math.sign(velocity);
+  const reversal = transition > 0 ? Math.tanh(velocity / transition) : sign;
+  const decay = sign * Math.exp(-Math.abs(velocity) / stribeckSpeed);
+  return (friction.coulomb || 0) * reversal
+    + (friction.load_friction || 0) * Math.abs(load || 0) * sign
+    + (friction.stribeck || 0) * decay
+    + (friction.load_stribeck || 0) * Math.abs(load || 0) * decay
+    + (friction.viscous || 0) * velocity + (friction.offset || 0);
+}
+
+function frictionLoads(entry, samples) {
+  if (!(entry?.components?.load_friction
+        || entry?.components?.load_stribeck)) return [0];
+  const loads = (samples || []).map((sample) => Math.abs(sample.load || 0))
+    .sort((a, b) => a - b);
+  if (!loads.length) return [0];
+  const low = loads[Math.floor(loads.length * 0.05)];
+  const high = loads[Math.floor(loads.length * 0.95)];
+  return high - low > 1e-6 ? [low, high] : [high];
+}
+
+function loadShade(load, loads) {
+  if (loads.length < 2 || loads[1] - loads[0] <= 1e-9) {
+    return 'rgba(77,163,255,.65)';
+  }
+  const share = Math.max(0, Math.min(1,
+    (Math.abs(load || 0) - loads[0]) / (loads[1] - loads[0])));
+  return `rgba(77,${Math.round(120 + 80 * share)},255,${(0.3 + 0.6 * share).toFixed(2)})`;
+}
+
 export function drawFriction(canvas, entry, samples, unit) {
   const { ctx, width, height } = setup(canvas);
   if (!entry) return empty(ctx, width, height, 'no result yet');
 
-  const friction = entry.friction || {};
-  const coulomb = friction.coulomb || 0;
-  const viscous = friction.viscous || 0;
-  const offset = friction.offset || 0;
-  const transition = entry.components?.coulomb_transition_deg_s ?? 0;
-
   const speeds = (samples || []).map((s) => s.speed);
   const efforts = (samples || []).map((s) => s.effort);
   const maxSpeed = Math.max(10, ...speeds.map(Math.abs));
-  const curve = [];
-  for (let i = 0; i <= 120; i += 1) {
-    const v = -maxSpeed + (2 * maxSpeed * i) / 120;
-    const reversal = transition > 0 ? Math.tanh(v / transition) : Math.sign(v);
-    curve.push([v, coulomb * reversal + viscous * v + offset]);
-  }
-  const values = curve.map((p) => p[1]).concat(efforts);
+  const loads = frictionLoads(entry, samples);
+  const curves = loads.map((load) => {
+    const curve = [];
+    for (let i = 0; i <= 120; i += 1) {
+      const velocity = -maxSpeed + (2 * maxSpeed * i) / 120;
+      curve.push([velocity, frictionValue(entry, velocity, load)]);
+    }
+    return curve;
+  });
+  const values = curves.flat().map((point) => point[1]).concat(efforts);
   const low = Math.min(...values);
   const high = Math.max(...values);
   const span = (high - low) || 1;
@@ -141,9 +173,9 @@ export function drawFriction(canvas, entry, samples, unit) {
   ctx.lineTo(sx(0), box.bottom);
   ctx.stroke();
 
-  ctx.fillStyle = 'rgba(77,163,255,.45)';
   (samples || []).forEach((sample) => {
     if (sample.sweep) return;
+    ctx.fillStyle = loadShade(sample.load, loads);
     ctx.fillRect(sx(sample.speed) - 1, sy(sample.effort) - 1, 2, 2);
   });
 
@@ -156,15 +188,38 @@ export function drawFriction(canvas, entry, samples, unit) {
     ctx.fillRect(sx(sample.speed) - 1.5, sy(sample.effort) - 1.5, 3, 3);
   });
 
+  if (curves.length > 1) {
+    ctx.fillStyle = 'rgba(224,179,65,.12)';
+    ctx.beginPath();
+    curves[0].forEach(([v, e], index) => {
+      const x = sx(v), y = sy(e);
+      if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    [...curves[1]].reverse().forEach(([v, e]) => ctx.lineTo(sx(v), sy(e)));
+    ctx.closePath();
+    ctx.fill();
+  }
   ctx.strokeStyle = '#e0b341';
   ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  curve.forEach(([v, e], index) => {
-    const x = sx(v);
-    const y = sy(e);
-    if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  curves.forEach((curve, curveIndex) => {
+    ctx.setLineDash(curveIndex === 0 && curves.length > 1 ? [4, 3] : []);
+    ctx.beginPath();
+    curve.forEach(([v, e], index) => {
+      const x = sx(v), y = sy(e);
+      if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
   });
-  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const friction = entry.friction || {};
+  ctx.fillStyle = MUTED;
+  ctx.textAlign = 'left';
+  ctx.fillText(`c ${(friction.coulomb || 0).toFixed(3)}`
+    + `${entry.components?.load_friction ? `  μ ${(friction.load_friction || 0).toFixed(3)}` : ''}`
+    + `${entry.components?.load_stribeck ? `  FsL ${(friction.load_stribeck || 0).toFixed(3)}` : ''}`
+    + `  v ${(friction.viscous || 0).toFixed(4)}`,
+  box.left + 4, box.top + 10);
 
   ctx.fillStyle = MUTED;
   ctx.fillText(high.toFixed(2), 2, box.top + 4);

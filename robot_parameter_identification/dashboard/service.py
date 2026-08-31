@@ -6,8 +6,9 @@ Python so the whole surface can be exercised in tests without a robot.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+import csv
 import json
 import threading
 import time
@@ -19,6 +20,7 @@ from .. import autoprofile
 from .. import campaign as campaign_module
 from .. import excitation, identification as ident
 from .. import loadsweep as loadsweep_module
+from .. import loadsweep_report
 from .. import report as report_module
 from ..interfaces import CommandSpec, TelemetrySpec
 from ..loadsweep_run import LoadSweepRun
@@ -49,9 +51,30 @@ def _swept_here(record, joint: int) -> bool:
     except (AttributeError, IndexError, TypeError):
         return False
 
+def _parked_here(record, joint: int) -> bool:
+    """A friction-phase row for a joint that pass never drove.
+
+    Measured on this arm, a parked joint's fitted window speed runs to 0.037
+    deg/s at the ninety-ninth percentile and 0.145 at worst, which is the same
+    range the slowest rungs are commanded in. So the pass tag decides, not the
+    speed: a threshold high enough to catch these would delete the crawl.
+    """
+    if getattr(record, "phase", "") != campaign_module.PHASE_FRICTION:
+        return False
+    for part in (getattr(record, "motion", "") or "").split(":"):
+        if part.startswith("j") and part[1:].isdigit():
+            return int(part[1:]) != joint
+    return False
+
+
 # A campaign yields tens of thousands of samples; a scatter plot stops being
 # readable long before a browser stops being able to draw them.
 MAX_PLOT_POINTS = 1500
+# Below this a joint has not established a direction of travel, so measured
+# minus rigid is wherever the position servo happened to settle inside the
+# stiction band, not friction at a speed. It sits well below the slowest
+# commanded rung; the parked rows of a sweep are excluded by their tag instead.
+STILL_SPEED_DEG_S = 0.01
 # The rehearsal plants known friction and must find it again; a run that merely
 # completes proves the code executes, not that it computes.
 REHEARSAL_NOISE = 0.002
@@ -59,6 +82,52 @@ REHEARSAL_TOLERANCE = 0.02
 # Homing is a recovery move from an unknown pose, so it goes slowly whatever
 # speed the campaign was configured for.
 HOMING_SPEED_DEG_S = 10.0
+OPTIMAL_MODE = "optimal_excitation"
+
+
+def _comparison(optimal_errors, sweep: dict, joint_names) -> dict:
+    """Put both models on one untouched validation set and judge the target."""
+    if not sweep.get("available"):
+        return dict(sweep)
+    optimal = [float(value) for value in optimal_errors]
+    baseline = [float(value) for value in sweep.get("validation_rms_a") or []]
+    names = list(joint_names)
+    if not optimal or len(optimal) != len(baseline):
+        return {"available": False,
+                "reason": "the two models did not score the same joints"}
+    joints = []
+    for index, (new, old) in enumerate(zip(optimal, baseline)):
+        gain = (100.0 * (old - new) / old) if old > 0.0 else None
+        joints.append({
+            "joint": index,
+            "name": names[index] if index < len(names) else f"joint{index + 1}",
+            "optimal_validation_rms_a": new,
+            "sweep_validation_rms_a": old,
+            "improvement_percent": gain,
+            "optimal_better": new < old,
+        })
+    optimal_mean, sweep_mean = float(np.mean(optimal)), float(np.mean(baseline))
+    optimal_worst, sweep_worst = max(optimal), max(baseline)
+    target_met = optimal_mean < sweep_mean and optimal_worst < sweep_worst
+    return {
+        "available": True,
+        "basis": "same_unseen_optimal_validation_trajectories",
+        "target_met": target_met,
+        "source": sweep.get("source"),
+        "sweep_method": sweep.get("method"),
+        "validation_samples": sweep.get("validation_samples"),
+        "optimal_mean_validation_rms_a": optimal_mean,
+        "sweep_mean_validation_rms_a": sweep_mean,
+        "optimal_worst_validation_rms_a": optimal_worst,
+        "sweep_worst_validation_rms_a": sweep_worst,
+        "mean_improvement_percent": (
+            100.0 * (sweep_mean - optimal_mean) / sweep_mean
+            if sweep_mean > 0.0 else None),
+        "worst_improvement_percent": (
+            100.0 * (sweep_worst - optimal_worst) / sweep_worst
+            if sweep_worst > 0.0 else None),
+        "joints": joints,
+    }
 
 
 @dataclass
@@ -394,13 +463,13 @@ class IdentificationService:
         with self._lock:
             if self._state != IDLE:
                 return {"ok": False, "message": f"{self._activity} is running"}
-            if mode == "hardware" and not self.rehearsal_passed:
+            if mode in ("hardware", OPTIMAL_MODE) and not self.rehearsal_passed:
                 # Not ceremony: the rehearsal plants known friction and must
                 # find it again, and it is what caught the fit returning zero.
                 return {"ok": False,
                         "message": "rehearse first: a dry run must pass "
                                    "before the arm is allowed to move"}
-            if mode in ("hardware", "load_sweep"):
+            if mode in ("hardware", "load_sweep", OPTIMAL_MODE):
                 astray = self.elsewhere_off_neutral()
                 if astray:
                     where = ", ".join(f"{item['joint']} at {item['at_deg']:g} deg"
@@ -412,7 +481,7 @@ class IdentificationService:
                                        "before driving, or the screen will clear "
                                        "a path through them."}
             self._state = RUNNING
-            self._activity = ("load_sweep" if mode == "load_sweep"
+            self._activity = (mode if mode in ("load_sweep", OPTIMAL_MODE)
                               else f"campaign_{mode}")
             self._abort.clear()
             self._started_at = time.monotonic()
@@ -467,6 +536,9 @@ class IdentificationService:
                 self.profile, self.scene,
                 require_neutral_start=False,
                 maximum_speed_deg_s=HOMING_SPEED_DEG_S)
+            setter = getattr(plant, "set_monitor", None)
+            if setter is not None:
+                setter(self._monitor())
             before = [float(v) for v in plant.sample()["position_deg"]]
             self._on_progress("moving",
                               {"from_deg": [round(v, 2) for v in before]})
@@ -505,14 +577,37 @@ class IdentificationService:
         plant = None
         run = None
         try:
+            monitor = (self._monitor()
+                       if mode in ("hardware", OPTIMAL_MODE) else None)
+            plan = self._optimal_plan() if mode == OPTIMAL_MODE else self.plan
+            reused = None
+            if mode == OPTIMAL_MODE and self._options.get("reuse_friction"):
+                folder = self._latest_optimal_friction(plan)
+                if folder is None:
+                    raise RuntimeError(
+                        "no compatible completed optimal low-speed phase found")
+                reused = self._read_optimal_friction(folder)
             plant = self._build_plant(mode)
-            run = campaign_module.Campaign(
-                self.arm, plant, self.plan,
+            setter = getattr(plant, "set_monitor", None)
+            if setter is not None and monitor is not None:
+                setter(monitor)
+            run_type = (campaign_module.OptimalExcitationCampaign
+                        if mode == OPTIMAL_MODE else campaign_module.Campaign)
+            run = run_type(
+                self.arm, plant, plan,
                 progress=self._on_progress,
                 should_stop=self._abort.is_set,
-                monitor=self._monitor())
+                monitor=monitor)
+            if reused is not None:
+                records, folder, phase = reused
+                run.reuse_low_speed_friction(records, str(folder), phase)
+                self.note(f"reusing {len(records)} low-speed observations "
+                          f"from {folder}")
             self.progress = {"mode": mode, "phase": "starting"}
             result = run.run()
+            if mode == OPTIMAL_MODE:
+                result.comparison = self._compare_with_load_sweep(
+                    result, run.observations)
             self._finish(mode, result, run.observations,
                          getattr(plant, "raw_frames", None))
         except Exception as error:  # noqa: BLE001 - a crash must not be silent
@@ -526,6 +621,180 @@ class IdentificationService:
             with self._lock:
                 self._state = IDLE
                 self._activity = ""
+
+    def _optimal_plan(self):
+        """Apply the small set of options exposed by the optimal-run card."""
+        plan = replace(self.plan)
+        bounds = campaign_module.campaign_bounds(self.profile)
+        for name in ("optimal_training_trajectories",
+                     "optimal_validation_trajectories",
+                     "optimal_friction_repeats",
+                     "optimal_friction_postures",
+                     "fourier_base_frequency_hz",
+                     "fourier_duration_s"):
+            if name not in self._options:
+                continue
+            low, high = bounds[name]
+            try:
+                value = float(self._options[name])
+            except (TypeError, ValueError):
+                self.note(f"ignoring optimal excitation option "
+                          f"{name}={self._options[name]!r}")
+                continue
+            bounded = min(max(value, low), high)
+            if bounded != value:
+                self.note(f"{name} {value:g} clamped to {bounded:g}")
+            setattr(plan, name, int(bounded) if name.startswith("optimal_")
+                    else float(bounded))
+        return plan
+
+    def _latest_load_sweep(self) -> Path | None:
+        root = Path(self.config.output_directory) / "load_sweep"
+        if not root.is_dir():
+            return None
+        folders = sorted(
+            (path for path in root.glob("sweep-*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime, reverse=True)
+        expected = list(self.driven_joints) or list(self.arm.joint_names)
+        for folder in folders:
+            records = folder / loadsweep_module.RECORDS_NAME
+            try:
+                if not records.is_file() or records.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            try:
+                _rows, manifest = loadsweep_report.read(folder)
+            except (OSError, ValueError, KeyError):
+                continue
+            recorded = list(manifest.get("joint_names") or [])
+            if not recorded or recorded == expected:
+                return folder
+        return None
+
+    def _latest_optimal_friction(self, plan) -> Path | None:
+        """Newest saved B phase whose design exactly matches this request."""
+        root = Path(self.config.output_directory)
+        if not root.is_dir():
+            return None
+        expected_names = list(self.driven_joints) or list(self.profile.joint_names)
+        folders = sorted(
+            (path for path in root.glob("optimal_excitation-*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime, reverse=True)
+        for folder in folders:
+            result_path = folder / report_module.RESULT_NAME
+            observations_path = folder / report_module.OBSERVATIONS_NAME
+            if not result_path.is_file() or not observations_path.is_file():
+                continue
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            saved_plan = payload.get("plan") or {}
+            if list(payload.get("joint_names") or []) != expected_names:
+                continue
+            if payload.get("action") != self.config.commands.follow_joint_trajectory_action:
+                continue
+            if payload.get("effort_source") != self.config.telemetry.signals.effort_source:
+                continue
+            if tuple(saved_plan.get("optimal_friction_speeds_deg_s") or ()) != tuple(
+                    plan.optimal_friction_speeds_deg_s):
+                continue
+            if int(saved_plan.get("optimal_friction_repeats") or 0) != int(
+                    plan.optimal_friction_repeats):
+                continue
+            if int(saved_plan.get("optimal_friction_postures") or 0) != int(
+                    plan.optimal_friction_postures):
+                continue
+            phase = next((entry for entry in payload.get("phases") or []
+                          if entry.get("phase") == campaign_module.PHASE_FRICTION),
+                         None)
+            detail = (phase or {}).get("detail") or {}
+            if (phase is None or phase.get("aborted")
+                    or int(detail.get("planned_passes") or 0) <= 0
+                    or int(detail.get("completed_passes") or 0)
+                    != int(detail.get("planned_passes") or 0)):
+                continue
+            try:
+                self._read_optimal_friction(folder)
+            except (OSError, ValueError, KeyError, StopIteration):
+                continue
+            return folder
+        return None
+
+    def _read_optimal_friction(self, folder: Path):
+        """Load fitted B-phase windows; raw source frames remain in that folder."""
+        payload = json.loads(
+            (folder / report_module.RESULT_NAME).read_text(encoding="utf-8"))
+        names = list(payload.get("joint_names") or [])
+        expected = list(self.driven_joints) or list(self.profile.joint_names)
+        if names != expected:
+            raise ValueError("saved low-speed phase names another arm")
+        phase = next(entry for entry in payload.get("phases") or []
+                     if entry.get("phase") == campaign_module.PHASE_FRICTION)
+
+        def values(row, suffix, required=True):
+            raw = [row.get(f"{name}.{suffix}", "") for name in names]
+            if any(value == "" for value in raw):
+                if required:
+                    raise ValueError(f"saved low-speed data lacks {suffix}")
+                return []
+            return [float(value) for value in raw]
+
+        records = []
+        with (folder / report_module.OBSERVATIONS_NAME).open(
+                newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("phase") != campaign_module.PHASE_FRICTION:
+                    continue
+                records.append(campaign_module.Observation(
+                    phase=campaign_module.PHASE_FRICTION,
+                    time_s=float(row.get("time_s") or 0.0),
+                    position_deg=values(row, "position_deg"),
+                    velocity_deg_s=values(row, "velocity_deg_s"),
+                    acceleration_deg_s2=values(row, "acceleration_deg_s2"),
+                    current_a=values(row, "effort"),
+                    temperature_c=values(row, "temperature_c", required=False),
+                    motion=str(row.get("motion") or ""),
+                    window_frames=int(row.get("window_frames") or 0),
+                    window_fit_rms_deg=float(
+                        row.get("window_fit_rms_deg") or 0.0)))
+        if not records:
+            raise ValueError("saved low-speed phase contains no fitted observations")
+        return records, folder, phase
+
+    def _compare_with_load_sweep(self, result, observations) -> dict:
+        if self.config.telemetry.signals.effort_source != "current":
+            return {"available": False,
+                    "reason": "load sweep baseline is in current, but this "
+                              "campaign identified another effort quantity"}
+        folder = self._latest_load_sweep()
+        if folder is None:
+            return {"available": False,
+                    "reason": "no compatible completed load sweep was found"}
+        validation = [record for record in observations
+                      if record.phase == campaign_module.PHASE_VALIDATION]
+        try:
+            sweep = loadsweep_report.score_saved_sweep(
+                folder, self.arm, validation,
+                expected_joint_names=(list(self.driven_joints)
+                                      or list(self.arm.joint_names)))
+        except (OSError, ValueError, KeyError) as error:
+            return {"available": False,
+                    "reason": f"load sweep could not be scored: {error}"}
+        comparison = _comparison(
+            result.validation_rms_a, sweep,
+            list(self.driven_joints) or list(self.arm.joint_names))
+        if comparison.get("available"):
+            self.note(
+                "optimal excitation vs load sweep: "
+                f"mean {comparison['mean_improvement_percent']:+.1f}%, "
+                f"worst {comparison['worst_improvement_percent']:+.1f}%, "
+                f"target {'met' if comparison['target_met'] else 'not met'}")
+        else:
+            self.note("optimal excitation comparison unavailable: "
+                      + comparison.get("reason", "unknown reason"))
+        return comparison
 
     def _sweep_plan(self) -> loadsweep_module.SweepPlan:
         """The requested sweep, with anything unspecified left at its default."""
@@ -604,6 +873,9 @@ class IdentificationService:
             plant = self.bridge.hardware_plant(
                 self.profile, self.scene,
                 maximum_speed_deg_s=plan.transit_speed_deg_s)
+            setter = getattr(plant, "set_monitor", None)
+            if setter is not None:
+                setter(self._monitor())
             run = LoadSweepRun(self.arm, plant, plan, designs, folder,
                                progress=self._on_progress,
                                should_stop=self._abort.is_set,
@@ -666,9 +938,23 @@ class IdentificationService:
         checking; the panel says which guards are live either way.
         """
         written = self.profile is not None and self.profile_source == "configured"
+        current = (written
+                   and self.config.telemetry.signals.effort_source == "current"
+                   and autoprofile.current_guard_active(self.profile))
         return campaign_module.DriveMonitor(
             minimum_voltage_v=self.profile.minimum_voltage_v if written else None,
-            maximum_voltage_v=self.profile.maximum_voltage_v if written else None)
+            maximum_voltage_v=self.profile.maximum_voltage_v if written else None,
+            maximum_speed_deg_s=(self.profile.peak_speed_deg_s
+                                 if self.profile is not None else None),
+            maximum_temperature_c=(self.profile.temperature_c
+                                   if self.profile is not None else None),
+            peak_current_a=(tuple(self.profile.peak_current_a)
+                            if current else ()),
+            continuous_current_a=(tuple(self.profile.continuous_current_a)
+                                  if current else ()),
+            sustained_current_window_s=(
+                self.profile.sustained_current_window_s
+                if current else 0.5))
 
     def _dark_guards(self) -> tuple[str, ...]:
         """Guards that will not fire, and why is not the operator's problem."""
@@ -726,7 +1012,8 @@ class IdentificationService:
         payload.update(self._plot_data(payload, observations,
                                        getattr(result, "fits", None)))
         aborted = payload.get("aborted")
-        recovery = {} if mode == "hardware" else self._check_recovery(payload)
+        recovery = ({} if mode in ("hardware", OPTIMAL_MODE)
+                else self._check_recovery(payload))
         if recovery:
             payload["rehearsal_check"] = recovery
         with self._lock:
@@ -737,7 +1024,7 @@ class IdentificationService:
                              "phase": "stopped" if aborted else "finished"}
             if aborted:
                 self.progress["error"] = str(aborted)
-            if mode != "hardware":
+            if mode not in ("hardware", OPTIMAL_MODE):
                 self.rehearsal_passed = (bool(payload.get("complete"))
                                          and bool(recovery.get("passed")))
         self._write(payload, mode, observations, raw_frames)
@@ -765,12 +1052,24 @@ class IdentificationService:
         from many poses at low speed, and reading a speed trend across the two
         groups measures the pose difference as much as the speed difference.
         The flag is omitted when false to keep the polled payload small.
+
+        Rows where the joint is standing still are left out. Friction has no
+        determined sign at rest, so those rows say only where the servo
+        settled inside the stiction band, and drawn against speed they pile
+        into a vertical band at zero that looks like a low-speed peak.
         """
         joints = payload.get("joints") or []
         if not joints or not observations or self.arm is None:
             return {}
+        acceleration_ceiling = (payload.get("data_quality") or {}).get(
+            "acceleration_exclusion_deg_s2")
         moving = [record for record in observations
-                  if getattr(record, "phase", "") != "D_validation"]
+                  if getattr(record, "phase", "") != "D_validation"
+                  and (acceleration_ceiling is None
+                       or not record.acceleration_deg_s2
+                       or max(abs(value) for value
+                              in record.acceleration_deg_s2)
+                       <= acceleration_ceiling)]
         if not moving:
             return {}
         stride = max(1, len(moving) // MAX_PLOT_POINTS)
@@ -788,13 +1087,17 @@ class IdentificationService:
             for record in thinned]
 
         friction, residual = [], []
+        standstill = []
         for index, fit in enumerate(fits):
-            curve, errors = [], []
+            curve, errors, still = [], [], 0
             for record, regressor in zip(thinned, regressors):
                 try:
                     speed = float(record.velocity_deg_s[index])
                     measured = float(record.current_a[index])
                 except (AttributeError, IndexError, TypeError):
+                    continue
+                if abs(speed) < STILL_SPEED_DEG_S or _parked_here(record, index):
+                    still += 1
                     continue
                 acceleration = 0.0
                 if record.acceleration_deg_s2 is not None and index < len(
@@ -805,11 +1108,11 @@ class IdentificationService:
                     acceleration=acceleration)
                 whole = ident.predict_joint(
                     fit, regressor, speed, acceleration=acceleration)
-                point = {"speed": round(speed, 3),
-                         "effort": round(measured - rigid, 4),
-                         "load": round(rigid, 4)}
-                error = {"speed": round(speed, 3),
-                         "residual": round(measured - whole, 4)}
+                point = {"speed": round(speed, 6),
+                         "effort": round(measured - rigid, 6),
+                         "load": round(rigid, 6)}
+                error = {"speed": round(speed, 6),
+                         "residual": round(measured - whole, 6)}
                 if _swept_here(record, index):
                     point["sweep"] = True
                     error["sweep"] = True
@@ -817,10 +1120,13 @@ class IdentificationService:
                 errors.append(error)
             friction.append(curve)
             residual.append(errors)
-        return {"friction_samples": friction, "residual_samples": residual}
+            standstill.append(still)
+        return {"friction_samples": friction, "residual_samples": residual,
+                "friction_standstill_excluded": standstill,
+                "friction_standstill_speed_deg_s": STILL_SPEED_DEG_S}
 
     def _build_plant(self, mode: str):
-        if mode == "hardware":
+        if mode in ("hardware", OPTIMAL_MODE):
             if self.bridge is None:
                 raise RuntimeError("no ROS bridge; cannot drive hardware")
             return self.bridge.hardware_plant(self.profile, self.scene)
@@ -938,6 +1244,7 @@ class IdentificationService:
                 "profile_source": self.profile_source,
                 "current_guard": (
                     self.profile is not None
+                    and self.config.telemetry.signals.effort_source == "current"
                     and autoprofile.current_guard_active(self.profile)),
                 "driven_joints": list(self.driven_joints),
                 "reach_deg": ([round(v, 1) for v in self.plan.design_limits(

@@ -90,13 +90,17 @@ class StubMonitor:
     def __init__(self, limits):
         self.limits = limits
         self.checked = 0
+        self.last_trip = None
 
     def check(self, sample, now):
         self.checked += 1
         for index, value in enumerate(sample["current_a"]):
             if abs(value) > self.limits.peak_current_a[index]:
-                return (f"joint{index + 1} peak current {abs(value):.2f} A "
-                        f"exceeded {self.limits.peak_current_a[index]:.2f} A")
+                message = (f"joint{index + 1} peak current {abs(value):.2f} A "
+                           f"exceeded {self.limits.peak_current_a[index]:.2f} A")
+                self.last_trip = {"joint": index, "kind": "peak_current",
+                                  "message": message}
+                return message
         return None
 
 
@@ -125,6 +129,29 @@ class PlanTest(unittest.TestCase):
         payload = small_plan().as_dict()
         self.assertEqual(payload["static_poses"], 6)
         self.assertIsInstance(payload["friction_speeds_deg_s"], list)
+
+    def test_the_friction_ladder_reaches_below_the_old_tenth_degree_floor(self):
+        # A Stribeck peak lives in the decade under the speed where sliding
+        # takes over. Sampling 0.1 to 2 deg/s only asks about the top of it,
+        # and a ladder spaced by equal steps spends its rungs where the curve
+        # is already flat.
+        speeds = campaign.CampaignPlan().optimal_friction_speeds_deg_s
+        self.assertLess(min(speeds), 0.1)
+        ratios = [b / a for a, b in zip(speeds, speeds[1:])]
+        self.assertTrue(all(ratio >= 1.8 for ratio in ratios), speeds)
+
+    def test_a_crawling_pass_still_covers_an_arc_that_can_be_measured(self):
+        # Sized by time alone, a 0.02 deg/s pass travels 0.08 deg, which is
+        # too little arc to fit a speed out of. Travel is what has to be held.
+        for speed in (0.02, 0.05, 0.1):
+            self.assertGreaterEqual(
+                campaign.pass_amplitude_deg(speed, 30.0),
+                campaign.FRICTION_MINIMUM_ARC_DEG - 1e-9, speed)
+        self.assertLessEqual(campaign.friction_cruise_s(0.001),
+                             campaign.FRICTION_CRAWL_CRUISE_S)
+        # Nothing above the crawl range moves.
+        self.assertEqual(campaign.friction_cruise_s(60.0),
+                        campaign.FRICTION_CRUISE_S)
 
 
 class PhaseBookkeepingTest(unittest.TestCase):
@@ -198,6 +225,326 @@ class PhaseBookkeepingTest(unittest.TestCase):
         peak = max(max(np.abs(r.acceleration_deg_s2))
                    for r in self.campaign.observations)
         self.assertGreater(peak, 0.0)
+
+
+class TripRecoveryTest(unittest.TestCase):
+    """A drive trip is one trajectory's problem, not the whole run's."""
+
+    class TrippingPlant(ScriptedPlant):
+        """Draws too much current on one joint until its swing is reduced."""
+
+        def __init__(self, joint=6, ceiling_deg=8.0, **kwargs):
+            super().__init__(**kwargs)
+            self.joint = joint
+            self.ceiling_deg = ceiling_deg
+            self.tracked = 0
+            self.monitor_resets = 0
+
+        def set_monitor(self, monitor):
+            self.monitor_resets += 1
+
+        def track(self, trajectory, rate_hz):
+            self.tracked += 1
+            swing = max(
+                abs(float(trajectory.sample(step * 0.1)[0][self.joint]))
+                for step in range(5))
+            for step in range(5):
+                position, velocity, acceleration = trajectory.sample(step * 0.1)
+                frame = self._frame(position, velocity)
+                frame["acceleration_deg_s2"] = acceleration.tolist()
+                frame["current_a"] = list(frame["current_a"])
+                if swing > self.ceiling_deg:
+                    frame["current_a"][self.joint] = 99.0
+                yield frame
+
+    def plan(self, **overrides):
+        values = dict(
+            optimal_training_trajectories=3,
+            optimal_validation_trajectories=1,
+            optimal_friction_speeds_deg_s=(0.5,),
+            optimal_friction_repeats=1,
+            optimal_friction_postures=1,
+            fourier_attempts=8)
+        values.update(overrides)
+        return small_plan(**values)
+
+    def test_an_over_current_trip_does_not_end_the_run(self):
+        # Losing the validation phase to one trajectory's swing throws away
+        # every hour already spent, which is what the trip was meant to avoid.
+        plant = self.TrippingPlant()
+        run = campaign.OptimalExcitationCampaign(
+            arm_model(), plant, self.plan(),
+            monitor=StubMonitor(StubLimits(peak=5.0)))
+
+        result = run.run()
+
+        self.assertIsNone(result.aborted)
+        phases = [report.phase for report in run.reports]
+        self.assertIn(campaign.PHASE_VALIDATION, phases)
+
+    def test_the_tripping_joint_is_backed_off_and_the_motion_retried(self):
+        plant = self.TrippingPlant()
+        run = campaign.OptimalExcitationCampaign(
+            arm_model(), plant, self.plan(),
+            monitor=StubMonitor(StubLimits(peak=5.0)))
+
+        run.run()
+
+        # Retried rather than abandoned: more attempts than trajectories.
+        self.assertGreater(plant.tracked, 4)
+        self.assertGreater(plant.monitor_resets, 0)
+        self.assertLess(run.joint_amplitude_scale[plant.joint], 1.0)
+        self.assertTrue(any(entry.get("reason", "").startswith("drive trip")
+                            for entry in run.skipped), run.skipped)
+
+    def test_a_drive_that_trips_on_everything_still_stops_the_run(self):
+        # Backing off forever is not persistence, it is a machine refusing to
+        # move while the report fills up with retries.
+        plant = self.TrippingPlant(ceiling_deg=0.0)
+        run = campaign.OptimalExcitationCampaign(
+            arm_model(), plant, self.plan(skip_budget=4),
+            monitor=StubMonitor(StubLimits(peak=5.0)))
+
+        result = run.run()
+
+        self.assertIsNotNone(result.aborted)
+
+    def test_a_faulted_drive_is_not_retried(self):
+        # An amplitude cannot answer a fault word or a disabled drive.
+        trip = campaign.DriveTrip("joint3 reports fault code 12", joint=2,
+                                  kind="fault")
+        self.assertFalse(trip.recoverable)
+        self.assertTrue(campaign.DriveTrip(
+            "joint7 peak current 0.884 A exceeded 0.800 A", joint=6,
+            kind="peak_current").recoverable)
+
+
+class OptimalExcitationCampaignTest(unittest.TestCase):
+    def test_low_speed_rows_do_not_refit_the_dynamic_predictor(self):
+        plan = small_plan(
+            optimal_training_trajectories=2,
+            optimal_validation_trajectories=1,
+            optimal_friction_speeds_deg_s=(0.5,),
+            optimal_friction_repeats=1,
+            optimal_friction_postures=1,
+            fourier_attempts=8)
+        run = campaign.OptimalExcitationCampaign(
+            arm_model(), ScriptedPlant(), plan)
+        run.run()
+
+        result = run.fit()
+        inertia = [record for record in run.observations
+                   if record.phase == campaign.PHASE_INERTIA]
+        friction = [record for record in run.observations
+                    if record.phase == campaign.PHASE_FRICTION]
+
+        self.assertTrue(friction)
+        self.assertTrue(all(entry["samples"] == len(inertia)
+                            for entry in result.joints))
+        self.assertEqual(
+            result.data_quality["auxiliary_friction_observations"],
+            len(friction))
+        self.assertEqual(
+            result.data_quality["main_training_observations"], len(inertia))
+        self.assertTrue(result.steady_friction_audit["available"])
+        self.assertFalse(
+            result.steady_friction_audit["used_by_dynamic_fit"])
+        self.assertEqual(
+            result.steady_friction_audit["observations"], len(friction))
+
+    def test_controlled_steady_curve_rejects_a_monotonic_scatter_peak(self):
+        summary = campaign._steady_curve_summary([
+            (0.1, 0.05), (0.2, 0.09), (0.35, 0.13), (0.5, 0.17),
+            (0.75, 0.21), (1.0, 0.24), (1.5, 0.27), (2.0, 0.29),
+        ])
+        self.assertFalse(summary["classical_low_speed_peak"])
+        self.assertLess(summary["low_speed_peak_a"], 0.0)
+
+    def test_controlled_steady_curve_detects_a_real_low_speed_peak(self):
+        summary = campaign._steady_curve_summary([
+            (0.1, 0.35), (0.2, 0.32), (0.35, 0.28), (0.5, 0.25),
+            (0.75, 0.22), (1.0, 0.21), (1.5, 0.20), (2.0, 0.20),
+        ])
+        self.assertTrue(summary["classical_low_speed_peak"])
+        self.assertGreater(summary["low_speed_peak_a"], 0.1)
+
+    def test_reused_low_speed_phase_skips_every_traverse(self):
+        plan = small_plan(
+            optimal_training_trajectories=2,
+            optimal_validation_trajectories=1,
+            optimal_friction_speeds_deg_s=(0.5,),
+            optimal_friction_repeats=1,
+            optimal_friction_postures=1,
+            fourier_attempts=8)
+        plant = ScriptedPlant()
+        run = campaign.OptimalExcitationCampaign(arm_model(), plant, plan)
+        reused = campaign.Observation(
+            phase=campaign.PHASE_FRICTION, time_s=1.0,
+            position_deg=[0.0] * 7, velocity_deg_s=[0.5] * 7,
+            acceleration_deg_s2=[0.0] * 7, current_a=[0.1] * 7,
+            temperature_c=[35.0] * 7,
+            motion="optimal_friction:j0:0.5:+:s1:r1")
+        source = {
+            "observations": 1,
+            "duration_s": 12.0,
+            "peak_temperature_c": 35.0,
+            "peak_speed_deg_s": 0.5,
+            "peak_current_a": 0.1,
+            "detail": {"planned_passes": 1, "completed_passes": 1},
+        }
+        run.reuse_low_speed_friction(
+            [reused], "optimal_excitation-source", source)
+
+        result = run.run()
+
+        self.assertIsNone(result.aborted)
+        self.assertNotIn("traverse", plant.calls)
+        self.assertEqual([entry["phase"] for entry in result.phases], [
+            campaign.PHASE_FRICTION,
+            campaign.PHASE_INERTIA,
+            campaign.PHASE_VALIDATION,
+        ])
+        self.assertEqual(
+            result.phases[0]["detail"]["reused_from"],
+            "optimal_excitation-source")
+        self.assertEqual(result.phases[0]["observations"], 1)
+
+    def test_fourier_execution_uses_a_zero_velocity_ramp(self):
+        class CapturingPlant(ScriptedPlant):
+            def __init__(self):
+                super().__init__()
+                self.trajectories = []
+
+            def track(self, trajectory, rate_hz):
+                self.trajectories.append(trajectory)
+                yield from super().track(trajectory, rate_hz)
+
+        plan = small_plan(
+            optimal_training_trajectories=2,
+            optimal_validation_trajectories=1,
+            optimal_friction_speeds_deg_s=(0.5,),
+            optimal_friction_repeats=1,
+            optimal_friction_postures=1,
+            fourier_duration_s=8.0,
+            fourier_ramp_s=4.0,
+            fourier_attempts=8)
+        plant = CapturingPlant()
+        run = campaign.OptimalExcitationCampaign(arm_model(), plant, plan)
+
+        report = run.run_training()
+
+        self.assertIsNone(report.aborted)
+        self.assertEqual(len(plant.trajectories), 2)
+        for trajectory in plant.trajectories:
+            self.assertEqual(trajectory.duration_s, 10.0)
+            np.testing.assert_allclose(
+                trajectory.sample(0.0)[1], np.zeros(7))
+            np.testing.assert_allclose(
+                trajectory.sample(trajectory.duration_s)[1], np.zeros(7),
+                atol=1e-12)
+
+    def test_low_speed_load_trajectories_are_grouped_training_data(self):
+        plan = small_plan(
+            optimal_training_trajectories=2,
+            optimal_validation_trajectories=1,
+            optimal_friction_speeds_deg_s=(0.1, 0.5, 2.0),
+            optimal_friction_repeats=2,
+            optimal_friction_postures=1,
+            fourier_attempts=8)
+        plant = ScriptedPlant()
+        run = campaign.OptimalExcitationCampaign(arm_model(), plant, plan)
+
+        result = run.run()
+
+        self.assertIsNone(result.aborted)
+        self.assertEqual([entry["phase"] for entry in result.phases], [
+            campaign.PHASE_FRICTION,
+            campaign.PHASE_INERTIA,
+            campaign.PHASE_VALIDATION,
+        ])
+        friction = [record for record in run.observations
+                    if record.phase == campaign.PHASE_FRICTION]
+        self.assertTrue(friction)
+        self.assertIn("traverse", plant.calls)
+        self.assertTrue(all(record.motion.startswith("optimal_friction:")
+                            for record in friction))
+        self.assertEqual(
+            {round(abs(record.velocity_deg_s[int(
+                record.motion.split(":")[1][1:])]), 1)
+             for record in friction},
+            {0.1, 0.5, 2.0})
+        groups = {record.motion for record in friction}
+        self.assertEqual(len(groups), 7 * 3 * 2 * 2)
+
+    def test_training_uses_low_speed_and_fourier_with_distinct_validation(self):
+        plan = small_plan(
+            optimal_training_trajectories=3,
+            optimal_validation_trajectories=2,
+            optimal_friction_speeds_deg_s=(0.5,),
+            optimal_friction_repeats=1,
+            optimal_friction_postures=1,
+            fourier_attempts=8)
+        plant = ScriptedPlant()
+        run = campaign.OptimalExcitationCampaign(arm_model(), plant, plan)
+        result = run.run()
+
+        self.assertIsNone(result.aborted)
+        self.assertEqual([entry["phase"] for entry in result.phases],
+                         [campaign.PHASE_FRICTION,
+                          campaign.PHASE_INERTIA,
+                          campaign.PHASE_VALIDATION])
+        self.assertNotIn("hold", plant.calls)
+        self.assertIn("traverse", plant.calls)
+        self.assertEqual(plant.calls.count("track"), 5)
+        training = [record for record in run.observations
+                    if record.phase == campaign.PHASE_INERTIA]
+        validation = [record for record in run.observations
+                      if record.phase == campaign.PHASE_VALIDATION]
+        self.assertEqual(len(training), 15)
+        self.assertEqual(len(validation), 10)
+        self.assertEqual(result.validation_samples, 10)
+
+    def test_implausible_measured_acceleration_is_recorded_but_not_fitted(self):
+        plan = small_plan(
+            optimal_training_trajectories=3,
+            optimal_validation_trajectories=2,
+            optimal_friction_speeds_deg_s=(0.5,),
+            optimal_friction_repeats=1,
+            optimal_friction_postures=1,
+            fourier_attempts=8)
+        run = campaign.OptimalExcitationCampaign(
+            arm_model(), ScriptedPlant(), plan)
+        run.run()
+        training = [record for record in run.observations
+                    if record.phase == campaign.PHASE_INERTIA]
+        training[0].acceleration_deg_s2[0] = (
+            2.1 * run.limits.maximum_acceleration_deg_s2)
+
+        result = run.fit()
+        usable_training = [
+            record for record in run.observations
+            if record.phase == campaign.PHASE_INERTIA
+            and record is not training[0]]
+        expected_groups = {
+            f"{record.phase}:{record.motion or 'untagged'}"
+            for record in usable_training}
+
+        self.assertIn(training[0], run.observations)
+        self.assertEqual(
+            result.data_quality["excluded_acceleration_outliers"], 1)
+        self.assertEqual(
+            result.data_quality["observations_recorded"],
+            len(run.observations))
+        self.assertEqual(
+            result.data_quality["observations_used"],
+            len(run.observations) - 1)
+        self.assertEqual(
+            result.data_quality["optional_selection_groups"],
+            len(expected_groups))
+        self.assertTrue(all(entry["samples"] == len(usable_training)
+                            for entry in result.joints))
+        self.assertTrue(all(entry["peak_measured_effort"] >= 0.0
+                    for entry in result.joints))
 
 
 class RefusedMotionsTest(unittest.TestCase):
@@ -401,6 +748,53 @@ class MonitorTest(unittest.TestCase):
         plant = ScriptedPlant(current_a=0.1, instrumented=True)
         campaign.Campaign(self.arm, plant, small_plan(), monitor=monitor).run()
         self.assertGreater(monitor.checked, 0)
+
+    def test_peak_current_trips_immediately(self):
+        monitor = campaign.DriveMonitor(
+            peak_current_a=(2.0, 3.0), continuous_current_a=(1.0, 1.5))
+        trip = monitor.check({"current_a": [1.0, 3.1]}, 0.0)
+        self.assertIn("joint2 peak current", trip)
+
+    def test_continuous_current_only_trips_after_its_window(self):
+        monitor = campaign.DriveMonitor(
+            peak_current_a=(3.0,), continuous_current_a=(1.0,),
+            sustained_current_window_s=0.5)
+        self.assertIsNone(monitor.check({"current_a": [1.2]}, 10.0))
+        self.assertIsNone(monitor.check({"current_a": [1.2]}, 10.49))
+        self.assertIn(
+            "continuous current",
+            monitor.check({"current_a": [1.2]}, 10.51))
+
+    def test_continuous_current_timer_resets_below_the_limit(self):
+        monitor = campaign.DriveMonitor(
+            peak_current_a=(3.0,), continuous_current_a=(1.0,),
+            sustained_current_window_s=0.5)
+        self.assertIsNone(monitor.check({"current_a": [1.2]}, 1.0))
+        self.assertIsNone(monitor.check({"current_a": [0.8]}, 1.4))
+        self.assertIsNone(monitor.check({"current_a": [1.2]}, 1.6))
+        self.assertIsNone(monitor.check({"current_a": [1.2]}, 2.0))
+
+    def test_position_rate_trips_the_speed_ceiling(self):
+        monitor = campaign.DriveMonitor(maximum_speed_deg_s=60.0)
+        trip = monitor.check({
+            "speed_deg_s": [8.0],
+            "safety_speed_deg_s": [61.0],
+        }, 0.0)
+        self.assertIn("position-derived speed", trip)
+        self.assertIn("61.0", trip)
+
+    def test_quantized_drive_velocity_does_not_trip_the_position_rate_guard(self):
+        monitor = campaign.DriveMonitor(maximum_speed_deg_s=60.0)
+        self.assertIsNone(monitor.check({
+            "speed_deg_s": [80.0],
+            "safety_speed_deg_s": [0.2],
+        }, 0.0))
+
+    def test_temperature_trips_on_a_raw_frame(self):
+        monitor = campaign.DriveMonitor(maximum_temperature_c=40.0)
+        trip = monitor.check({"temperature_c": [39.0, 40.1]}, 0.0)
+        self.assertIn("joint2 temperature", trip)
+        self.assertIn("40.1", trip)
 
     def test_pose_admission_hook_filters_the_design(self):
         rejected = []

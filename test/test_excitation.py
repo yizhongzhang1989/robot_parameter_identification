@@ -237,6 +237,71 @@ class MultiPostureSweepTest(unittest.TestCase):
             span = loads.max(axis=0) - loads.min(axis=0)
             self.assertGreater(span.max(), 0.0, f"joint {joint} never moved")
 
+    def test_postures_reach_the_heaviest_load_the_workspace_allows(self):
+        """Spreading is not the same as reaching. Friction rises with the load
+        pressing the surfaces together, so a run that spreads three postures
+        across the light end describes only the light end."""
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=CLEAR, seed=5)
+        low, high = self.limits.usable()
+        rng = np.random.default_rng(11)
+        for joint in range(self.arm.joint_count):
+            here = [s for s in sweeps if s.joint == joint]
+            if not here:
+                continue
+            centre = (here[0].start_deg[joint] + here[0].amplitude_deg / 2.0)
+            poses = rng.uniform(low, high, size=(400, self.arm.joint_count))
+            poses[:, joint] = centre
+            reachable = max(abs(self.arm.joint_loads(pose)[joint][0])
+                            for pose in poses)
+            if reachable < 1e-6:
+                continue        # gravity cannot load this joint in any pose
+            heaviest = max(abs(s.load[0]) for s in here)
+            self.assertGreater(heaviest, 0.7 * reachable,
+                               f"joint {joint}: {heaviest} of {reachable}")
+
+    def test_the_heaviest_candidate_is_kept_even_when_spread_would_drop_it(self):
+        # Two postures extreme in the lesser terms win the farthest-point
+        # distance, and the one carrying five times the axial torque -- the
+        # load the motor actually works against -- goes unswept.
+        loads = np.array([
+            [0.0, 0.0, 0.0, 0.0],       # home
+            [5.0, 0.0, 0.0, 0.0],       # heaviest axial torque
+            [0.5, 10.0, 0.0, 0.0],
+            [0.4, 0.0, 10.0, 0.0],
+        ])
+        chosen = excitation._choose_by_load(loads, 3)
+        self.assertIn(1, chosen)
+        # A middle rung is what tells a straight load line from a curve.
+        picked = sorted(abs(loads[index][0]) for index in chosen)
+        self.assertLess(picked[1], 0.9 * picked[2])
+        self.assertGreater(picked[1], picked[0])
+
+    def test_a_joint_gravity_cannot_load_still_gets_spread_postures(self):
+        # Joint seven carries no axial torque in any pose, so ranking on it
+        # would pick arbitrarily; the terms that do move have to decide.
+        loads = np.array([
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0, 0.0],
+            [0.0, 1.2, 0.0, 0.0],
+        ])
+        chosen = excitation._choose_by_load(loads, 2)
+        self.assertEqual(sorted(chosen), [0, 1])
+
+    def test_the_swept_joint_may_be_centred_away_from_home(self):
+        # The joint's own angle is part of the load on it, so a centre pinned
+        # at home caps how heavily it can ever be measured.
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=20.0, speeds_deg_s=(5.0,),
+            postures=3, collision_free=CLEAR, seed=3)
+        centres = {}
+        for sweep in sweeps:
+            centres.setdefault(sweep.joint, set()).add(round(
+                sweep.start_deg[sweep.joint] + sweep.amplitude_deg / 2.0, 6))
+        self.assertTrue(any(len(seen) > 1 for seen in centres.values()),
+                        centres)
+
 
 class JointLoadTest(unittest.TestCase):
     """What a joint carries is four numbers, and they do not move together."""
@@ -311,6 +376,106 @@ class FourierDesignTest(unittest.TestCase):
             self.arm, self.limits, harmonics=2, duration_s=5.0, attempts=5,
             seed=6, collision_free=lambda _pose: False)
         self.assertIsNone(trajectory)
+
+    def test_random_centres_explore_more_than_neutral(self):
+        trajectory = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, duration_s=5.0, attempts=12,
+            seed=8, randomize_centre=True)
+        self.assertIsNotNone(trajectory)
+        self.assertGreater(np.max(np.abs(trajectory.centre_deg)), 1.0)
+
+    def test_transit_to_trajectory_start_is_collision_screened(self):
+        def wall(pose):
+            return not 20.0 <= float(pose[0]) <= 40.0
+
+        centre = np.zeros(self.arm.joint_count)
+        centre[0] = 70.0
+        without_transit = excitation.design_fourier_trajectory(
+            self.arm, self.limits, centre_deg=centre, harmonics=1,
+            duration_s=5.0, attempts=12, seed=9, collision_free=wall)
+        with_transit = excitation.design_fourier_trajectory(
+            self.arm, self.limits, centre_deg=centre, harmonics=1,
+            duration_s=5.0, attempts=12, seed=9, collision_free=wall,
+            start_deg=np.zeros(self.arm.joint_count))
+        self.assertIsNotNone(without_transit)
+        self.assertIsNone(with_transit)
+
+    def test_higher_amplitude_floor_strengthens_the_same_candidate(self):
+        gentle = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, base_frequency_hz=0.1,
+            duration_s=10.0, attempts=1, seed=12,
+            minimum_amplitude_fraction=0.2)
+        stronger = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, base_frequency_hz=0.1,
+            duration_s=10.0, attempts=1, seed=12,
+            minimum_amplitude_fraction=0.45)
+
+        self.assertIsNotNone(gentle)
+        self.assertIsNotNone(stronger)
+        self.assertTrue(np.all(
+            np.asarray(stronger.amplitudes_deg)
+            >= np.asarray(gentle.amplitudes_deg)))
+        self.assertGreater(
+            np.linalg.norm(stronger.amplitudes_deg),
+            np.linalg.norm(gentle.amplitudes_deg))
+
+    def test_joint_backoff_scales_amplitude_without_shrinking_the_workspace(self):
+        normal = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, base_frequency_hz=0.1,
+            duration_s=10.0, attempts=1, seed=14)
+        scale = np.ones(self.arm.joint_count)
+        scale[-1] = 0.25
+        backed_off = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, base_frequency_hz=0.1,
+            duration_s=10.0, attempts=1, seed=14,
+            joint_amplitude_scale=scale)
+
+        self.assertIsNotNone(normal)
+        self.assertIsNotNone(backed_off)
+        before = np.asarray(normal.amplitudes_deg)
+        after = np.asarray(backed_off.amplitudes_deg)
+        np.testing.assert_allclose(after[:, :-1], before[:, :-1])
+        np.testing.assert_allclose(after[:, -1], 0.25 * before[:, -1])
+        np.testing.assert_allclose(backed_off.centre_deg, normal.centre_deg)
+
+    def test_amplitude_floor_must_be_a_fraction(self):
+        with self.assertRaises(ValueError):
+            excitation.design_fourier_trajectory(
+                self.arm, self.limits, minimum_amplitude_fraction=1.1)
+
+    def test_time_scaling_starts_and_ends_at_rest(self):
+        base = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, base_frequency_hz=0.1,
+            duration_s=10.0, attempts=1, seed=2)
+        ramped = excitation.ramp_fourier_trajectory(base, ramp_s=4.0)
+
+        start = ramped.sample(0.0)
+        finish = ramped.sample(ramped.duration_s)
+
+        np.testing.assert_allclose(start[0], base.sample(0.0)[0])
+        np.testing.assert_allclose(finish[0], base.sample(base.duration_s)[0])
+        np.testing.assert_allclose(start[1], np.zeros(self.arm.joint_count))
+        np.testing.assert_allclose(start[2], np.zeros(self.arm.joint_count))
+        np.testing.assert_allclose(finish[1], np.zeros(self.arm.joint_count),
+                                   atol=1e-12)
+        np.testing.assert_allclose(finish[2], np.zeros(self.arm.joint_count),
+                                   atol=1e-12)
+        self.assertEqual(ramped.duration_s, 12.5)
+
+    def test_time_scaled_derivatives_match_the_position_path(self):
+        base = excitation.design_fourier_trajectory(
+            self.arm, self.limits, harmonics=2, base_frequency_hz=0.1,
+            duration_s=10.0, attempts=1, seed=3)
+        ramped = excitation.ramp_fourier_trajectory(base, ramp_s=4.0)
+        step = 1e-4
+        for moment in (0.5, 3.5, 5.0, 10.5, 13.5):
+            before = ramped.sample(moment - step)[0]
+            position, velocity, _acceleration = ramped.sample(moment)
+            after = ramped.sample(moment + step)[0]
+            np.testing.assert_allclose(
+                (after - before) / (2.0 * step), velocity,
+                rtol=2e-4, atol=2e-4,
+                err_msg=f"velocity at t={moment}: {position}")
 
 
 if __name__ == "__main__":

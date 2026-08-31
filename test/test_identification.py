@@ -84,6 +84,23 @@ class TruncationTest(unittest.TestCase):
         self.assertTrue(np.isfinite(ident.stacked_condition_number(rows)))
 
 
+class SelectionFoldTest(unittest.TestCase):
+    def test_every_motion_group_stays_inside_one_fold(self):
+        groups = [f"motion-{index // 3}" for index in range(36)]
+        folds = ident._selection_folds(len(groups), seed=4, groups=groups)
+
+        self.assertEqual(sorted(np.concatenate(folds).tolist()), list(range(36)))
+        for group in set(groups):
+            rows = {index for index, value in enumerate(groups) if value == group}
+            owners = [fold for fold, indices in enumerate(folds)
+                      if rows.intersection(indices.tolist())]
+            self.assertEqual(len(owners), 1, group)
+
+    def test_group_count_must_match_rows(self):
+        with self.assertRaises(ValueError):
+            ident._selection_folds(10, seed=0, groups=["one"] * 9)
+
+
 class GeneralisationTest(unittest.TestCase):
     """The failure mode that matters: a fit that only works on its own data."""
 
@@ -317,6 +334,49 @@ class StribeckSelectionTest(unittest.TestCase):
                               components=ident.ModelComponents(),
                               maximum_condition=1e6)
         self.assertFalse(fit.components.stribeck)
+
+    def test_grouped_search_recovers_width_and_load_dependent_amplitude(self):
+        rng = np.random.default_rng(19)
+        regressors, velocities, currents, groups = [], [], [], []
+        speeds = (0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
+        for load_index, coordinate in enumerate(np.linspace(0.25, 1.5, 18)):
+            rigid_row = np.array([[coordinate, coordinate ** 2]])
+            rigid_current = 0.8 * coordinate + 0.35 * coordinate ** 2
+            for speed in speeds:
+                for direction in (-1.0, 1.0):
+                    signed_speed = direction * speed
+                    for repeat in range(2):
+                        decay = direction * np.exp(-speed / 1.0)
+                        effort = (
+                            rigid_current
+                            + 0.28 * np.tanh(signed_speed / 0.7)
+                            + 0.004 * signed_speed
+                            + (0.08 + 0.18 * abs(rigid_current)) * decay
+                            + rng.normal(0.0, 0.001))
+                        regressors.append(rigid_row)
+                        velocities.append(signed_speed)
+                        currents.append(effort)
+                        groups.append(
+                            f"load-{load_index}:speed-{speed}:"
+                            f"direction-{direction}:repeat-{repeat}")
+
+        fit = ident.fit_joint(
+            0, regressors, velocities, currents,
+            components=ident.ModelComponents(
+                coulomb_transition_deg_s=0.7,
+                stribeck_search=True,
+                load_stribeck_search=True,
+                stribeck_speed_search=(0.3, 0.6, 1.0, 1.7, 3.0)),
+            transition_rows=[True] * len(currents),
+            selection_groups=groups, holdout_fraction=0.0,
+            maximum_condition=1.0e6)
+
+        self.assertTrue(fit.components.stribeck)
+        self.assertTrue(fit.components.load_stribeck)
+        self.assertEqual(fit.components.stribeck_speed_deg_s, 1.0)
+        self.assertAlmostEqual(fit.friction["stribeck"], 0.08, delta=0.03)
+        self.assertAlmostEqual(
+            fit.friction["load_stribeck"], 0.18, delta=0.04)
 
 
 if __name__ == "__main__":

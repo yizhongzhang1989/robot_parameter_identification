@@ -39,6 +39,9 @@ class ModelComponents:
     stribeck_search: bool = False
     # Stribeck is only linear once this is fixed, so it is a setting, not a fit.
     stribeck_speed_deg_s: float = 2.0
+    # Candidate decay widths. Each candidate remains a linear fit; grouped
+    # validation chooses the width instead of asserting one for every joint.
+    stribeck_speed_search: tuple[float, ...] = ()
     # Friction that grows with transmitted load, as a gearbox's efficiency loss
     # would. Its column needs a load estimate, which is itself being fitted, so
     # this one costs an iteration.
@@ -47,6 +50,10 @@ class ModelComponents:
     # by default because every sweep used to be taken at one posture, where a
     # joint's load barely moves and the column had nothing to fit.
     load_friction_search: bool = False
+    # The static-to-dynamic excess may itself grow with transmitted load. This
+    # is a separate column from load_friction because it decays with speed.
+    load_stribeck: bool = False
+    load_stribeck_search: bool = False
 
     def column_names(self) -> tuple[str, ...]:
         names: list[str] = []
@@ -56,6 +63,8 @@ class ModelComponents:
             names.append("stribeck")
         if self.load_friction:
             names.append("load_friction")
+        if self.load_stribeck:
+            names.append("load_stribeck")
         if self.actuator_inertia:
             names.append("actuator_inertia")
         if self.offset:
@@ -75,6 +84,12 @@ class ModelComponents:
             if not np.isfinite(speed) or speed <= 0.0:
                 raise ValueError("stribeck_speed_deg_s must be positive")
             known["stribeck_speed_deg_s"] = speed
+        if "stribeck_speed_search" in known:
+            speeds = tuple(float(value) for value in
+                           known["stribeck_speed_search"] or ())
+            if any(not np.isfinite(value) or value <= 0.0 for value in speeds):
+                raise ValueError("stribeck_speed_search values must be positive")
+            known["stribeck_speed_search"] = speeds
         if "coulomb_transition_deg_s" in known:
             width = float(known["coulomb_transition_deg_s"])
             if not np.isfinite(width) or width < 0.0:
@@ -109,6 +124,9 @@ def extra_row(velocity_deg_s: float, acceleration_deg_s2: float = 0.0,
         values.append(float(np.sign(velocity_deg_s) * decay))
     if components.load_friction:
         values.append(float(np.sign(velocity_deg_s) * abs(load_a)))
+    if components.load_stribeck:
+        decay = np.exp(-abs(velocity_deg_s) / components.stribeck_speed_deg_s)
+        values.append(float(np.sign(velocity_deg_s) * decay * abs(load_a)))
     if components.actuator_inertia:
         # Reflected rotor and gearbox inertia. Without this column it is
         # absorbed into the link inertia, which then stops being a link inertia.

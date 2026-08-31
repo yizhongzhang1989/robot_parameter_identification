@@ -98,6 +98,74 @@ class ScreenTest(unittest.TestCase):
         self.assertTrue(self.plant.collision_free(np.zeros(JOINTS)))
 
 
+class RawFrameGuardTest(unittest.TestCase):
+    class Monitor:
+        last_trip = None
+
+        def check(self, sample, now):
+            if sample["current_a"][3] <= 4.0:
+                return None
+            self.last_trip = {"joint": 3, "kind": "peak_current"}
+            return "joint4 peak current"
+
+    def test_raw_frame_trip_is_latched_until_the_motion_checks_it(self):
+        plant = hardware.HardwarePlant(rm75_profile())
+        plant.set_monitor(self.Monitor())
+        over = frame()
+        over["current_a"][3] = 4.1
+
+        plant._check_monitor(over, 2.0)
+
+        with self.assertRaises(hardware.DriveLimitExceeded) as caught:
+            plant._raise_if_monitor_tripped()
+        self.assertIn("joint4 peak current", str(caught.exception))
+        self.assertEqual(caught.exception.joint, 3)
+        self.assertEqual(caught.exception.kind, "peak_current")
+
+
+class PositionRateGuardTest(unittest.TestCase):
+    def test_rate_uses_position_and_publisher_time(self):
+        plant = hardware.HardwarePlant(rm75_profile())
+        first = plant._position_speed(np.zeros(JOINTS), 10.0)
+        moved = np.zeros(JOINTS)
+        moved[2] = 0.02
+        second = plant._position_speed(moved, 10.01)
+
+        np.testing.assert_allclose(first, np.zeros(JOINTS))
+        self.assertAlmostEqual(second[2], 2.0, places=6)
+
+    def test_invalid_timestamp_gap_is_not_reported_as_motion(self):
+        plant = hardware.HardwarePlant(rm75_profile())
+        plant._position_speed(np.zeros(JOINTS), 10.0)
+        moved = np.full(JOINTS, 20.0)
+
+        repeated = plant._position_speed(moved, 10.0)
+
+        np.testing.assert_allclose(repeated, np.zeros(JOINTS))
+
+    def test_isolated_quantized_jump_is_smoothed_below_the_limit(self):
+        plant = hardware.HardwarePlant(rm75_profile())
+        values = (0.0, 0.146, 0.146, 0.452, 0.452)
+        speeds = []
+        for index, value in enumerate(values):
+            position = np.zeros(JOINTS)
+            position[3] = value
+            speeds.append(plant._position_speed(position, 10.0 + 0.005 * index))
+
+        self.assertGreater((values[3] - values[2]) / 0.005, 60.0)
+        self.assertLess(max(abs(speed[3]) for speed in speeds), 60.0)
+
+    def test_sustained_overspeed_is_detected_within_five_frames(self):
+        plant = hardware.HardwarePlant(rm75_profile())
+        found = []
+        for index in range(5):
+            position = np.zeros(JOINTS)
+            position[3] = 70.0 * 0.005 * index
+            found.append(plant._position_speed(position, 10.0 + 0.005 * index))
+
+        self.assertGreater(found[-1][3], 69.9)
+
+
 class FakeFuture:
     def __init__(self, value, spins_until_done=0):
         self._value = value
@@ -237,6 +305,50 @@ class MotionTest(unittest.TestCase):
         self.assertAlmostEqual(
             np.degrees(goal.trajectory.points[0].velocities[1]), -4.0, places=6)
 
+    def test_a_crawl_is_commanded_at_the_speed_it_was_asked_for(self):
+        # A silent floor here runs the pass at 0.1 deg/s while the tag, the
+        # plan and the report all say 0.02, which is worse than refusing it.
+        list(self.plant.traverse(2, np.zeros(JOINTS), 0.4, 0.02))
+        goal = self.plant._client.goals[-1]
+        self.assertAlmostEqual(
+            np.degrees(goal.trajectory.points[0].velocities[2]), 0.02,
+            places=6)
+
+    def test_the_window_grows_for_a_crawl_but_stays_inside_the_cruise(self):
+        ceiling = self.plant.config.window_maximum_span_s
+        self.assertLessEqual(self.plant._window_span(5.0), ceiling)
+        self.assertLessEqual(self.plant._window_span(1.0, cruise_s=4.0),
+                             ceiling)
+        crawl = self.plant._window_span(0.02, cruise_s=20.0)
+        self.assertGreater(crawl, ceiling)
+        self.assertLessEqual(crawl, 10.0)
+        # A window longer than the cruise would average the ramps back in.
+        self.assertLessEqual(self.plant._window_span(0.02, cruise_s=2.0), 1.0)
+
+    def test_crawl_produces_a_steady_position_fitted_observation(self):
+        period_s = 0.005
+        speed_deg_s = 0.1
+
+        def crawl(index):
+            position = np.zeros(JOINTS)
+            position[0] = speed_deg_s * index * period_s
+            return frame(position=position, speed=np.full(JOINTS, 8.0))
+
+        self.plant.hold_pose = lambda _pose: frame()
+        self.plant._client = FakeClient(self.result, spins_until_done=1000)
+        self.plant._rclpy = FakeRclpy(
+            self.plant, crawl, period_s=period_s)
+
+        observations = list(self.plant.traverse(
+            0, np.zeros(JOINTS), 0.4, speed_deg_s))
+
+        self.assertEqual(len(observations), 1)
+        self.assertAlmostEqual(
+            observations[0]["speed_deg_s"][0], speed_deg_s, places=6)
+        self.assertLess(
+            abs(observations[0]["acceleration_deg_s2"][0]), 1e-6)
+        self.assertGreater(observations[0]["window_frames"], 100)
+
     def test_rejected_goal_raises(self):
         class Rejecting(FakeClient):
             def send_goal_async(self, goal):
@@ -364,6 +476,21 @@ class RefusedGoalTest(unittest.TestCase):
         with self.assertRaises(hardware.MotionFailed):
             self._move()
         self.assertEqual(self.plant._client.sent, 3)
+
+    def test_a_drive_limit_goes_to_the_amplitude_backoff_without_recommanding(self):
+        calls = 0
+
+        def trip(_points, _on_frame=None):
+            nonlocal calls
+            calls += 1
+            raise hardware.DriveLimitExceeded(
+                "joint7 peak current", joint=6, kind="peak_current")
+
+        self.plant._attempt = trip
+        with self.assertRaises(hardware.DriveLimitExceeded) as caught:
+            self.plant._execute([])
+        self.assertEqual(caught.exception.joint, 6)
+        self.assertEqual(calls, 1)
 
     def test_a_faulted_arm_is_not_re_commanded(self):
         """Retrying into a fault is how a bad moment becomes a worse one."""

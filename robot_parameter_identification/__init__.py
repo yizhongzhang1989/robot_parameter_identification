@@ -25,7 +25,8 @@ from .consistency import (
     LinkVerdict, pseudo_inertia, check_link, check_parameters, summarise,
 )
 from .campaign import (
-    Campaign, CampaignPlan, CampaignResult, Observation, PhaseReport, Abort,
+    Campaign, OptimalExcitationCampaign, CampaignPlan, CampaignResult,
+    Observation, PhaseReport, Abort,
     Plant, EnvelopeMonitor, PHASES, PHASE_GRAVITY, PHASE_FRICTION,
     PHASE_INERTIA, PHASE_VALIDATION, MAXIMUM_CONDITION,
     campaign_bounds, clamp_campaign_plan, default_plan, judge_joint,
@@ -43,7 +44,8 @@ __all__ = [
     "urdf_from_xacro",
     "DesignLimits", "StaticPlan", "FourierTrajectory", "FrictionSweep",
     "design_static_poses", "design_friction_sweeps", "design_fourier_trajectory",
-    "Campaign", "CampaignPlan", "CampaignResult", "Observation", "PhaseReport",
+    "Campaign", "OptimalExcitationCampaign", "CampaignPlan", "CampaignResult",
+    "Observation", "PhaseReport",
     "Abort", "Plant", "EnvelopeMonitor", "PHASES", "PHASE_GRAVITY",
     "PHASE_FRICTION", "PHASE_INERTIA", "PHASE_VALIDATION", "MAXIMUM_CONDITION",
     "campaign_bounds", "clamp_campaign_plan", "default_plan", "judge_joint",

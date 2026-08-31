@@ -36,6 +36,26 @@ def sample_payload() -> dict:
         "complete": True,
         "aborted": None,
         "validation_samples": 40,
+        "comparison": {
+            "available": True, "target_met": True,
+            "source": "load_sweep/sweep-x",
+            "optimal_mean_validation_rms_a": 0.20,
+            "sweep_mean_validation_rms_a": 0.30,
+            "optimal_worst_validation_rms_a": 0.25,
+            "sweep_worst_validation_rms_a": 0.35,
+            "mean_improvement_percent": 33.3,
+            "worst_improvement_percent": 28.6,
+            "joints": [
+                {"name": "right_arm_joint1",
+                 "optimal_validation_rms_a": 0.18,
+                 "sweep_validation_rms_a": 0.30,
+                 "improvement_percent": 40.0, "optimal_better": True},
+                {"name": "right_arm_joint2",
+                 "optimal_validation_rms_a": 0.22,
+                 "sweep_validation_rms_a": 0.30,
+                 "improvement_percent": 26.7, "optimal_better": True},
+            ],
+        },
         "plan": {"maximum_speed_deg_s": 60.0, "seed": 0},
         "phases": [{"phase": "A_gravity", "observations": 120,
                     "duration_s": 30.0, "peak_temperature_c": 31.0,
@@ -120,6 +140,11 @@ class RunFolderTest(unittest.TestCase):
         self.assertEqual(rows[2]["right_arm_joint1.position_deg"], "2.0")
         self.assertEqual(rows[0]["phase"], "A_gravity")
 
+    def test_combined_report_names_external_raw_sources(self):
+        self.assertIn("raw_frame_sources.json", report._TEMPLATE)
+        self.assertIn("P.data_sources", report._TEMPLATE)
+        self.assertIn("files.sources", report.TEXT)
+
 
 class ReportPageTest(unittest.TestCase):
 
@@ -162,6 +187,11 @@ class ReportPageTest(unittest.TestCase):
 
     def test_the_joint_names_are_shown_not_indices(self):
         self.assertIn("right_arm_joint1", self.html)
+
+    def test_the_fair_comparison_is_in_the_saved_report(self):
+        self.assertIn("Optimal excitation vs load sweep", self.html)
+        self.assertIn("最优激励与负载扫掠对比", self.html)
+        self.assertIn("comparisonSection()", self.html)
 
 
 class ServedRunsTest(unittest.TestCase):
@@ -300,6 +330,76 @@ class ChartIdentityTest(unittest.TestCase):
         self.assertIn("pick.value = String(picked);", report._TEMPLATE)
         self.assertIn("lock.checked = locked;", report._TEMPLATE)
 
+    def test_load_and_stribeck_terms_are_drawn_with_the_fitted_shapes(self):
+        panel = (STATIC / "charts.js").read_text(encoding="utf-8")
+        for source in (report._TEMPLATE, panel):
+            self.assertIn(
+                "Math.abs(load || 0) * sign", source)
+            self.assertIn(
+                "const decay = sign * Math.exp(-Math.abs(velocity) / stribeckSpeed)", source)
+            self.assertIn(
+                "Math.abs(load || 0) * decay", source)
+            self.assertNotIn("+ carried) * rev", source)
+
+    def test_load_dependent_curves_are_drawn_as_a_cluster(self):
+        panel = (STATIC / "charts.js").read_text(encoding="utf-8")
+        self.assertIn("const LOAD_LEVEL_COUNT = 6", report._TEMPLATE)
+        self.assertIn('id="load-legend"', report._TEMPLATE)
+        self.assertIn("loadClusterIndex(s.load, loads)", report._TEMPLATE)
+        self.assertIn("curves.length > 1", report._TEMPLATE)
+        self.assertIn("curves[curves.length - 1]", report._TEMPLATE)
+        for colour in ("#2563eb", "#06b6d4", "#22c55e",
+                       "#facc15", "#f97316", "#ef4444"):
+            self.assertIn(colour, report._TEMPLATE)
+
+    def test_report_directly_lists_each_joint_numeric_formula(self):
+        self.assertIn("function frictionFormula(entry)", report._TEMPLATE)
+        self.assertIn("'L sgn(v)'", report._TEMPLATE)
+        self.assertIn("sgn(v) exp(-|v| /", report._TEMPLATE)
+        self.assertIn("L sgn(v) exp(-|v| /", report._TEMPLATE)
+        self.assertIn("formulaSection(),", report._TEMPLATE)
+        self.assertIn("formula.head", report.TEXT)
+        self.assertIn("L = |I_rigid|", report.TEXT["formula.say"]["en"])
+
+    def test_formula_diagnostics_distinguish_stribeck_and_current_peaks(self):
+        self.assertIn("function hasStribeckPeak(entry, load)", report._TEMPLATE)
+        self.assertIn("function formulaDiagnostic(entry, index)", report._TEMPLATE)
+        self.assertIn("entry.peak_measured_effort", report._TEMPLATE)
+        self.assertIn("formula.stribeck.nopeak", report.TEXT)
+        self.assertIn("formula.totalpeak", report.TEXT)
+        self.assertIn("formula.frictionpeak", report.TEXT)
+
+    def test_controlled_low_speed_audit_is_separate_from_the_formula(self):
+        self.assertIn("function steadyFrictionSection()", report._TEMPLATE)
+        self.assertIn("steadyFrictionSection(), comparisonSection()",
+                      report._TEMPLATE)
+        self.assertIn("steady.head", report.TEXT)
+        self.assertIn("do not refit the dynamic predictor",
+                      report.TEXT["steady.say"]["en"])
+        self.assertIn("visual peaks in the mixed", report.TEXT["steady.say"]["en"])
+
+    def test_the_friction_chart_overlays_the_measured_steady_curve(self):
+        # The fitted curve alone cannot settle whether a Stribeck peak was
+        # measured. Drawing the controlled steady medians on the same axes
+        # puts the measurement and the model side by side.
+        self.assertIn("function steadyOverlay(", report._TEMPLATE)
+        self.assertIn("steady_friction_audit", report._TEMPLATE)
+        self.assertIn("charts.friction.steady", report.TEXT)
+        self.assertIn("charts.friction.still", report.TEXT)
+        self.assertIn("standing still", report.TEXT["charts.friction.still"]["en"])
+        self.assertIn("stiction band", report.TEXT["charts.friction.still"]["en"])
+        self.assertIn("still-note", report._TEMPLATE)
+
+    def test_the_low_speed_range_gets_a_chart_of_its_own(self):
+        # On an axis that runs to 35 deg/s the whole steady range is a few
+        # pixels wide, so "no peak" is asserted rather than shown. The zoomed
+        # chart puts the measured medians and the fitted curve side by side
+        # over the speeds the Stribeck question is actually about.
+        self.assertIn("function drawSteady(", report._TEMPLATE)
+        self.assertIn("c-steady", report._TEMPLATE)
+        self.assertIn("charts.steadylow", report.TEXT)
+        self.assertIn("charts.steadylow.say", report.TEXT)
+
 
 class ChartLegendTest(unittest.TestCase):
     """The residual chart drew two colours and explained neither, and the
@@ -313,14 +413,14 @@ class ChartLegendTest(unittest.TestCase):
         self.assertEqual(self.section.count('<ul class="key">'), 2)
 
     def test_every_colour_the_friction_chart_draws_is_in_its_legend(self):
-        body = report._TEMPLATE.split("function drawFriction", 1)[1] \
+        body = report._TEMPLATE.split("const LOAD_LEVEL_COUNT", 1)[1] \
                                .split("function drawResidual", 1)[0]
-        drawn = {"rgba(77,163,255": "var(--accent)",   # non-sweep points
-                 "rgba(120,220,150": "var(--sweep)",   # sweep points
-                 "#e0b341": "var(--warn)"}             # fitted curve
-        for literal, swatch in drawn.items():
-            self.assertIn(literal, body)
-            self.assertIn(swatch, self.section)
+        for colour in ("#2563eb", "#06b6d4", "#22c55e",
+                       "#facc15", "#f97316", "#ef4444"):
+            self.assertIn(colour, body)
+            self.assertIn(colour, self.section)
+        self.assertIn("#f8fafc", body)
+        self.assertIn("#f8fafc", self.section)
 
     def test_every_colour_the_residual_chart_draws_is_in_its_legend(self):
         body = report._TEMPLATE.split("function drawResidual", 1)[1] \

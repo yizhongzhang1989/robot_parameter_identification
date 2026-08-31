@@ -49,7 +49,7 @@ def read(folder):
     return rows, manifest
 
 
-def split(rows):
+def split(rows, arm=None):
     """Half-difference and half-sum, per joint, level and speed rung.
 
     Anything that reverses with direction is friction; anything that does not
@@ -66,21 +66,26 @@ def split(rows):
         forward = float(np.mean([r["current_a"] for r in sides["+"]]))
         back = float(np.mean([r["current_a"] for r in sides["-"]]))
         every = sides["+"] + sides["-"]
+        signed_values = [
+          r["load"].get("axial_signed_nm", np.nan) for r in every]
+        if arm is not None and not np.isfinite(signed_values).all():
+          signed_values = [
+            float(arm.inverse_dynamics(r["pose_deg"])[joint])
+            for r in every]
         table.append({
             "joint": joint, "level": level, "speed": speed,
             "friction": (forward - back) / 2.0,
             "gravity": (forward + back) / 2.0,
             "load": float(np.mean([r["load"]["axial_nm"] for r in every])),
-            "signed": float(np.mean(
-                [r["load"].get("axial_signed_nm", np.nan) for r in every])),
+            "signed": float(np.mean(signed_values)),
             "temperature": float(np.mean([r["temperature_c"] for r in every])),
             "passes": len(every),
         })
     return table
 
 
-def torque_constant(table, joint: int) -> tuple[float, float]:
-    """Amperes per newton metre for this joint, and how well it is determined.
+def torque_calibration(table, joint: int) -> dict:
+    """Signed effort gain, zero offset and how well they are determined.
 
     From the half-sum, which is the current spent holding gravity rather than
     fighting friction. Free, because the sweep already drove both directions at
@@ -97,21 +102,34 @@ def torque_constant(table, joint: int) -> tuple[float, float]:
     """
     mine = [r for r in table if r["joint"] == joint]
     if len(mine) < 4:
-        return float("nan"), float("nan")
+        return {"gain": float("nan"), "offset": float("nan"),
+                "fitness": float("nan"), "signed": False}
     hold = np.array([r["gravity"] for r in mine])
     signed = np.array([r.get("signed", np.nan) for r in mine])
     if np.isfinite(signed).all() and signed.std() > 1e-6:
         torque = signed
+        has_sign = True
     else:
         torque, hold = np.array([r["load"] for r in mine]), np.abs(hold)
+        has_sign = False
     if torque.std() < 1e-4 or hold.std() < 1e-6:
-        return float("nan"), float("nan")
+        return {"gain": float("nan"), "offset": float("nan"),
+                "fitness": float("nan"), "signed": has_sign}
     fitness = float(np.corrcoef(torque, hold)[0, 1])
     # A joint whose gravity current does not track its gravity torque has not
     # been calibrated by this, whatever number least squares returns.
     if not np.isfinite(fitness) or abs(fitness) < 0.95:
-        return float("nan"), fitness
-    return abs(float(np.polyfit(torque, hold, 1)[0])), fitness
+        return {"gain": float("nan"), "offset": float("nan"),
+                "fitness": fitness, "signed": has_sign}
+    gain, offset = np.polyfit(torque, hold, 1)
+    return {"gain": float(gain), "offset": float(offset),
+            "fitness": fitness, "signed": has_sign}
+
+
+def torque_constant(table, joint: int) -> tuple[float, float]:
+    """Absolute amperes per newton metre, retained for report compatibility."""
+    calibration = torque_calibration(table, joint)
+    return abs(calibration["gain"]), calibration["fitness"]
 
 
 def grid(table, joint: int):
@@ -239,25 +257,29 @@ def load_regression(rows, table, joint: int):
 # -- the whole story ------------------------------------------------------
 
 
-def summarise(folder) -> dict:
+def summarise(folder, arm=None) -> dict:
     """Everything the page shows, computed once."""
     rows, manifest = read(folder)
-    table = split(rows)
+    table = split(rows, arm=arm)
     repeats = int(manifest["plan"].get("repeats", 1))
     joints, temperatures = [], [r["temperature_c"] for r in rows]
     # Every joint's own constant first, so a joint that could not be
     # calibrated falls back to this arm rather than to a number measured on
     # one joint of it. They run 0.42 to 1.55 across these seven.
-    constants = {entry["joint"]: torque_constant(table, entry["joint"])
-                 for entry in manifest["joints"]}
-    resolved = [value for value, _ in constants.values() if not np.isnan(value)]
+    calibrations = {
+        entry["joint"]: torque_calibration(table, entry["joint"])
+        for entry in manifest["joints"]}
+    resolved = [abs(value["gain"]) for value in calibrations.values()
+                if not np.isnan(value["gain"])]
     fallback = float(np.median(resolved)) if resolved else 0.4186
     for entry in manifest["joints"]:
         number = entry["joint"]
         done = len({r["key"] for r in rows if r["joint"] == number})
         wanted = len(entry["passes"]) * repeats * 2
-        constant, fitness = constants[number]
-        borrowed = bool(np.isnan(constant))
+        calibration = calibrations[number]
+        gain = calibration["gain"]
+        fitness = calibration["fitness"]
+        borrowed = bool(np.isnan(gain))
         data = grid(table, number)
         item = {
             "joint": number,
@@ -270,10 +292,16 @@ def summarise(folder) -> dict:
             "arc_room_deg": entry.get("arc_room_deg", 0.0),
             "refused": len(entry.get("refused", [])),
             "measured": done, "designed": wanted,
-            "amps_per_nm": None if borrowed else round(constant, 4),
+            "amps_per_nm": None if borrowed else round(abs(gain), 4),
             "amps_per_nm_fit": None if np.isnan(fitness) else round(fitness, 5),
             "amps_per_nm_borrowed": borrowed,
-            "amps_per_nm_used": round(fallback if borrowed else constant, 4),
+            "amps_per_nm_used": round(fallback if borrowed else abs(gain), 4),
+            "signed_amps_per_nm": (
+                round(gain, 6)
+                if not borrowed and calibration["signed"] else None),
+            "effort_offset_a": (
+                round(calibration["offset"], 6)
+                if not borrowed and calibration["signed"] else None),
         }
         if data is not None:
             enough = entry["loadable"] and len(data["levels"]) >= 2
@@ -295,7 +323,7 @@ def summarise(folder) -> dict:
                 [round(float(v), 5)
                  for v in curve(model, data["speeds"], load)]
                 for load in data["loads"]]
-            scale = fallback if borrowed else constant
+            scale = fallback if borrowed else abs(gain)
             worth = []
             for which, index in (("light", 0),
                                  ("heavy", len(data["levels"]) - 1)):
@@ -336,6 +364,75 @@ def summarise(folder) -> dict:
             "high": round(max(temperatures), 1) if temperatures else None},
         "joints": joints,
     }
+
+
+def score_validation(arm, observations, summary: dict) -> dict:
+    """Score a saved sweep model on observations it never trained on.
+
+    The baseline is the URDF inverse dynamics converted with the sweep's
+    signed effort gain, plus the sweep's fitted friction law at the current
+    speed and gravity load. This puts it on the same per-sample current metric
+    as the optimal-excitation model without refitting either side.
+    """
+    observations = list(observations)
+    if not observations:
+        return {"available": False, "reason": "no validation observations"}
+    joints = sorted(summary.get("joints") or [], key=lambda item: item["joint"])
+    if len(joints) != arm.joint_count:
+        return {"available": False,
+                "reason": "load sweep joint count does not match this arm"}
+    missing = [item["name"] for item in joints if not item.get("fit")]
+    if missing:
+        return {"available": False,
+                "reason": "load sweep has no friction fit for "
+                          + ", ".join(missing)}
+
+    squared = [[] for _ in range(arm.joint_count)]
+    for record in observations:
+        position = np.asarray(record.position_deg, dtype=float)
+        velocity = np.asarray(record.velocity_deg_s, dtype=float)
+        acceleration = np.asarray(record.acceleration_deg_s2, dtype=float)
+        measured = np.asarray(record.current_a, dtype=float)
+        torque = arm.inverse_dynamics(position, velocity, acceleration)
+        loads = arm.joint_loads(position)[:, 0]
+        for joint, model in enumerate(joints):
+            signed_gain = model.get("signed_amps_per_nm")
+            gain = (float(signed_gain) if signed_gain is not None
+                    else float(model["amps_per_nm_used"]))
+            offset = float(model.get("effort_offset_a") or 0.0)
+            prediction = (gain * float(torque[joint]) + offset
+                          + float(curve(model["fit"], velocity[joint],
+                                        loads[joint])))
+            squared[joint].append((prediction - measured[joint]) ** 2)
+
+    errors = [float(np.sqrt(np.mean(values))) for values in squared]
+    return {
+        "available": True,
+        "method": "urdf_inverse_dynamics_plus_load_sweep_friction",
+        "validation_samples": len(observations),
+        "validation_rms_a": errors,
+        "mean_validation_rms_a": float(np.mean(errors)),
+        "worst_validation_rms_a": float(np.max(errors)),
+        "joints": [
+            {"joint": index, "name": joints[index]["name"],
+             "validation_rms_a": errors[index]}
+            for index in range(len(errors))
+        ],
+    }
+
+
+def score_saved_sweep(folder, arm, observations,
+                      expected_joint_names=None) -> dict:
+    """Load one sweep and score it, refusing a result from another arm."""
+    summary = summarise(folder, arm=arm)
+    expected = list(expected_joint_names or arm.joint_names)
+    recorded = list(summary.get("joint_names") or [])
+    if recorded and recorded != expected:
+        return {"available": False,
+                "reason": "load sweep joint names do not match this arm"}
+    result = score_validation(arm, observations, summary)
+    result["source"] = str(Path(folder))
+    return result
 
 
 def write_report(folder) -> Path:

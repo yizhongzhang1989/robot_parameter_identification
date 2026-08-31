@@ -45,6 +45,16 @@ class MotionFailed(RuntimeError):
     fault is not this, and raises through.
     """
 
+
+class DriveLimitExceeded(MotionFailed):
+    """One motion exceeded a drive limit that a smaller motion may satisfy."""
+
+    def __init__(self, message: str, joint: int | None = None,
+                 kind: str = "") -> None:
+        super().__init__(message)
+        self.joint = joint
+        self.kind = kind
+
 # These improve the fit or the safety envelope but each has a fallback.
 OPTIONAL_SIGNALS = ("velocity", "temperature", "voltage", "enabled",
                     "fault_code")

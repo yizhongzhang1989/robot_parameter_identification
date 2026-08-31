@@ -212,6 +212,8 @@ TEXT = {
     "summary.mode": {"en": "mode", "zh": "运行方式"},
     "summary.mode.hardware": {"en": "hardware", "zh": "真机"},
     "summary.mode.rehearsal": {"en": "rehearsal", "zh": "预演"},
+    "summary.mode.optimal_excitation": {
+      "en": "optimal excitation", "zh": "最优激励轨迹辨识"},
     "summary.when": {"en": "recorded", "zh": "记录时间"},
     "summary.joints": {"en": "joints", "zh": "关节数"},
     "summary.quantity": {"en": "identified quantity", "zh": "辨识量"},
@@ -225,14 +227,19 @@ TEXT = {
     "joints.head": {"en": "Per joint", "zh": "逐关节结果"},
     "joints.say": {
         "en": "Coulomb friction is the constant part that opposes motion; "
-              "viscous friction grows with speed. Validation error is measured "
-              "on motion the fit never saw, so it is the honest one.",
+          "viscous friction grows with speed. The load ratio multiplies "
+          "the absolute rigid-body effort predicted in the same units, so "
+          "it is dimensionless (A/A or N·m/N·m), not a direct payload "
+          "measurement. Validation error is measured on motion the fit "
+          "never saw, so it is the honest one.",
         "zh": "库仑摩擦是与运动方向相反的恒定部分，粘滞摩擦随速度增大。"
-              "验证误差在拟合从未见过的运动上测得，因此最能反映真实水平。",
+          "载荷比例乘以同单位的刚体驱动量绝对值，因此它是无量纲比例"
+          "（A/A 或 N·m/N·m），并非直接测得的负载质量或力矩。"
+          "验证误差在拟合从未见过的运动上测得，因此最能反映真实水平。",
     },
     "col.joint": {"en": "joint", "zh": "关节"},
     "col.coulomb": {"en": "Coulomb", "zh": "库仑摩擦"},
-    "col.load": {"en": "per unit load", "zh": "随载荷增量"},
+    "col.load": {"en": "load ratio", "zh": "载荷比例"},
     "col.kept": {"en": "extra columns kept", "zh": "保留的附加项"},
     "col.viscous": {"en": "viscous", "zh": "粘滞摩擦"},
     "col.offset": {"en": "offset", "zh": "偏置"},
@@ -244,6 +251,65 @@ TEXT = {
     "col.samples": {"en": "samples", "zh": "样本数"},
     "col.state": {"en": "state", "zh": "判定"},
     "col.reason": {"en": "reason", "zh": "原因"},
+
+    "formula.head": {"en": "Fitted friction formulas", "zh": "拟合摩擦公式"},
+    "formula.say": {
+      "en": "Numeric formulas used by the predictor. Here v is joint speed "
+          "in degrees per second, L = |I_rigid| is the absolute rigid-body "
+          "effort in the identified unit, and I_f is friction effort. The "
+          "friction chart excludes rigid-body gravity and inertia, so its "
+          "peak is smaller than measured total effort.",
+      "zh": "预测器实际使用的数值公式。其中 v 为关节速度（度/秒），"
+          "L = |I_rigid| 为辨识单位下的刚体驱动量绝对值，I_f 为摩擦驱动量。"
+          "摩擦图已扣除刚体重力与惯性，因此其峰值小于实测总驱动峰值。",
+    },
+        "formula.stribeck.on": {"en": "Stribeck retained", "zh": "保留 Stribeck"},
+        "formula.stribeck.off": {"en": "Stribeck rejected", "zh": "拒绝 Stribeck"},
+        "formula.stribeck.peak": {"en": "local low-speed peak", "zh": "存在低速局部尖峰"},
+        "formula.stribeck.nopeak": {"en": "no local peak", "zh": "无局部尖峰"},
+        "formula.totalpeak": {"en": "measured total peak", "zh": "实测总驱动峰值"},
+        "formula.frictionpeak": {"en": "plotted friction peak", "zh": "图中摩擦峰值"},
+
+        "steady.head": {"en": "Controlled low-speed friction audit",
+                        "zh": "受控低速摩擦审计"},
+        "steady.say": {
+        "en": "Phase B is grouped by the same load posture, commanded speed, "
+          "direction and repeat after subtracting the frozen rigid-body model. "
+          "These rows do not refit the dynamic predictor. A classical peak is "
+          "reported only when friction at 0.5 deg/s or below exceeds the "
+          "highest-speed rung by more than 0.02 A; visual peaks in the mixed "
+          "trajectory scatter do not count.",
+        "zh": "B 阶段在扣除冻结的刚体模型后，按相同负载位形、指令速度、方向和重复次数分组。"
+          "这些数据不参与动态预测器的重新拟合。只有当 0.5 度/秒及以下的摩擦比最高速度档"
+          "高出 0.02 A 以上时，才判定为经典低速尖峰；动态轨迹混合散点中的视觉尖点不计。",
+        },
+        "steady.levels": {"en": "load levels", "zh": "负载层数"},
+        "steady.lowpeak": {"en": "low-speed peak minus top rung",
+                           "zh": "低速峰减最高速度档"},
+        "steady.interior": {"en": "largest interior hump",
+                            "zh": "最大内部隆起"},
+        "steady.peak": {"en": "classical peak", "zh": "经典尖峰"},
+        "steady.nopeak": {"en": "no classical peak", "zh": "无经典尖峰"},
+
+        "compare.head": {"en": "Optimal excitation vs load sweep",
+             "zh": "最优激励与负载扫掠对比"},
+        "compare.say": {
+        "en": "Both models are scored on the same multi-joint Fourier "
+          "validation trajectories. Neither model trained on these rows; "
+          "a lower RMS is better.",
+        "zh": "两个模型均在同一组多关节傅里叶验证轨迹上评分，双方都未使用这些数据训练；"
+          "均方根误差越低越好。",
+        },
+        "compare.met": {"en": "target met", "zh": "目标达成"},
+        "compare.missed": {"en": "target not met", "zh": "目标未达成"},
+        "compare.unavailable": {"en": "Comparison unavailable",
+                "zh": "无法进行对比"},
+        "compare.mean": {"en": "mean RMS", "zh": "平均均方根"},
+        "compare.worst": {"en": "worst RMS", "zh": "最差均方根"},
+        "compare.optimal": {"en": "optimal excitation", "zh": "最优激励"},
+        "compare.sweep": {"en": "load sweep", "zh": "负载扫掠"},
+        "compare.improvement": {"en": "improvement", "zh": "改善幅度"},
+        "compare.source": {"en": "sweep source", "zh": "扫掠来源"},
 
     "charts.head": {"en": "Per-joint diagnostics", "zh": "逐关节诊断图"},
     "charts.pick": {"en": "joint", "zh": "关节"},
@@ -270,40 +336,79 @@ TEXT = {
         "en": "from phase B, and only where this joint was the one being "
               "swept. It moves back and forth about a single nominal pose "
               "across the whole speed range, so with the pose barely changing, "
-              "a difference between two green points is a difference in speed. "
-              "The sweeps of the other joints are recorded too, but this joint "
-              "is standing still through them, so they are drawn blue.",
+              "a difference between two outlined points is a difference in speed. "
+          "Sweep samples keep their load color and use a white outline.",
         "zh": "来自 B 摩擦阶段，且只包含本关节自己被扫掠的样本。此时它绕同一标称位姿"
-              "往复运动、覆盖整个速度区间，位姿几乎不变，因此两个绿点之间的差异就是"
-              "速度造成的差异。其他关节被扫掠时本关节是静止的，那些样本按蓝色绘制。",
+            "往复运动、覆盖整个速度区间，位姿几乎不变，因此两个描边点之间的差异就是"
+          "速度造成的差异。扫掠样本保留所属负载层颜色，并加白色描边。",
     },
     "charts.friction.blue": {
-        "en": "from phase A, held still at many poses, phase C, all joints on "
-              "a smooth trajectory, and the parts of phase B where a different "
-              "joint was being swept. Together they cover many poses but "
-              "almost only low speed.",
-        "zh": "来自 A 重力阶段（在多个位姿静止保持）、C 惯性阶段（所有关节沿平滑轨迹"
-              "运动），以及 B 阶段中其他关节被扫掠的部分。它们覆盖了很多位姿，"
-              "但速度几乎都很低。",
+        "en": "all other training samples. In an optimal-excitation run these "
+              "are the multi-joint Fourier trajectories. Each point uses the "
+              "color of its nearest load-quantile curve, from blue at light "
+              "load to red at heavy load.",
+        "zh": "其余所有训练样本。在最优激励运行中，它们就是多关节傅里叶轨迹。"
+              "每个点使用最近负载分位曲线的颜色，由轻载蓝色过渡到重载红色。",
     },
     "charts.friction.curve": {
-        "en": "the fitted model, (coulomb + load term) x tanh(speed / "
-              "transition) + viscous x speed + offset. Where a joint kept a "
-              "load term there are two lines, drawn at the lightest and "
-              "heaviest load measured; the model is the band between them, and "
-              "the points should fall inside it rather than on either line.",
-        "zh": "拟合模型：(库仑 + 载荷项) x tanh(速度 / 过渡宽度) + 粘滞 x 速度 + "
-              "偏置。若该关节保留了载荷项，则画出两条线，分别对应实测到的最轻与"
-              "最重载荷；模型是两线之间的带，数据点应落在带内，而非贴住某一条线。",
+        "en": "the fitted model: six colored curves at load quantiles from "
+              "light to heavy. Points and curves with the same color share a "
+              "load cluster; the outer curves bound the shaded 5–95% range.",
+        "zh": "拟合模型按由轻到重的负载分位数画六条彩色曲线。同色点与曲线属于"
+              "同一负载层，最外两条曲线界定阴影中的 5–95% 范围。",
+    },
+    "charts.friction.steady": {
+        "en": "the controlled steady passes, drawn as circles joined by a "
+              "dashed line at positive speed, one series per load level. "
+              "Each circle is the median of a whole window held at one "
+              "commanded speed with the pose fixed, so it is friction at a "
+              "speed in a way no trajectory point is. A Stribeck peak would "
+              "show here as a hump above the line that follows it.",
+        "zh": "受控恒速段，在正速度一侧以圆点加虚线绘制，每个负载层一条。"
+              "每个圆点是某一指令速度下整个窗口的中位数，位姿保持不变，"
+              "因此它才是真正意义上“某一速度下的摩擦”，而轨迹点不是。"
+              "若存在 Stribeck 尖峰，它会在此处表现为高出后续曲线的隆起。",
+    },
+    "charts.friction.still": {
+        "en": "Rows where this joint was standing still (|v| below {v} °/s) "
+              "are withheld from the scatter: {n} of them here. At rest "
+              "friction has no determined sign, so such a row records only "
+              "where the position servo settled inside the stiction band. "
+              "Every joint but the swept one stands still through a sweep, "
+              "so those rows are the majority, and drawn against speed they "
+              "stack into a vertical band at zero that reads as a peak no "
+              "speed curve can pass through.",
+        "zh": "本关节处于静止（|v| 小于 {v} °/s）的样本已从散点中剔除，此处共 "
+              "{n} 个。静止时摩擦没有确定符号，这类样本只记录了位置伺服停在"
+              "静摩擦带内的哪个位置。扫掠某一关节时其余关节都静止，因此这类"
+              "样本占多数；把它们按速度画出来，就会在零速处堆成一条竖直亮带，"
+              "看起来像尖峰，而任何速度曲线都不可能穿过它。",
     },
     "charts.friction.warn": {
-        "en": "The two groups differ in pose as well as in speed, so a step "
-              "between blue and green is not on its own evidence about speed. "
-              "Read the speed dependence from the green points; use the blue "
-              "ones to see how the curve behaves near rest.",
-        "zh": "两组数据不只是速度不同，位姿也不同，因此蓝色与绿色之间的落差本身"
-              "并不能作为速度效应的证据。速度依赖性应依据绿点判断，蓝点用来观察"
-              "曲线在近零速处的表现。",
+        "en": "When outlined sweep points are present, sweep and trajectory "
+              "groups differ in pose as well as speed, so a step between them "
+              "is not by itself a speed effect. Match points to same-color "
+              "curves; use the residual chart below for point-by-point error.",
+        "zh": "若存在描边扫掠点，扫掠组与轨迹组不仅速度不同，位姿也不同，因此两组"
+              "落差本身不能证明速度效应。应将测量点与同色曲线比较，逐点模型误差"
+              "则查看下方残差图。",
+    },
+    "charts.steadylow": {"en": "Low speed, measured against fitted",
+                          "zh": "低速段：实测与拟合对比"},
+    "charts.steadylow.say": {
+        "en": "The chart above runs to tens of degrees per second, so the "
+              "whole steady range is a few pixels wide in it. Here the axis "
+              "stops at the fastest controlled pass. Circles joined by a "
+              "solid line are the measured medians; the dashed line is the "
+              "fitted curve evaluated at the same load. A Stribeck peak "
+              "means friction falls as speed rises out of zero: it would "
+              "appear as a circle high on the left with lower circles to its "
+              "right. A line that only climbs has no such peak to fit.",
+        "zh": "上方图的横轴直到每秒几十度，整个恒速区间在其中只占几个像素。"
+              "此处横轴只到最快的受控恒速段。实线连接的圆点是实测中位数，"
+              "虚线是同一负载下的拟合曲线。Stribeck 尖峰的含义是速度从零升高时"
+              "摩擦反而下降：它会表现为左侧圆点偏高、右侧圆点更低。一条只升不降的"
+              "折线里没有可供拟合的尖峰。",
     },
     "charts.residual": {"en": "Residual against speed", "zh": "残差-速度关系"},
     "charts.residual.say": {
@@ -314,9 +419,9 @@ TEXT = {
               "零表示预测完全正确。",
     },
     "charts.residual.red": {
-        "en": "phases A and C: the same low-speed, many-pose group drawn in "
-              "blue on the chart above.",
-        "zh": "A 与 C 阶段：即上图中以蓝色绘制的那组低速、多位姿数据。",
+        "en": "all non-sweep training samples: the same group drawn in blue "
+          "on the chart above.",
+        "zh": "所有非扫掠训练样本，即上图中以蓝色绘制的同一组数据。",
     },
     "charts.residual.green": {
         "en": "phase B, and only where this joint was the one being swept: "
@@ -351,12 +456,16 @@ TEXT = {
     "charts.speed": {"en": "speed (°/s)", "zh": "速度（°/秒）"},
     # The colour is named in the text as well as shown, so the legend still
     # works for a reader who cannot separate the two hues.
-    "charts.sweep": {"en": "Green — sweep samples", "zh": "绿色 —— 扫掠样本"},
-    "charts.other": {"en": "Blue — static and trajectory phases",
-                     "zh": "蓝色 —— 静态与轨迹阶段"},
-    "charts.curve": {"en": "Yellow — fitted curve", "zh": "黄色 —— 拟合曲线"},
-    "charts.red": {"en": "Red — static and trajectory phases",
-                   "zh": "红色 —— 静态与轨迹阶段"},
+    "charts.sweep": {"en": "Outlined squares — sweep samples",
+             "zh": "描边方点 —— 扫掠样本"},
+    "charts.other": {"en": "Colors — training samples grouped by load",
+             "zh": "彩色 —— 按负载分组的训练样本"},
+    "charts.curve": {"en": "Lines — fitted curve cluster at the same loads",
+             "zh": "曲线 —— 相同负载层的拟合曲线簇"},
+    "charts.steady": {"en": "Dashed circles — measured steady curve",
+             "zh": "虚线圆点 —— 实测恒速曲线"},
+    "charts.red": {"en": "Red — other training samples",
+             "zh": "红色 —— 其余训练样本"},
     "charts.green": {"en": "Green — sweep samples", "zh": "绿色 —— 扫掠样本"},
 
     "phases.head": {"en": "Phases", "zh": "各阶段"},
@@ -424,6 +533,12 @@ TEXT = {
         "zh": "每次运动中驱动器发布的每一帧，按其原始速率记录。拟合不使用这些数据，"
               "提供它们是为了让由一批帧塌缩成一个样本的这一步可被核查。",
     },
+              "files.sources": {
+              "en": "Paths to the original steady and dynamic observation/raw-frame "
+                "files. They are referenced instead of duplicated in this combined run.",
+              "zh": "原始稳态与动态观测/原始帧文件的路径。组合结果引用这些文件，"
+                "而不重复复制大体量原始数据。",
+              },
     "files.report": {"en": "This page.", "zh": "本页面。"},
 
     "glossary.head": {"en": "Terms", "zh": "术语说明"},
@@ -454,6 +569,15 @@ TEXT = {
     "g.viscous": {
         "en": "Viscous friction — the part proportional to speed.",
         "zh": "粘滞摩擦 —— 与速度成正比的摩擦分量。",
+    },
+    "g.load": {
+      "en": "Load ratio — friction added per unit absolute rigid-body "
+          "effort. It is dimensionless and uses the fitted current/torque "
+          "model as a load proxy; it does not separately identify radial "
+          "force, thrust and tilting moment.",
+      "zh": "载荷比例 —— 每单位刚体驱动量绝对值增加的摩擦。它是无量纲量，"
+          "以拟合出的电流/力矩模型作为载荷代理；不会分别辨识径向力、轴向推力和"
+          "倾覆力矩。",
     },
     "g.unphysical": {
         "en": "A negative Coulomb or viscous term is unphysical: friction "
@@ -519,6 +643,16 @@ margin-right:6px;vertical-align:-1px}
 color:var(--muted);font-size:13px;line-height:1.5}
 .key i{flex:none;width:11px;height:11px;border-radius:2px;margin-top:5px}
 .key b{color:var(--ink);font-weight:600}
+.load-clusters{display:flex;flex-wrap:wrap;gap:8px 16px;margin:10px 0 2px;
+color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.load-clusters span{display:inline-flex;align-items:center;gap:6px}
+.load-clusters i{display:inline-block;width:18px;height:4px;border-radius:1px}
+.formula-list{display:grid;gap:0}
+.formula-row{display:grid;grid-template-columns:minmax(150px,220px) 1fr;gap:14px;
+padding:9px 0;border-bottom:1px solid var(--line);align-items:start}
+.formula-row:last-child{border-bottom:0}
+.formula-row code{white-space:normal;overflow-wrap:anywhere;line-height:1.7}
+.formula-note{margin-top:5px;color:var(--muted);font-size:12px;line-height:1.5}
 code{background:#222833;padding:1px 6px;border-radius:4px;font-size:12px}
 dl{margin:0}dt{margin-top:10px;font-weight:600}dd{margin:2px 0 0;color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
@@ -645,6 +779,175 @@ function jointSection() {
     </tr></thead><tbody>${rows}</tbody></table></section>`;
 }
 
+function formulaTerm(value, expression, digits) {
+  const coefficient = Number(value || 0);
+  return {negative: coefficient < 0,
+          text: `${Math.abs(coefficient).toFixed(digits)}${expression ? ` ${expression}` : ''}`};
+}
+
+function frictionFormula(entry) {
+  const friction = entry.friction || {};
+  const components = entry.components || {};
+  const stribeckSpeed = Number(components.stribeck_speed_deg_s || 1);
+  const terms = [];
+  if (components.friction !== false) {
+    const width = Number(components.coulomb_transition_deg_s || 0);
+    const shape = width > 0 ? `tanh(v / ${width.toFixed(4)})` : 'sgn(v)';
+    terms.push(formulaTerm(friction.coulomb, shape, 4));
+  }
+  if (components.load_friction) {
+    terms.push(formulaTerm(friction.load_friction, 'L sgn(v)', 4));
+  }
+  if (components.stribeck) {
+    terms.push(formulaTerm(
+      friction.stribeck,
+      `sgn(v) exp(-|v| / ${stribeckSpeed.toFixed(4)})`, 4));
+  }
+  if (components.load_stribeck) {
+    terms.push(formulaTerm(
+      friction.load_stribeck,
+      `L sgn(v) exp(-|v| / ${stribeckSpeed.toFixed(4)})`, 4));
+  }
+  if (components.friction !== false) {
+    terms.push(formulaTerm(friction.viscous, 'v', 6));
+  }
+  if (components.actuator_inertia) {
+    terms.push(formulaTerm(friction.actuator_inertia, 'a', 6));
+  }
+  if (components.offset !== false || friction.offset !== undefined) {
+    terms.push(formulaTerm(friction.offset, '', 5));
+  }
+  if (!terms.length) return 'I_f(v,L) = 0';
+  const body = terms.map((term, index) => {
+    if (index === 0) return `${term.negative ? '-' : ''}${term.text}`;
+    return `${term.negative ? ' - ' : ' + '}${term.text}`;
+  }).join('');
+  return `I_f(v,L) = ${body}`;
+}
+
+function hasStribeckPeak(entry, load) {
+  const friction = entry.friction || {};
+  const components = entry.components || {};
+  if (!(components.stribeck || components.load_stribeck)) return false;
+  const coulomb = Number(friction.coulomb || 0);
+  const stribeck = Number(friction.stribeck || 0)
+    + Number(friction.load_stribeck || 0) * Math.abs(load || 0);
+  if (!(stribeck > 1e-9)) return false;
+  const viscous = Number(friction.viscous || 0);
+  const transition = Number(components.coulomb_transition_deg_s || 0);
+  const decay = Number(components.stribeck_speed_deg_s || 1);
+  const derivative = (velocity) => {
+    const ratio = transition > 0 ? velocity / transition : 0;
+    const sech2 = transition > 0 ? 1 / Math.cosh(ratio) ** 2 : 0;
+    return (transition > 0 ? coulomb / transition * sech2 : 0)
+      - stribeck / decay * Math.exp(-velocity / decay) + viscous;
+  };
+  let previous = derivative(1e-6);
+  if (previous < 0) return true;
+  const ceiling = Math.max(8, 5 * transition, 5 * decay);
+  for (let index = 1; index <= 1000; index += 1) {
+    const current = derivative(ceiling * index / 1000);
+    if (previous > 0 && current < 0) return true;
+    previous = current;
+  }
+  return false;
+}
+
+function formulaDiagnostic(entry, index) {
+  const friction = entry.friction || {};
+  const components = entry.components || {};
+  const points = (P.friction_samples || [])[index] || [];
+  const load = points.length
+    ? Math.max(...points.map((point) => Math.abs(point.load || 0))) : 0;
+  const active = (Number(friction.stribeck || 0)
+    + Number(friction.load_stribeck || 0) * load) > 1e-9;
+  const status = t(active ? 'formula.stribeck.on' : 'formula.stribeck.off');
+  const peak = active
+    ? t(hasStribeckPeak(entry, load)
+      ? 'formula.stribeck.peak' : 'formula.stribeck.nopeak') : '';
+  const scale = Number(components.stribeck_speed_deg_s || 0);
+  const details = active
+    ? `${status}: Fs0=${num(friction.stribeck, 4)} ${UNIT}, `
+      + `FsL=${num(friction.load_stribeck, 4)}, `
+      + `vs=${num(scale, 3)} °/s, ${peak}`
+    : status;
+  const frictionPeak = points.length
+    ? Math.max(...points.map((point) => Math.abs(point.effort || 0))) : null;
+  const totalPeak = entry.peak_measured_effort;
+  return `${details} · ${t('formula.totalpeak')}=${num(totalPeak, 4)} ${UNIT}`
+    + ` · ${t('formula.frictionpeak')}=${num(frictionPeak, 4)} ${UNIT}`;
+}
+
+function formulaSection() {
+  const rows = JOINTS.map((entry, index) => `<div class="formula-row">
+    <strong>${esc(NAMES[index] || index + 1)}</strong>
+    <div><code>${esc(frictionFormula(entry))}</code>
+      <div class="formula-note">${esc(formulaDiagnostic(entry, index))}</div></div>
+    </div>`).join('');
+  return `<section><h2>${t('formula.head')}</h2>
+    <p class="say">${t('formula.say')}</p>
+    <div class="formula-list">${rows}</div></section>`;
+}
+
+function steadyFrictionSection() {
+  const audit = P.steady_friction_audit || {};
+  if (!audit.available) return '';
+  const rows = (audit.joints || []).map((entry, index) => {
+    const levels = entry.load_levels || [];
+    const status = entry.classical_low_speed_peak
+      ? 'steady.peak' : 'steady.nopeak';
+    return `<tr>
+      <td>${esc(NAMES[index] || index + 1)}</td>
+      <td class="n">${entry.observations ?? 0}</td>
+      <td class="n">${levels.length}</td>
+      <td class="n">${num(entry.maximum_low_speed_peak_a, 4)} ${UNIT}</td>
+      <td class="n">${num(entry.maximum_interior_peak_a, 4)} ${UNIT}</td>
+      <td style="color:var(--${entry.classical_low_speed_peak ? 'bad' : 'ok'})">
+        ${t(status)}</td></tr>`;
+  }).join('');
+  return `<section><h2>${t('steady.head')}</h2>
+    <p class="say">${t('steady.say')}</p>
+    <table><thead><tr>
+      <th>${t('col.joint')}</th><th class="n">${t('col.observations')}</th>
+      <th class="n">${t('steady.levels')}</th>
+      <th class="n">${t('steady.lowpeak')}</th>
+      <th class="n">${t('steady.interior')}</th>
+      <th>${t('col.state')}</th>
+    </tr></thead><tbody>${rows}</tbody></table></section>`;
+}
+
+function comparisonSection() {
+  const c = P.comparison || {};
+  if (!Object.keys(c).length) return '';
+  if (!c.available) return `<section><h2>${t('compare.head')}</h2>
+    <p class="say">${t('compare.unavailable')}: ${esc(c.reason || '')}</p></section>`;
+  const signed = (v) => (v === null || v === undefined) ? '—'
+    : `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const rows = (c.joints || []).map((j, i) => `<tr>
+    <td>${esc(NAMES[i] || j.name || i + 1)}</td>
+    <td class="n">${num(j.optimal_validation_rms_a, 4)} ${UNIT}</td>
+    <td class="n">${num(j.sweep_validation_rms_a, 4)} ${UNIT}</td>
+    <td class="n" style="color:var(--${j.optimal_better ? 'ok' : 'bad'})">
+      ${signed(j.improvement_percent)}</td></tr>`).join('');
+  const state = c.target_met ? 'pass' : 'fail';
+  return `<section><h2>${t('compare.head')}</h2><p class="say">${t('compare.say')}</p>
+    <p class="big"><span class="pill ${state}">${t(c.target_met ? 'compare.met' : 'compare.missed')}</span></p>
+    <div class="grid">
+      <div class="kv"><div class="k">${t('compare.mean')}</div><div class="v">
+        ${num(c.optimal_mean_validation_rms_a, 4)} / ${num(c.sweep_mean_validation_rms_a, 4)} ${UNIT}
+        (${signed(c.mean_improvement_percent)})</div></div>
+      <div class="kv"><div class="k">${t('compare.worst')}</div><div class="v">
+        ${num(c.optimal_worst_validation_rms_a, 4)} / ${num(c.sweep_worst_validation_rms_a, 4)} ${UNIT}
+        (${signed(c.worst_improvement_percent)})</div></div>
+      <div class="kv"><div class="k">${t('compare.source')}</div><div class="v mono">
+        ${esc(c.source || '—')}</div></div>
+    </div>
+    <table><thead><tr><th>${t('col.joint')}</th>
+      <th class="n">${t('compare.optimal')}</th><th class="n">${t('compare.sweep')}</th>
+      <th class="n">${t('compare.improvement')}</th></tr></thead>
+      <tbody>${rows}</tbody></table></section>`;
+}
+
 function key(colour, term, detail) {
   return `<li><i style="background:${colour}"></i><span><b>${term}</b>
     &nbsp;${detail}</span></li>`;
@@ -661,13 +964,22 @@ function chartSection() {
     <p class="say" style="margin-top:8px" data-i18n="charts.lock.say"></p>
     <h2 style="margin-top:18px" data-i18n="charts.friction"></h2>
     <p class="say" data-i18n="charts.friction.say"></p>
-    <canvas id="c-friction" height="260"></canvas>
+    <canvas id="c-friction" height="300"></canvas>
+    <div id="load-legend" class="load-clusters"></div>
     <ul class="key">
-      ${key('var(--sweep)', t('charts.sweep'), t('charts.friction.green'))}
-      ${key('var(--accent)', t('charts.other'), t('charts.friction.blue'))}
-      ${key('var(--warn)', t('charts.curve'), t('charts.friction.curve'))}
+      ${key('#f8fafc', t('charts.sweep'), t('charts.friction.green'))}
+      ${key('linear-gradient(90deg,#2563eb,#06b6d4,#22c55e,#facc15,#f97316,#ef4444)',
+        t('charts.other'), t('charts.friction.blue'))}
+      ${key('linear-gradient(90deg,#2563eb,#06b6d4,#22c55e,#facc15,#f97316,#ef4444)',
+        t('charts.curve'), t('charts.friction.curve'))}
+      ${key('repeating-linear-gradient(90deg,#f8fafc 0 4px,transparent 4px 8px)',
+        t('charts.steady'), t('charts.friction.steady'))}
     </ul>
+    <p class="say" id="still-note"></p>
     <p class="say" data-i18n="charts.friction.warn"></p>
+    <h2 style="margin-top:22px" data-i18n="charts.steadylow"></h2>
+    <p class="say" data-i18n="charts.steadylow.say"></p>
+    <canvas id="c-steady" height="260"></canvas>
     <h2 style="margin-top:22px" data-i18n="charts.residual"></h2>
     <p class="say" data-i18n="charts.residual.say"></p>
     <canvas id="c-residual" height="220"></canvas>
@@ -741,7 +1053,8 @@ function fileSection() {
   const items = [
     [DOC.files.result, 'files.result'],
     [DOC.files.observations, 'files.observations'],
-    [DOC.files.raw, 'files.raw'],
+    ...(DOC.rawRows ? [[DOC.files.raw, 'files.raw']] : []),
+    ...(P.data_sources ? [['raw_frame_sources.json', 'files.sources']] : []),
     ['report.html', 'files.report'],
   ];
   return `<section><h2 data-i18n="files.head"></h2><dl>
@@ -751,7 +1064,7 @@ function fileSection() {
 
 function glossarySection() {
   const keys = ['g.rms', 'g.holdout', 'g.condition', 'g.rank', 'g.coulomb',
-                'g.viscous', 'g.unphysical'];
+                'g.viscous', 'g.load', 'g.unphysical'];
   return `<section><h2 data-i18n="glossary.head"></h2><dl>
     ${keys.map((k) => `<dd style="margin:8px 0">${t(k)}</dd>`).join('')}
   </dl></section>`;
@@ -856,30 +1169,92 @@ function formatTick(value, step) {
   return value.toFixed(digits);
 }
 
-function frictionCurve(entry, maxSpeed, load) {
+function frictionValue(entry, velocity, load) {
   const f = entry.friction || {};
-  const transition = (entry.components || {}).coulomb_transition_deg_s || 0;
-  const carried = Math.abs(load || 0) * (f.load_friction || 0);
+  const components = entry.components || {};
+  const transition = components.coulomb_transition_deg_s || 0;
+  const stribeckSpeed = components.stribeck_speed_deg_s || 1;
+  const sign = Math.sign(velocity);
+  const reversal = transition > 0 ? Math.tanh(velocity / transition) : sign;
+  const decay = sign * Math.exp(-Math.abs(velocity) / stribeckSpeed);
+  return (f.coulomb || 0) * reversal
+    + (f.load_friction || 0) * Math.abs(load || 0) * sign
+    + (f.stribeck || 0) * decay
+    + (f.load_stribeck || 0) * Math.abs(load || 0) * decay
+    + (f.viscous || 0) * velocity + (f.offset || 0);
+}
+
+function frictionCurve(entry, maxSpeed, load) {
   const curve = [];
   for (let i = 0; i <= 160; i += 1) {
     const v = -maxSpeed + (2 * maxSpeed * i) / 160;
-    const rev = transition > 0 ? Math.tanh(v / transition) : Math.sign(v);
-    curve.push([v, ((f.coulomb || 0) + carried) * rev
-                   + (f.viscous || 0) * v + (f.offset || 0)]);
+    curve.push([v, frictionValue(entry, v, load)]);
   }
   return curve;
 }
 
-// Once friction depends on what the joint carries there is no single curve to
-// draw, so the light and heavy ends of the loads actually measured are drawn
-// and the band between them is the model.
+const LOAD_LEVEL_COUNT = 6;
+const LOAD_COLORS = ['#2563eb', '#06b6d4', '#22c55e',
+                     '#facc15', '#f97316', '#ef4444'];
+
+// Representative 5%-95% quantiles. Equal-count bins keep every color visible
+// even when the load distribution is concentrated near one end.
 function frictionLoads(entry, points) {
-  if (!((entry.components || {}).load_friction)) return [0];
+  if (!((entry.components || {}).load_friction
+        || (entry.components || {}).load_stribeck)) return [0];
   const loads = points.map((s) => Math.abs(s.load || 0)).sort((a, b) => a - b);
   if (!loads.length) return [0];
-  const low = loads[Math.floor(loads.length * 0.05)];
-  const high = loads[Math.floor(loads.length * 0.95)];
-  return high - low > 1e-6 ? [low, high] : [high];
+  const levels = [];
+  for (let index = 0; index < LOAD_LEVEL_COUNT; index += 1) {
+    const quantile = 0.05 + 0.90 * index / (LOAD_LEVEL_COUNT - 1);
+    const value = loads[Math.round((loads.length - 1) * quantile)];
+    if (!levels.length || Math.abs(value - levels[levels.length - 1]) > 1e-9) {
+      levels.push(value);
+    }
+  }
+  return levels;
+}
+
+function loadClusterIndex(load, levels) {
+  const value = Math.abs(load || 0);
+  let best = 0;
+  for (let index = 1; index < levels.length; index += 1) {
+    if (Math.abs(value - levels[index]) < Math.abs(value - levels[best])) {
+      best = index;
+    }
+  }
+  return best;
+}
+
+function loadColor(index) {
+  return LOAD_COLORS[index % LOAD_COLORS.length];
+}
+
+// The controlled steady passes hold one joint at one commanded speed and
+// average a whole window, so their medians are friction at a speed in a way
+// no trajectory point is. Drawn on the same axes they settle by eye whether
+// the measurement rises to a low-speed peak or climbs monotonically, which
+// the fitted curve alone can only assert.
+function steadyOverlay(index) {
+  const audit = P.steady_friction_audit || {};
+  if (!audit.available) return [];
+  const entry = (audit.joints || [])[index];
+  if (!entry) return [];
+  return (entry.load_levels || []).map((level) => ({
+    load: level.load_median_a || 0,
+    points: (level.curve || [])
+      .filter((p) => Number.isFinite(p.speed_deg_s)
+                     && Number.isFinite(p.friction_a))
+      .map((p) => [p.speed_deg_s, p.friction_a]),
+  })).filter((series) => series.points.length > 1);
+}
+
+function updateLoadLegend(levels) {
+  const legend = document.getElementById('load-legend');
+  if (!legend) return;
+  legend.innerHTML = levels.map((load, index) =>
+    `<span><i style="background:${loadColor(index)}"></i>`
+    + `L${index + 1} = ${num(load, 3)} ${UNIT}</span>`).join('');
 }
 
 function frictionSpan(index) {
@@ -890,19 +1265,25 @@ function frictionSpan(index) {
   frictionLoads(entry, points).forEach((load) => {
     values = values.concat(frictionCurve(entry, maxSpeed, load).map((p) => p[1]));
   });
+  steadyOverlay(index).forEach((series) => {
+    values = values.concat(series.points.map((p) => p[1]));
+  });
   return { low: Math.min(...values), high: Math.max(...values) };
 }
 
-function drawFriction(canvas, entry, samples, label, forced) {
+function drawFriction(canvas, entry, samples, label, forced, steady) {
   const { ctx, width, height } = frame(canvas);
   if (!entry) return empty(ctx, width, height);
   const points = samples || [];
+  const series = steady || [];
   const speeds = points.map((s) => s.speed);
   const maxSpeed = Math.max(10, ...speeds.map(Math.abs));
   const loads = frictionLoads(entry, points);
   const curves = loads.map((load) => frictionCurve(entry, maxSpeed, load));
+  updateLoadLegend(loads);
   let values = points.map((s) => s.effort);
   curves.forEach((curve) => { values = values.concat(curve.map((p) => p[1])); });
+  series.forEach((s) => { values = values.concat(s.points.map((p) => p[1])); });
   const low = forced ? forced.low : Math.min(...values);
   const high = forced ? forced.high : Math.max(...values);
   const span = (high - low) || 1;
@@ -912,21 +1293,136 @@ function drawFriction(canvas, entry, samples, label, forced) {
   axes(ctx, box);
   yTicks(ctx, box, low, high, UNIT);
   xTicks(ctx, box, maxSpeed, sx);
-  ctx.fillStyle = 'rgba(77,163,255,.45)';
-  points.forEach((s) => { if (!s.sweep) ctx.fillRect(sx(s.speed) - 1, sy(s.effort) - 1, 2, 2); });
-  ctx.fillStyle = 'rgba(120,220,150,.9)';
-  points.forEach((s) => { if (s.sweep) ctx.fillRect(sx(s.speed) - 1.5, sy(s.effort) - 1.5, 3, 3); });
-  ctx.strokeStyle = '#e0b341'; ctx.lineWidth = 1.8;
+  points.forEach((s) => {
+    if (s.sweep) return;
+    ctx.fillStyle = loadColor(loadClusterIndex(s.load, loads));
+    ctx.fillRect(sx(s.speed) - 1.5, sy(s.effort) - 1.5, 3, 3);
+  });
+  points.forEach((s) => {
+    if (!s.sweep) return;
+    ctx.fillStyle = loadColor(loadClusterIndex(s.load, loads));
+    ctx.fillRect(sx(s.speed) - 2, sy(s.effort) - 2, 4, 4);
+    ctx.strokeStyle = '#f8fafc';
+    ctx.strokeRect(sx(s.speed) - 2.5, sy(s.effort) - 2.5, 5, 5);
+  });
+  if (curves.length > 1) {
+    ctx.fillStyle = 'rgba(255,255,255,.055)';
+    ctx.beginPath();
+    curves[0].forEach(([v, e], i) => {
+      const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    [...curves[curves.length - 1]].reverse().forEach(
+      ([v, e]) => ctx.lineTo(sx(v), sy(e)));
+    ctx.closePath();
+    ctx.fill();
+  }
   curves.forEach((curve, index) => {
-    ctx.setLineDash(index === 0 && curves.length > 1 ? [5, 4] : []);
+    ctx.strokeStyle = loadColor(index);
+    ctx.lineWidth = (index === 0 || index === curves.length - 1) ? 2.2 : 1.6;
     ctx.beginPath();
     curve.forEach(([v, e], i) => { const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
     ctx.stroke();
   });
-  ctx.setLineDash([]);
+  series.forEach((entry) => {
+    const color = loadColor(loadClusterIndex(entry.load, loads));
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    entry.points.forEach(([v, e], i) => {
+      const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    entry.points.forEach(([v, e]) => {
+      ctx.beginPath();
+      ctx.arc(sx(v), sy(e), 3, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#f8fafc';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    });
+  });
   const f = entry.friction || {};
   caption(ctx, box, `${label}   c ${(f.coulomb || 0).toFixed(3)} ${UNIT}`
-    + `   v ${(f.viscous || 0).toFixed(4)} ${UNIT}/(°/s)`);
+    + `${entry.components?.load_friction ? `   μ ${(f.load_friction || 0).toFixed(3)}` : ''}`
+    + `${entry.components?.load_stribeck ? `   FsL ${(f.load_stribeck || 0).toFixed(3)}` : ''}`
+    + `   v ${(f.viscous || 0).toFixed(4)} ${UNIT}/(°/s)`
+    + `${loads.length > 1 ? `   |load| ${loads[0].toFixed(2)}–${loads[loads.length - 1].toFixed(2)} ${UNIT}` : ''}`);
+  ctx.fillStyle = '#8b96a5';
+  ctx.textAlign = 'center';
+  ctx.fillText(t('charts.speed'), (box.left + box.right) / 2, height - 8);
+  ctx.textAlign = 'left';
+}
+
+// The steady range is a sliver of the main chart's axis. Given its own frame,
+// the measured medians and the fitted curve can be read against each other at
+// the speeds a Stribeck peak would live in.
+function drawSteady(canvas, entry, series, loads, label) {
+  const { ctx, width, height } = frame(canvas);
+  if (!entry || !series || !series.length) return empty(ctx, width, height);
+  const maxSpeed = Math.max(...series.map(
+    (s) => Math.max(...s.points.map((p) => p[0]))));
+  if (!(maxSpeed > 0)) return empty(ctx, width, height);
+  const models = series.map((s) => {
+    const curve = [];
+    for (let i = 0; i <= 80; i += 1) {
+      const v = Math.max(1e-3, (maxSpeed * i) / 80);
+      curve.push([v, frictionValue(entry, v, s.load)]);
+    }
+    return curve;
+  });
+  let values = series.flatMap((s) => s.points.map((p) => p[1]));
+  models.forEach((curve) => { values = values.concat(curve.map((p) => p[1])); });
+  const pad = (Math.max(...values) - Math.min(...values)) * 0.12 || 0.01;
+  const low = Math.min(...values) - pad;
+  const high = Math.max(...values) + pad;
+  const span = (high - low) || 1;
+  const box = { left: 62, right: width - 12, top: 12, bottom: height - 44 };
+  const sx = (v) => box.left + (v / maxSpeed) * (box.right - box.left);
+  const sy = (e) => box.bottom - ((e - low) / span) * (box.bottom - box.top);
+  axes(ctx, box);
+  yTicks(ctx, box, low, high, UNIT);
+  ctx.textAlign = 'center';
+  series[0].points.forEach(([v]) => {
+    ctx.strokeStyle = '#20252d';
+    ctx.beginPath();
+    ctx.moveTo(sx(v), box.top);
+    ctx.lineTo(sx(v), box.bottom);
+    ctx.stroke();
+    ctx.fillStyle = '#8b96a5';
+    ctx.fillText(String(v), sx(v), box.bottom + 14);
+  });
+  ctx.textAlign = 'left';
+  series.forEach((s, index) => {
+    const color = loadColor(loadClusterIndex(s.load, loads));
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    models[index].forEach(([v, e], i) => {
+      const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    s.points.forEach(([v, e], i) => {
+      const x = sx(v), y = sy(e); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    s.points.forEach(([v, e]) => {
+      ctx.beginPath();
+      ctx.arc(sx(v), sy(e), 3.2, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#f8fafc';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    });
+  });
+  if (label) caption(ctx, box, label);
   ctx.fillStyle = '#8b96a5';
   ctx.textAlign = 'center';
   ctx.fillText(t('charts.speed'), (box.left + box.right) / 2, height - 8);
@@ -996,7 +1492,19 @@ function redrawCharts() {
       .map((p) => Math.abs(p.residual)));
   }
   drawFriction(document.getElementById('c-friction'), JOINTS[index],
-               (P.friction_samples || [])[index], name, span);
+               (P.friction_samples || [])[index], name, span,
+               steadyOverlay(index));
+  drawSteady(document.getElementById('c-steady'), JOINTS[index],
+             steadyOverlay(index),
+             frictionLoads(JOINTS[index] || {},
+                           (P.friction_samples || [])[index] || []),
+             name);
+  const still = document.getElementById('still-note');
+  if (still) {
+    still.textContent = t('charts.friction.still')
+      .replace('{v}', num(P.friction_standstill_speed_deg_s || 0.05, 2))
+      .replace('{n}', String((P.friction_standstill_excluded || [])[index] || 0));
+  }
   drawResidual(document.getElementById('c-residual'),
                (P.residual_samples || [])[index], name, residualCap);
   drawBars(document.getElementById('c-error'), JOINTS.map((e, i) => ({
@@ -1016,7 +1524,8 @@ function render() {
   document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
   document.getElementById('root').innerHTML = [
     `<p class="say" data-i18n="subtitle"></p>`,
-    verdictSection(), summarySection(), jointSection(), chartSection(),
+    verdictSection(), summarySection(), jointSection(), formulaSection(),
+    steadyFrictionSection(), comparisonSection(), chartSection(),
     phaseSection(), rehearsalSection(), planSection(), fileSection(),
     glossarySection(),
   ].join('');

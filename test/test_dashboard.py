@@ -12,7 +12,7 @@ try:
     from robot_parameter_identification.dashboard.http_server import (
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
-        DashboardConfig, IdentificationService, _swept_here)
+        DashboardConfig, IdentificationService, _comparison, _swept_here)
     from robot_parameter_identification.interfaces import (
         SignalMap, TelemetrySpec)
     from fixtures import synthetic_urdf, test_profile, PREFIX
@@ -97,6 +97,11 @@ class RunGateTest(unittest.TestCase):
         self.assertFalse(answer["ok"])
         self.assertIn("rehearse", answer["message"])
 
+    def test_optimal_hardware_is_refused_before_a_rehearsal(self):
+        answer = service().start("optimal_excitation")
+        self.assertFalse(answer["ok"])
+        self.assertIn("rehearse", answer["message"])
+
     def test_a_passed_rehearsal_arms_the_hardware_run(self):
         # The rehearsal gate is not ceremony: it plants known friction and must
         # find it again, and it is what caught the fit returning zero.
@@ -119,6 +124,27 @@ class RunGateTest(unittest.TestCase):
 
     def test_no_acknowledgement_is_demanded_anywhere(self):
         self.assertNotIn("acknowledgement", service().snapshot())
+
+    def test_rehearsal_does_not_apply_the_hardware_current_envelope(self):
+        from unittest import mock
+
+        made = service()
+        captured = {}
+
+        class Run:
+            def __init__(self, _arm, _plant, _plan, **kwargs):
+                captured["monitor"] = kwargs.get("monitor")
+                self.observations = []
+
+            def run(self):
+                return campaign_module.CampaignResult()
+
+        made._build_plant = lambda _mode: object()
+        made._finish = lambda *_args: None
+        with mock.patch.object(campaign_module, "Campaign", Run):
+            made._run("rehearsal")
+
+        self.assertIsNone(captured["monitor"])
 
 
 class ResultProvenanceTest(unittest.TestCase):
@@ -147,6 +173,231 @@ class ResultProvenanceTest(unittest.TestCase):
                          "newton_metre")
 
 
+class PlotDataQualityTest(unittest.TestCase):
+    def test_excluded_acceleration_window_is_not_drawn_as_a_fitted_sample(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        made = service()
+        count = made.arm.joint_count
+        good = SimpleNamespace(
+            phase=campaign_module.PHASE_INERTIA,
+            position_deg=[0.0] * count, velocity_deg_s=[1.234] * count,
+            acceleration_deg_s2=[1.0] * count, current_a=[0.2] * count,
+            motion="optimal:training:1")
+        rejected = SimpleNamespace(
+            phase=campaign_module.PHASE_INERTIA,
+            position_deg=[0.0] * count, velocity_deg_s=[-0.321] * count,
+            acceleration_deg_s2=[999.0] * count, current_a=[0.3] * count,
+            motion="optimal:training:2")
+        payload = {
+            "joints": [{} for _ in range(count)],
+            "data_quality": {"acceleration_exclusion_deg_s2": 480.0},
+        }
+        with mock.patch.object(ident, "predict_joint", return_value=0.0):
+            plotted = made._plot_data(
+                payload, [good, rejected], [object()] * count)
+
+        self.assertTrue(all(len(points) == 1
+                            for points in plotted["friction_samples"]))
+        self.assertEqual(
+            plotted["friction_samples"][0][0]["speed"], 1.234)
+
+    def test_a_joint_standing_still_is_not_drawn_as_a_friction_sample(self):
+        # At rest the position servo settles anywhere inside the stiction
+        # band, so measured-minus-rigid is a band, not friction at a speed.
+        # Every joint but the swept one is standing still during a sweep, and
+        # stacking those rows at v=0 draws a vertical spike that reads as a
+        # Stribeck peak no speed curve can or should follow. A parked joint's
+        # fitted speed reaches the slowest commanded rung, so the pass tag
+        # decides rather than a threshold.
+        from types import SimpleNamespace
+        from unittest import mock
+
+        made = service()
+        count = made.arm.joint_count
+        moving = SimpleNamespace(
+            phase=campaign_module.PHASE_FRICTION,
+            position_deg=[0.0] * count, velocity_deg_s=[0.4] * count,
+            acceleration_deg_s2=[0.0] * count, current_a=[0.3] * count,
+            motion="optimal_friction:j0:0.5:+:s1:r1")
+        parked = SimpleNamespace(
+            phase=campaign_module.PHASE_FRICTION,
+            position_deg=[0.0] * count, velocity_deg_s=[0.037] * count,
+            acceleration_deg_s2=[0.0] * count, current_a=[0.9] * count,
+            motion="optimal_friction:j3:0.5:+:s4:r1")
+        payload = {"joints": [{} for _ in range(count)], "data_quality": {}}
+
+        with mock.patch.object(ident, "predict_joint", return_value=0.0):
+            plotted = made._plot_data(
+                payload, [moving, parked], [object()] * count)
+
+        # Each row is drawn only for the joint its pass actually drove.
+        drawn = [len(points) for points in plotted["friction_samples"]]
+        self.assertEqual(drawn[0], 1)
+        self.assertEqual(drawn[3], 1)
+        self.assertEqual([drawn[index] for index in (1, 2, 4, 5, 6)],
+                         [0, 0, 0, 0, 0])
+        self.assertEqual(plotted["friction_samples"][0][0]["speed"], 0.4)
+        self.assertEqual(plotted["friction_samples"][3][0]["speed"], 0.037)
+        self.assertEqual(plotted["friction_standstill_excluded"][1], 2)
+
+    def test_the_slowest_commanded_sweep_survives_the_standstill_floor(self):
+        # The controlled low-speed passes are commanded down to 0.05 deg/s and
+        # arrive a little under. Losing them would delete the only evidence
+        # about the speed range the Stribeck question is asked in.
+        from robot_parameter_identification.dashboard import service as module
+
+        self.assertLess(module.STILL_SPEED_DEG_S,
+                        min(campaign_module.CampaignPlan()
+                            .optimal_friction_speeds_deg_s))
+
+
+class OptimalComparisonTest(unittest.TestCase):
+    def test_target_requires_better_mean_and_worst_error(self):
+        sweep = {
+            "available": True,
+            "source": "/tmp/sweep",
+            "method": "baseline",
+            "validation_samples": 100,
+            "validation_rms_a": [0.30, 0.20],
+        }
+        better = _comparison([0.20, 0.15], sweep, ["j1", "j2"])
+        mixed = _comparison([0.31, 0.10], sweep, ["j1", "j2"])
+        self.assertTrue(better["target_met"])
+        self.assertFalse(mixed["target_met"])
+        self.assertEqual(better["basis"],
+                         "same_unseen_optimal_validation_trajectories")
+
+    def test_service_dispatches_options_to_the_optimal_campaign(self):
+        from unittest import mock
+
+        made = service()
+        made._options = {
+            "optimal_training_trajectories": 7,
+            "optimal_validation_trajectories": 2,
+            "optimal_friction_repeats": 3,
+            "optimal_friction_postures": 2,
+            "fourier_base_frequency_hz": 0.08,
+            "fourier_duration_s": 45,
+        }
+        captured = {}
+
+        class Run:
+            def __init__(self, _arm, _plant, plan, **_kwargs):
+                captured["plan"] = plan
+                self.observations = []
+
+            def run(self):
+                return campaign_module.CampaignResult(
+                    validation_rms_a=[0.1] * made.arm.joint_count)
+
+        made._build_plant = lambda _mode: object()
+        made._compare_with_load_sweep = lambda _result, _rows: {
+            "available": False, "reason": "test"}
+        made._finish = lambda mode, result, *_args: captured.update(
+            {"mode": mode, "result": result})
+        with mock.patch.object(
+                campaign_module, "OptimalExcitationCampaign", Run):
+            made._run("optimal_excitation")
+
+        self.assertEqual(captured["mode"], "optimal_excitation")
+        self.assertEqual(captured["plan"].optimal_training_trajectories, 7)
+        self.assertEqual(captured["plan"].optimal_validation_trajectories, 2)
+        self.assertEqual(captured["plan"].optimal_friction_repeats, 3)
+        self.assertEqual(captured["plan"].optimal_friction_postures, 2)
+        self.assertFalse(captured["plan"].load_stribeck_search)
+        self.assertEqual(captured["plan"].stribeck_speed_search, ())
+        self.assertEqual(captured["plan"].fourier_base_frequency_hz, 0.08)
+        self.assertEqual(captured["plan"].optimal_fourier_amplitude_fraction,
+                 0.20)
+        self.assertEqual(captured["plan"].fourier_duration_s, 45.0)
+
+    def test_empty_latest_sweep_does_not_shadow_real_baseline(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            made = IdentificationService(
+                DashboardConfig(output_directory=temporary),
+                profile=test_profile())
+            made.adopt_description(synthetic_urdf())
+            root = Path(temporary) / "load_sweep"
+            real = root / "sweep-20260820-120000"
+            empty = root / "sweep-20260821-120000"
+            for folder in (real, empty):
+                folder.mkdir(parents=True)
+                (folder / "manifest.json").write_text(json.dumps({
+                    "joint_names": list(made.arm.joint_names),
+                }), encoding="utf-8")
+                (folder / "records.jsonl").write_text("", encoding="utf-8")
+            (real / "records.jsonl").write_text("{}\n", encoding="utf-8")
+
+            self.assertEqual(made._latest_load_sweep(), real)
+
+    def test_latest_complete_compatible_friction_phase_is_reusable(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            made = IdentificationService(
+                DashboardConfig(output_directory=temporary),
+                profile=test_profile())
+            made.adopt_description(synthetic_urdf())
+            plan = made._optimal_plan()
+            root = Path(temporary)
+            usable = root / "optimal_excitation-20260825-120000"
+            incomplete = root / "optimal_excitation-20260825-130000"
+            unreadable = root / "optimal_excitation-20260825-140000"
+            names = list(made.profile.joint_names)
+            fields = ["phase", "time_s", "motion", "window_frames",
+                      "window_fit_rms_deg"]
+            for name in names:
+                fields.extend((f"{name}.position_deg",
+                               f"{name}.velocity_deg_s",
+                               f"{name}.acceleration_deg_s2",
+                               f"{name}.effort",
+                               f"{name}.temperature_c"))
+            values = [campaign_module.PHASE_FRICTION, "1.0",
+                      "optimal_friction:j0:0.05:+:s1:r1", "100", "0.001"]
+            values.extend(["0", "0.05", "0", "0.2", "35"] * len(names))
+            for folder, completed in ((usable, 672), (incomplete, 671),
+                                      (unreadable, 672)):
+                folder.mkdir()
+                header = fields if folder != unreadable else fields[:5]
+                row = values if folder != unreadable else values[:5]
+                (folder / "observations.csv").write_text(
+                    ",".join(header) + "\n" + ",".join(row) + "\n",
+                    encoding="utf-8")
+                (folder / "result.json").write_text(json.dumps({
+                    "joint_names": list(made.profile.joint_names),
+                    "action": made.config.commands.follow_joint_trajectory_action,
+                    "effort_source": "current",
+                    "plan": {
+                        "optimal_friction_speeds_deg_s": list(
+                            plan.optimal_friction_speeds_deg_s),
+                        "optimal_friction_repeats":
+                            plan.optimal_friction_repeats,
+                        "optimal_friction_postures":
+                            plan.optimal_friction_postures,
+                    },
+                    "phases": [{
+                        "phase": campaign_module.PHASE_FRICTION,
+                        "aborted": None,
+                        "detail": {"planned_passes": 672,
+                                   "completed_passes": completed},
+                    }],
+                }), encoding="utf-8")
+
+            for timestamp, folder in enumerate(
+                    (usable, incomplete, unreadable), start=1):
+                os.utime(folder, (timestamp, timestamp))
+
+            self.assertEqual(
+                made._latest_optimal_friction(plan), usable)
+
+
 class FakePlant:
     """Enough of a hardware plant to check the homing plumbing."""
 
@@ -155,6 +406,10 @@ class FakePlant:
         self.parked = False
         self.closed = False
         self.opened_with = {}
+        self.monitor = None
+
+    def set_monitor(self, monitor):
+        self.monitor = monitor
 
     def sample(self):
         return {"position_deg": list(self.position)}
@@ -234,6 +489,14 @@ class HomingTest(unittest.TestCase):
         made.home()
         self.wait(made)
         self.assertIs(plant.opened_with.get("require_neutral_start"), False)
+
+    def test_homing_keeps_the_hardware_envelope_active(self):
+        made, plant = self.homing_service([40.0] * 7)
+        made.home()
+        self.wait(made)
+        self.assertIsNotNone(plant.monitor)
+        self.assertIn("peak-current ceiling", plant.monitor.guards())
+        self.assertIn("position-rate ceiling", plant.monitor.guards())
 
     def test_homing_reports_where_it_started_and_ended(self):
         made, _plant = self.homing_service([5.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -780,6 +1043,12 @@ class GuardTest(unittest.TestCase):
         made = service()
         made.profile_source = "derived"
         self.assertNotIn("bus-voltage window", made._monitor().guards())
+
+    def test_a_written_current_profile_arms_both_current_limits(self):
+        made = IdentificationService(DashboardConfig(), profile=test_profile())
+        guards = made._monitor().guards()
+        self.assertIn("peak-current ceiling", guards)
+        self.assertIn("sustained-current ceiling", guards)
 
     def test_an_unmapped_signal_reports_its_guard_dark(self):
         made = IdentificationService(

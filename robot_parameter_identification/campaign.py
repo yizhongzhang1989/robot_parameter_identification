@@ -22,12 +22,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Iterable, Iterator, Protocol
+import re
 import time
 
 import numpy as np
 
 from . import excitation, identification as ident
-from .interfaces import MotionFailed
+from .interfaces import DriveLimitExceeded, MotionFailed
 from .model import ModelComponents
 from .profile import RobotProfile
 
@@ -41,6 +42,7 @@ PHASE_VALIDATION = "D_validation"
 # generously rather than asserting one figure for the whole arm.
 COULOMB_TRANSITION_SEARCH = tuple(
     round(float(w), 4) for w in np.geomspace(0.08, 6.0, 25))
+STRIBECK_SPEED_SEARCH = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 PHASES = (PHASE_GRAVITY, PHASE_FRICTION, PHASE_INERTIA, PHASE_VALIDATION)
 
 MAXIMUM_CONDITION = 1.0e3
@@ -110,7 +112,15 @@ class Plant(Protocol):
 
 
 class EnvelopeMonitor(Protocol):
-    """Anything that can veto a telemetry frame."""
+    """Anything that can veto a telemetry frame.
+
+    A monitor that also fills ``last_trip`` with the joint and the kind lets
+    the campaign answer a trip it can answer -- too much current for one joint
+    -- instead of only reporting it. Without that detail every trip stops the
+    run, which is the safe reading of an unattributed veto.
+    """
+
+    last_trip: dict | None
 
     def check(self, sample: dict, now: float) -> str | None: ...
 
@@ -130,29 +140,113 @@ class DriveMonitor:
 
     minimum_voltage_v: float | None = None
     maximum_voltage_v: float | None = None
+    maximum_speed_deg_s: float | None = None
+    maximum_temperature_c: float | None = None
+    peak_current_a: tuple[float, ...] = ()
+    continuous_current_a: tuple[float, ...] = ()
+    sustained_current_window_s: float = 0.5
+    _over_current_since: list[float | None] = field(
+        default_factory=list, init=False, repr=False)
     # Campaign frames are pulled synchronously, so a gap between them is
     # deliberate dwell rather than lost telemetry; kept for protocol parity.
     last_sample_at: float | None = None
+    # Which joint tripped and why, so a caller can answer it rather than only
+    # report it. Set by every trip; the message alone would have to be parsed.
+    last_trip: dict | None = field(default=None, init=False, repr=False)
+
+    def _trip(self, joint: int | None, kind: str, message: str) -> str:
+        self.last_trip = {"joint": joint, "kind": kind, "message": message}
+        return message
 
     def check(self, sample: dict, now: float) -> str | None:
         for index, live in enumerate(sample.get("enabled") or []):
             if not live:
-                return f"joint{index + 1} reports its drive disabled"
+                return self._trip(
+                    index, "disabled",
+                    f"joint{index + 1} reports its drive disabled")
         for index, code in enumerate(sample.get("fault_code") or []):
             if code:
-                return f"joint{index + 1} reports fault code {int(code)}"
+                return self._trip(
+                    index, "fault",
+                    f"joint{index + 1} reports fault code {int(code)}")
+        if self.maximum_speed_deg_s is not None:
+            for index, value in enumerate(
+                    sample.get("safety_speed_deg_s") or []):
+                if abs(float(value)) > self.maximum_speed_deg_s:
+                    return self._trip(
+                        index, "speed",
+                        f"joint{index + 1} position-derived speed "
+                        f"{abs(float(value)):.1f} deg/s exceeded "
+                        f"{self.maximum_speed_deg_s:.1f} deg/s")
+        if self.maximum_temperature_c is not None:
+            for index, value in enumerate(sample.get("temperature_c") or []):
+                if float(value) >= self.maximum_temperature_c:
+                    return self._trip(
+                        index, "temperature",
+                        f"joint{index + 1} temperature {float(value):.1f} C "
+                        f"reached {self.maximum_temperature_c:.1f} C")
+        currents = sample.get("current_a") or []
+        if currents and self.peak_current_a:
+            if len(currents) != len(self.peak_current_a):
+                return self._trip(
+                    None, "envelope",
+                    f"current telemetry has {len(currents)} joints, "
+                    f"the envelope has {len(self.peak_current_a)}")
+            for index, (value, ceiling) in enumerate(
+                    zip(currents, self.peak_current_a)):
+                if abs(float(value)) > ceiling:
+                    return self._trip(
+                        index, "peak_current",
+                        f"joint{index + 1} peak current "
+                        f"{abs(float(value)):.3f} A exceeded "
+                        f"{ceiling:.3f} A")
+        if currents and self.continuous_current_a:
+            if len(currents) != len(self.continuous_current_a):
+                return self._trip(
+                    None, "envelope",
+                    f"current telemetry has {len(currents)} joints, "
+                    f"the continuous envelope has "
+                    f"{len(self.continuous_current_a)}")
+            if len(self._over_current_since) != len(currents):
+                self._over_current_since = [None] * len(currents)
+            for index, (value, ceiling) in enumerate(
+                    zip(currents, self.continuous_current_a)):
+                if abs(float(value)) <= ceiling:
+                    self._over_current_since[index] = None
+                    continue
+                since = self._over_current_since[index]
+                if since is None or now < since:
+                    self._over_current_since[index] = now
+                    continue
+                if now - since >= self.sustained_current_window_s:
+                    return self._trip(
+                        index, "continuous_current",
+                        f"joint{index + 1} continuous current "
+                        f"{abs(float(value)):.3f} A exceeded "
+                        f"{ceiling:.3f} A for "
+                        f"{self.sustained_current_window_s:.3f} s")
         if self.minimum_voltage_v is None or self.maximum_voltage_v is None:
             return None
         for index, volts in enumerate(sample.get("voltage_v") or []):
             if not self.minimum_voltage_v <= volts <= self.maximum_voltage_v:
-                return (f"joint{index + 1} bus at {volts:.1f} V, outside "
-                        f"{self.minimum_voltage_v:.1f}-"
-                        f"{self.maximum_voltage_v:.1f} V")
+                return self._trip(
+                    index, "voltage",
+                    f"joint{index + 1} bus at {volts:.1f} V, outside "
+                    f"{self.minimum_voltage_v:.1f}-"
+                    f"{self.maximum_voltage_v:.1f} V")
         return None
 
     def guards(self) -> tuple[str, ...]:
         """What this monitor is actually able to enforce."""
         active = ["drive-enabled check", "fault-code check"]
+        if self.maximum_speed_deg_s is not None:
+            active.append("position-rate ceiling")
+        if self.maximum_temperature_c is not None:
+            active.append("temperature ceiling")
+        if self.peak_current_a:
+            active.append("peak-current ceiling")
+        if self.continuous_current_a:
+            active.append("sustained-current ceiling")
         if self.minimum_voltage_v is not None:
             active.append("bus-voltage window")
         return tuple(active)
@@ -215,7 +309,20 @@ class CampaignPlan:
     fourier_harmonics: int = 4
     fourier_base_frequency_hz: float = 0.08
     fourier_duration_s: float = 30.0
+    fourier_ramp_s: float = 4.0
     fourier_attempts: int = 40
+    # The dedicated optimal-excitation campaign replaces the single inertia
+    # trajectory with a sequence selected against the cumulative regressor.
+    # Validation uses separately seeded trajectories and never enters the fit.
+    optimal_training_trajectories: int = 12
+    optimal_validation_trajectories: int = 3
+    optimal_fourier_amplitude_fraction: float = 0.20
+    # Fourier reversals contain low-speed points, but they are accelerating
+    # transients rather than the steady windows a Stribeck curve assumes.
+    optimal_friction_speeds_deg_s: tuple[float, ...] = (
+        0.05, 0.1, 0.2, 0.5, 1.0, 2.0)
+    optimal_friction_repeats: int = 2
+    optimal_friction_postures: int = 3
     sample_rate_hz: float = 20.0
     validation_poses: int = 12
     validation_speeds_deg_s: tuple[float, ...] = (3.5, 6.5)
@@ -241,11 +348,14 @@ class CampaignPlan:
     # seven take it and the rest are better without.
     stribeck_search: bool = True
     stribeck_speed_deg_s: float = 1.6
+    stribeck_speed_search: tuple[float, ...] = ()
     load_friction: bool = False
     # Offered to every joint and decided per joint. Measured on three postures
     # per joint it is worth twenty-nine per cent of the validation error on the
     # heaviest and nothing on the wrist, which carries no load in any pose.
     load_friction_search: bool = True
+    load_stribeck: bool = False
+    load_stribeck_search: bool = False
     # Motions the arm may refuse before the run is called off. A few gaps in a
     # ladder of thousands cost almost nothing; an arm refusing everything is
     # not producing a dataset and should not be left running for hours.
@@ -274,9 +384,12 @@ class CampaignPlan:
         payload = asdict(self)
         payload["friction_speeds_deg_s"] = list(self.friction_speeds_deg_s)
         payload["validation_speeds_deg_s"] = list(self.validation_speeds_deg_s)
+        payload["optimal_friction_speeds_deg_s"] = list(
+            self.optimal_friction_speeds_deg_s)
         payload["workspace_limit_deg"] = list(self.workspace_limit_deg)
         payload["coulomb_transition_search"] = list(
             self.coulomb_transition_search)
+        payload["stribeck_speed_search"] = list(self.stribeck_speed_search)
         return payload
 
     def model_components(self) -> ModelComponents:
@@ -286,8 +399,11 @@ class CampaignPlan:
             stribeck=self.stribeck,
             stribeck_search=self.stribeck_search,
             stribeck_speed_deg_s=self.stribeck_speed_deg_s,
+            stribeck_speed_search=tuple(self.stribeck_speed_search),
             load_friction=self.load_friction,
-            load_friction_search=self.load_friction_search)
+            load_friction_search=self.load_friction_search,
+            load_stribeck=self.load_stribeck,
+            load_stribeck_search=self.load_stribeck_search)
 
 
 @dataclass
@@ -326,6 +442,9 @@ class CampaignResult:
     validation_rms_a: list[float] = field(default_factory=list)
     validation_samples: int = 0
     aborted: str | None = None
+    comparison: dict = field(default_factory=dict)
+    data_quality: dict = field(default_factory=dict)
+    steady_friction_audit: dict = field(default_factory=dict)
     # Motions the arm refused. A run with gaps in it is still a run, but the
     # report must not present it as one that measured everything it planned to.
     skipped: list = field(default_factory=list)
@@ -366,6 +485,9 @@ class CampaignResult:
             "validation_rms_a": [round(v, 5) for v in self.validation_rms_a],
             "validation_samples": self.validation_samples,
             "aborted": self.aborted,
+            "comparison": dict(self.comparison),
+            "data_quality": dict(self.data_quality),
+            "steady_friction_audit": dict(self.steady_friction_audit),
             "skipped": self.skipped,
             "complete": self.complete,
             "verdict": self.verdict(),
@@ -376,11 +498,35 @@ class Abort(RuntimeError):
     """Raised when a guard stops the campaign; the arm is left at rest."""
 
 
+# Amplitude can answer these; it cannot answer a fault word, a disabled drive,
+# a bus outside its window, or heat already in the joint.
+RECOVERABLE_TRIPS = frozenset({"peak_current", "continuous_current", "speed"})
+
+
+class DriveTrip(Abort):
+    """One motion asked for more than the drive would give."""
+
+    def __init__(self, message: str, joint: int | None = None,
+                 kind: str = "") -> None:
+        super().__init__(message)
+        self.joint = joint
+        self.kind = kind
+
+    @property
+    def recoverable(self) -> bool:
+        return self.joint is not None and self.kind in RECOVERABLE_TRIPS
+
+
 # Phases A to C are position controlled, so the speed that matters is the
 # profile's sustained limit rather than any current-mode figure. The
 # acceleration bound is that same ceiling reached from rest in a quarter second.
 PROBE_SPEED_FRACTION = 0.5
 ACCELERATION_PER_SPEED = 4.0
+
+# How much of its swing a joint gives up after a trip, and how many times one
+# motion may be re-planned before the run moves on without it.
+TRIP_BACKOFF = 0.7
+TRIP_RETRIES = 3
 
 # The sweep speeds are what actually excites friction, so they are derived from
 # the speed ceiling rather than fixed figures. Fixed figures meant raising the
@@ -406,6 +552,11 @@ VALIDATION_SPEED_FRACTIONS = (0.35, 0.65)
 FRICTION_CRUISE_S = 1.0
 FRICTION_MAXIMUM_CRUISE_S = 4.0
 FRICTION_CRUISE_ARC_DEG = 6.0
+# A speed is fitted out of distance travelled, so a crawl needs arc, not time:
+# four seconds at 0.02 deg/s is 0.08 deg, which no position fit can turn into a
+# speed. Bounded so a rung slower than the ladder cannot stall the run.
+FRICTION_MINIMUM_ARC_DEG = 0.4
+FRICTION_CRAWL_CRUISE_S = 24.0
 
 # The plant ramps a sweep over a quarter of its nominal duration, so a pass of
 # `distance` at `speed` implies 4*speed^2/distance of acceleration. A short
@@ -421,7 +572,12 @@ _STATIC_BOUNDS = {
     "fourier_harmonics": (1, 6),
     "fourier_base_frequency_hz": (0.02, 0.3),
     "fourier_duration_s": (5.0, 120.0),
+    "fourier_ramp_s": (0.0, 10.0),
     "fourier_attempts": (5, 200),
+    "optimal_training_trajectories": (2, 32),
+    "optimal_validation_trajectories": (1, 8),
+    "optimal_friction_repeats": (1, 5),
+    "optimal_friction_postures": (1, 5),
     "sample_rate_hz": (5.0, 100.0),
     "validation_poses": (3, 40),
     "validation_trajectory_s": (4.0, 60.0),
@@ -442,7 +598,9 @@ def campaign_bounds(profile: RobotProfile) -> dict:
 
 _INTEGER_FIELDS = frozenset({
     "static_poses", "static_candidates", "settle_samples", "fourier_harmonics",
-    "fourier_attempts", "validation_poses", "seed",
+    "fourier_attempts", "optimal_training_trajectories",
+    "optimal_validation_trajectories", "optimal_friction_repeats",
+    "optimal_friction_postures", "validation_poses", "seed",
 })
 
 
@@ -481,8 +639,9 @@ def friction_cruise_s(speed_deg_s: float) -> float:
     if speed <= 0.0:
         return FRICTION_MAXIMUM_CRUISE_S
     wanted = FRICTION_CRUISE_ARC_DEG / speed
-    return float(min(FRICTION_MAXIMUM_CRUISE_S,
-                     max(FRICTION_CRUISE_S, wanted)))
+    held = min(FRICTION_MAXIMUM_CRUISE_S, max(FRICTION_CRUISE_S, wanted))
+    return float(min(max(held, FRICTION_MINIMUM_ARC_DEG / speed),
+                     FRICTION_CRAWL_CRUISE_S))
 
 
 def pass_amplitude_deg(speed_deg_s: float, ceiling_deg: float) -> float:
@@ -655,6 +814,32 @@ def _swept_rows(observations, joint: int) -> list[bool]:
     return rows
 
 
+def _steady_curve_summary(points, low_speed_ceiling: float = 0.5,
+                          minimum_peak_a: float = 0.02) -> dict:
+    """Classify a controlled same-load curve, not a mixed scatter cloud."""
+    grouped = {}
+    for speed, friction in points:
+        grouped.setdefault(float(speed), []).append(float(friction))
+    curve = [(speed, float(np.median(values)))
+             for speed, values in sorted(grouped.items())]
+    if not curve:
+        return {"classical_low_speed_peak": False,
+                "low_speed_peak_a": 0.0, "interior_peak_a": 0.0,
+                "curve": []}
+    terminal = curve[-1][1]
+    low = [friction for speed, friction in curve
+           if speed <= low_speed_ceiling]
+    low_peak = max(low, default=curve[0][1]) - terminal
+    interior_peak = max(friction for _speed, friction in curve) - terminal
+    return {
+        "classical_low_speed_peak": bool(low_peak > minimum_peak_a),
+        "low_speed_peak_a": float(low_peak),
+        "interior_peak_a": float(interior_peak),
+        "curve": [{"speed_deg_s": speed, "friction_a": friction}
+                  for speed, friction in curve],
+    }
+
+
 class Campaign:
     """Runs the phases against a plant and regresses the result."""
 
@@ -677,8 +862,24 @@ class Campaign:
         self.observations: list[Observation] = []
         self.reports: list[PhaseReport] = []
         self.skipped: list[dict] = []
+        # Shrunk for a joint that drew more than its drive would give, so the
+        # next design asks that joint for less instead of tripping again.
+        self.joint_amplitude_scale = np.ones(arm.joint_count)
         self.aborted: str | None = None
         self._started = self.clock()
+
+    def _back_off(self, trip: DriveTrip) -> None:
+        joint = int(trip.joint)
+        self.joint_amplitude_scale[joint] *= TRIP_BACKOFF
+        setter = getattr(self.plant, "set_monitor", None)
+        if setter is not None:
+            setter(self.monitor)
+        self.progress(self.reports[-1].phase if self.reports else "", {
+            "backed_off_joint": joint + 1,
+            "amplitude_scale": round(
+                float(self.joint_amplitude_scale[joint]), 4),
+            "reason": str(trip),
+        })
 
     def _plant_limits(self):
         getter = getattr(self.plant, "limits_deg", None)
@@ -711,9 +912,10 @@ class Campaign:
         report = getattr(model, "geometry_report", None)
         return bool(report and report().get("self_collision_checked"))
 
-    def _friction_postures(self) -> tuple[int, str | None]:
+    def _friction_postures(self, requested: int | None = None) -> tuple[int, str | None]:
         """How many postures may be swept, given what can be verified."""
-        wanted = max(1, int(self.plan.friction_postures))
+        wanted = max(1, int(
+            self.plan.friction_postures if requested is None else requested))
         if wanted == 1 or self._self_collision_checked():
             return wanted, None
         return 1, ("collision geometry unavailable, so postures away from home "
@@ -735,7 +937,9 @@ class Campaign:
             self.monitor.last_sample_at = None
             trip = self.monitor.check(sample, self.clock())
             if trip:
-                raise Abort(trip)
+                detail = getattr(self.monitor, "last_trip", None) or {}
+                raise DriveTrip(trip, joint=detail.get("joint"),
+                                kind=detail.get("kind", ""))
 
         temperatures = sample.get("temperature_c") or []
         for index, value in enumerate(temperatures):
@@ -794,23 +998,44 @@ class Campaign:
         start again, which is a worse outcome than a gap in the ladder. Failures
         are counted, and enough of them still stops the run: an arm refusing
         everything is not producing a dataset, it is producing a log.
+
+        A drive that asked for more current than it may draw is the same kind
+        of problem when amplitude can answer it: the joint gives up some swing
+        and the run carries on. A fault word or a disabled drive cannot be
+        answered that way and still stops everything.
         """
         try:
             motion()
             return True
-        except MotionFailed as failure:
-            self.skipped.append({"phase": report.phase, "motion": what,
-                                 "reason": str(failure)})
-            report.detail.setdefault("skipped", []).append(
-                {"motion": what, "reason": str(failure)})
-            self.progress(report.phase, {"skipped": what,
-                                         "reason": str(failure),
-                                         "skipped_total": len(self.skipped)})
-            if len(self.skipped) > self.plan.skip_budget:
-                raise Abort(
-                    f"{len(self.skipped)} motions failed, over the budget of "
-                    f"{self.plan.skip_budget}: {failure}") from failure
+        except DriveTrip as trip:
+            if not trip.recoverable:
+                raise
+            self._skipped(report, what, f"drive trip: {trip}")
+            self._back_off(trip)
             return False
+        except DriveLimitExceeded as failure:
+            trip = DriveTrip(str(failure), joint=failure.joint,
+                             kind=failure.kind)
+            if not trip.recoverable:
+                raise
+            self._skipped(report, what, f"drive trip: {trip}")
+            self._back_off(trip)
+            return False
+        except MotionFailed as failure:
+            self._skipped(report, what, str(failure))
+            return False
+
+    def _skipped(self, report: PhaseReport, what: str, reason: str) -> None:
+        self.skipped.append({"phase": report.phase, "motion": what,
+                             "reason": reason})
+        report.detail.setdefault("skipped", []).append(
+            {"motion": what, "reason": reason})
+        self.progress(report.phase, {"skipped": what, "reason": reason,
+                                     "skipped_total": len(self.skipped)})
+        if len(self.skipped) > self.plan.skip_budget:
+            raise Abort(
+                f"{len(self.skipped)} motions failed, over the budget of "
+                f"{self.plan.skip_budget}: {reason}")
 
     def _probe(self, pose_deg) -> list:
         """Gravity samples at a pose, with friction forced to a known sign.
@@ -839,6 +1064,10 @@ class Campaign:
         """Take another reading at rest, re-commanding only if the plant needs it."""
         dwell = getattr(self.plant, "dwell", None)
         return self.plant.hold_pose(pose_deg) if dwell is None else dwell(pose_deg)
+
+    def _execution_trajectory(self, trajectory):
+        return excitation.ramp_fourier_trajectory(
+            trajectory, self.plan.fourier_ramp_s)
 
     def run_gravity(self) -> PhaseReport:
         report, start = self._open(PHASE_GRAVITY)
@@ -921,6 +1150,7 @@ class Campaign:
                 report.aborted = "no feasible trajectory within the limits"
                 return report
 
+            trajectory = self._execution_trajectory(trajectory)
             report.detail = {"trajectory": trajectory.as_dict()}
             emitted = 0
 
@@ -1005,6 +1235,7 @@ class Campaign:
                 collision_free=admissible)
             tracked = 0
             if trajectory is not None:
+                trajectory = self._execution_trajectory(trajectory)
                 for frame in self.plant.track(
                         trajectory, self.plan.sample_rate_hz):
                     self._record(PHASE_VALIDATION, frame, report,
@@ -1054,15 +1285,37 @@ class Campaign:
             currents.append(np.asarray(record.current_a, dtype=float))
         return regressors, velocities, currents
 
+    def _main_training_observations(self, usable):
+        """Rows that determine the predictor; subclasses may own extra phases."""
+        return [record for record in usable
+                if record.phase != PHASE_VALIDATION]
+
     def fit(self) -> CampaignResult:
         """Regress on phases A-C and score on phase D."""
+        acceleration_ceiling = 2.0 * self.limits.maximum_acceleration_deg_s2
+        excluded = [
+            record for record in self.observations
+            if record.acceleration_deg_s2
+            and max(abs(value) for value in record.acceleration_deg_s2)
+            > acceleration_ceiling]
+        usable = [record for record in self.observations
+                  if record not in excluded]
         result = CampaignResult(
             plan=self.plan.as_dict(),
-            phases=[report.as_dict() for report in self.reports])
+            phases=[report.as_dict() for report in self.reports],
+            data_quality={
+                "observations_recorded": len(self.observations),
+                "observations_used": len(usable),
+                "excluded_acceleration_outliers": len(excluded),
+                "acceleration_exclusion_deg_s2": acceleration_ceiling,
+            })
 
-        training = [record for record in self.observations
-                    if record.phase != PHASE_VALIDATION]
-        holdout = [record for record in self.observations
+        training = self._main_training_observations(usable)
+        training_ids = {id(record) for record in training}
+        auxiliary = [record for record in usable
+                 if record.phase != PHASE_VALIDATION
+                 and id(record) not in training_ids]
+        holdout = [record for record in usable
                    if record.phase == PHASE_VALIDATION]
         if not training:
             result.aborted = "no training observations"
@@ -1071,6 +1324,13 @@ class Campaign:
         train_rows = self._rows(training)
         holdout_rows = self._rows(holdout) if holdout else None
         result.validation_samples = len(holdout)
+        result.data_quality["main_training_observations"] = len(training)
+        result.data_quality["auxiliary_friction_observations"] = len(auxiliary)
+        selection_groups = [
+            f"{record.phase}:{record.motion or 'untagged'}"
+            for record in training]
+        result.data_quality["optional_selection_groups"] = len(
+            set(selection_groups))
 
         for joint in range(self.arm.joint_count):
             fit = ident.fit_joint(
@@ -1080,8 +1340,11 @@ class Campaign:
                 maximum_condition=MAXIMUM_CONDITION,
                 components=self.plan.model_components(),
                 transition_rows=_swept_rows(training, joint),
+                selection_groups=selection_groups,
                 seed=self.plan.seed)
             entry = fit.as_dict()
+            entry["peak_measured_effort"] = max(
+                abs(float(record.current_a[joint])) for record in usable)
             if holdout_rows is not None:
                 predicted = np.array([
                     ident.predict_joint(fit, regressor, velocity[joint])
@@ -1111,6 +1374,348 @@ class Campaign:
                 # minute of it failed. Whatever went wrong is recorded and the
                 # data already taken goes on to be fitted and written, rather
                 # than being discarded on the way out.
+                self.aborted = f"{self.reports[-1].phase}: {error}"
+                self.reports[-1].aborted = str(error)
+                break
+            if report.aborted:
+                self.aborted = f"{report.phase}: {report.aborted}"
+                break
+        result = self.fit()
+        if self.aborted:
+            result.aborted = self.aborted
+        result.skipped = list(self.skipped)
+        return result
+
+
+class OptimalExcitationCampaign(Campaign):
+    """Identify from one designed set of complementary excitation trajectories.
+
+    Every training trajectory is selected against the regressors of the ones
+    already accepted, so the added rows carry new parameter directions rather
+    than merely repeating one attractive motion. Short load-conditioned,
+    constant-speed subtrajectories supply the steady low-speed rows a friction
+    law needs; Fourier trajectories supply the inertial rows. Validation uses
+    separate Fourier seeds and frequencies and is never included in the fit.
+    """
+
+    _TRAINING_FREQUENCY_SCALES = (0.75, 0.9, 1.0, 1.1, 1.25)
+    _VALIDATION_FREQUENCY_SCALES = (1.3, 1.45, 1.6)
+    _DESIGN_SAMPLES = 40
+    _FRICTION_MOTION = re.compile(
+        r"optimal_friction:j(\d+):([0-9.]+):([+-]):s(\d+):r(\d+)")
+
+    def _main_training_observations(self, usable):
+        """Steady B data diagnoses friction; C alone owns the dynamic model."""
+        return [record for record in usable
+                if record.phase == PHASE_INERTIA]
+
+    def _steady_friction_audit(self, fits) -> dict:
+        """Controlled same-load curves, evaluated against the frozen rigid fit."""
+        swept = [record for record in self.observations
+                 if record.phase == PHASE_FRICTION]
+        joints = []
+        for joint, fit in enumerate(fits):
+            levels = {}
+            for record in swept:
+                match = self._FRICTION_MOTION.fullmatch(record.motion or "")
+                if match is None or int(match.group(1)) != joint:
+                    continue
+                speed = float(match.group(2))
+                direction = 1.0 if match.group(3) == "+" else -1.0
+                level = int(match.group(4))
+                regressor = self.arm.torque_regressor(
+                    record.position_deg, record.velocity_deg_s,
+                    record.acceleration_deg_s2)
+                acceleration = float(record.acceleration_deg_s2[joint])
+                velocity = float(record.velocity_deg_s[joint])
+                rigid = ident.predict_joint(
+                    fit, regressor, velocity, include_friction=False,
+                    acceleration=acceleration)
+                levels.setdefault(level, []).append({
+                    "nominal_speed_deg_s": speed,
+                    "actual_speed_deg_s": abs(velocity),
+                    "acceleration_deg_s2": abs(acceleration),
+                    "signed_friction_a": direction * (
+                        float(record.current_a[joint]) - rigid),
+                    "load_a": abs(rigid),
+                })
+            summaries = []
+            for level, rows in sorted(levels.items()):
+                summary = _steady_curve_summary([
+                    (row["nominal_speed_deg_s"], row["signed_friction_a"])
+                    for row in rows])
+                summary.update({
+                    "level": level,
+                    "observations": len(rows),
+                    "load_median_a": float(np.median(
+                        [row["load_a"] for row in rows])),
+                    "actual_speed_error_median_deg_s": float(np.median([
+                        abs(row["actual_speed_deg_s"]
+                            - row["nominal_speed_deg_s"])
+                        for row in rows])),
+                    "acceleration_median_deg_s2": float(np.median([
+                        row["acceleration_deg_s2"] for row in rows])),
+                })
+                summaries.append(summary)
+            joints.append({
+                "joint": joint,
+                "observations": sum(level["observations"]
+                                    for level in summaries),
+                "load_levels": summaries,
+                "classical_low_speed_peak": any(
+                    level["classical_low_speed_peak"] for level in summaries),
+                "maximum_low_speed_peak_a": max(
+                    (level["low_speed_peak_a"] for level in summaries),
+                    default=0.0),
+                "maximum_interior_peak_a": max(
+                    (level["interior_peak_a"] for level in summaries),
+                    default=0.0),
+            })
+        return {
+            "available": bool(swept and fits),
+            "method": "same_load_direction_paired_pass_medians",
+            "used_by_dynamic_fit": False,
+            "low_speed_ceiling_deg_s": 0.5,
+            "minimum_peak_a": 0.02,
+            "observations": len(swept),
+            "joints": joints,
+        }
+
+    def fit(self) -> CampaignResult:
+        result = super().fit()
+        if result.fits:
+            result.steady_friction_audit = self._steady_friction_audit(
+                result.fits)
+        return result
+
+    def reuse_low_speed_friction(self, observations, source: str,
+                                 phase: dict) -> None:
+        """Seed a recovery run from a completed, compatible low-speed phase."""
+        if self.observations or self.reports:
+            raise ValueError("low-speed data can only be reused before the run")
+        records = list(observations)
+        if not records or any(record.phase != PHASE_FRICTION
+                              for record in records):
+            raise ValueError("reused data must contain friction observations")
+        detail = dict(phase.get("detail") or {})
+        detail.update({
+            "reused": True,
+            "reused_from": str(source),
+            "source_observations": len(records),
+        })
+        self.observations.extend(records)
+        self.reports.append(PhaseReport(
+            phase=PHASE_FRICTION,
+            observations=len(records),
+            duration_s=float(phase.get("duration_s") or 0.0),
+            peak_temperature_c=float(phase.get("peak_temperature_c") or 0.0),
+            peak_speed_deg_s=float(phase.get("peak_speed_deg_s") or 0.0),
+            peak_current_a=float(phase.get("peak_current_a") or 0.0),
+            detail=detail))
+
+    def _planned_rows(self, trajectory) -> list[np.ndarray]:
+        rows = []
+        for step in range(self._DESIGN_SAMPLES):
+            time_s = trajectory.duration_s * step / self._DESIGN_SAMPLES
+            position, velocity, acceleration = trajectory.sample(time_s)
+            rows.append(self.arm.torque_regressor(
+                position, velocity, acceleration))
+        return rows
+
+    def _current_pose(self, fallback) -> np.ndarray:
+        sample = getattr(self.plant, "sample", None)
+        if sample is not None:
+            try:
+                return np.asarray(sample()["position_deg"], dtype=float)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass
+        return np.asarray(fallback, dtype=float)
+
+    def run_low_speed_friction(self) -> PhaseReport:
+        """Collect steady low-speed rows at collision-screened load postures."""
+        report, start = self._open(PHASE_FRICTION)
+        speeds = tuple(sorted({
+            float(speed) for speed in self.plan.optimal_friction_speeds_deg_s
+            if 0.0 < float(speed) <= self.plan.maximum_speed_deg_s
+        }))
+        postures, downgraded = self._friction_postures(
+            self.plan.optimal_friction_postures)
+        repeats = max(1, int(self.plan.optimal_friction_repeats))
+        room = max(
+            (pass_amplitude_deg(speed, self.plan.friction_amplitude_deg)
+             for speed in speeds), default=0.0)
+        sweeps = excitation.design_friction_sweeps(
+            self.arm, self.limits, amplitude_deg=room,
+            speeds_deg_s=speeds, postures=postures,
+            collision_free=self._collision_free(), seed=self.plan.seed + 7001)
+        report.detail = {
+            "purpose": "steady_low_speed_load_conditioned",
+            "speeds_deg_s": list(speeds),
+            "repeats_per_direction": repeats,
+            "postures": postures,
+            "planned_passes": len(sweeps) * len(speeds) * repeats * 2,
+            "completed_passes": 0,
+            "sweeps": [sweep.as_dict() for sweep in sweeps],
+        }
+        if downgraded:
+            report.detail["downgraded"] = downgraded
+        try:
+            for sweep_index, sweep in enumerate(sweeps):
+                centre = (np.asarray(sweep.start_deg, dtype=float)[sweep.joint]
+                          + sweep.amplitude_deg / 2.0)
+                for speed in speeds:
+                    amplitude = pass_amplitude_deg(speed, sweep.amplitude_deg)
+                    for repeat in range(repeats):
+                        for direction in (1.0, -1.0):
+                            distance = direction * amplitude
+                            origin = np.asarray(sweep.start_deg, dtype=float).copy()
+                            origin[sweep.joint] = centre - distance / 2.0
+                            tag = (
+                                f"optimal_friction:j{sweep.joint}:{speed:g}:"
+                                f"{'+' if direction > 0.0 else '-'}:"
+                                f"s{sweep_index + 1}:r{repeat + 1}")
+
+                            def follow(joint=sweep.joint, origin=origin,
+                                       distance=distance, speed=speed,
+                                       tag=tag):
+                                for frame in self.plant.traverse(
+                                        joint, origin, distance, speed):
+                                    sample = dict(frame)
+                                    sample["motion"] = tag
+                                    self._record(PHASE_FRICTION, sample, report)
+
+                            if self._attempt(report, tag, follow):
+                                report.detail["completed_passes"] += 1
+                            self.progress(PHASE_FRICTION, {
+                                "pass": report.detail["completed_passes"],
+                                "passes": report.detail["planned_passes"],
+                                "joint": sweep.joint + 1,
+                                "speed_deg_s": speed,
+                            })
+            if not report.detail["completed_passes"]:
+                report.aborted = "no feasible low-speed friction trajectory"
+        finally:
+            report.duration_s = self.clock() - start
+        return report
+
+    def _run_trajectory_set(self, phase: str, count: int, scales,
+                            seed_base: int) -> PhaseReport:
+        report, start = self._open(phase)
+        selected_rows: list[np.ndarray] = []
+        current = self._current_pose(np.zeros(self.arm.joint_count))
+        report.detail = {
+            "requested_trajectories": int(count),
+            "selection": "cumulative_regressor_condition",
+            "trajectories": [],
+        }
+        try:
+            for index in range(max(0, int(count))):
+                scale = scales[index % len(scales)]
+                frequency = min(
+                    0.3, self.plan.fourier_base_frequency_hz * scale)
+                # Re-planned rather than abandoned: a trip narrows the joint
+                # that drew too much, so the next design asks it for less.
+                for retry in range(TRIP_RETRIES + 1):
+                    trajectory = excitation.design_fourier_trajectory(
+                        self.arm, self.limits,
+                        harmonics=self.plan.fourier_harmonics,
+                        base_frequency_hz=frequency,
+                        duration_s=self.plan.fourier_duration_s,
+                        attempts=self.plan.fourier_attempts,
+                        seed=seed_base + 997 * index + 31 * retry,
+                        collision_free=self._collision_free(),
+                        conditioning_rows=selected_rows,
+                        randomize_centre=True,
+                        start_deg=current,
+                        minimum_amplitude_fraction=(
+                            self.plan.optimal_fourier_amplitude_fraction),
+                        joint_amplitude_scale=self.joint_amplitude_scale)
+                    if trajectory is None:
+                        self.skipped.append({
+                            "phase": phase,
+                            "motion": f"optimal trajectory {index + 1}",
+                            "reason": "no feasible trajectory within the limits",
+                        })
+                        break
+
+                    execution = self._execution_trajectory(trajectory)
+
+                    emitted = 0
+
+                    def follow():
+                        nonlocal emitted
+                        for frame in self.plant.track(
+                                execution, self.plan.sample_rate_hz):
+                            sample = dict(frame)
+                            sample["motion"] = (
+                                f"optimal:{'validation' if phase == PHASE_VALIDATION else 'training'}:"
+                                f"{index + 1}")
+                            self._record(
+                                phase, sample, report,
+                                sample.get("acceleration_deg_s2"))
+                            emitted += 1
+                            if emitted % 20 == 0:
+                                self.progress(phase, {
+                                    "trajectory": index + 1,
+                                    "trajectories": count,
+                                    "trajectory_samples": emitted,
+                                })
+
+                    completed = self._attempt(
+                        report, f"optimal trajectory {index + 1}", follow)
+                    current = self._current_pose(
+                        execution.sample(execution.duration_s)[0]
+                        if completed else current)
+                    if not completed:
+                        continue
+                    selected_rows.extend(self._planned_rows(execution))
+                    detail = execution.as_dict()
+                    detail.update({
+                        "index": index + 1,
+                        "observations": emitted,
+                        "retries": retry,
+                        "cumulative_condition": round(
+                            ident.stacked_condition_number(selected_rows), 6),
+                    })
+                    report.detail["trajectories"].append(detail)
+                    self.progress(phase, {
+                        "trajectory": index + 1,
+                        "trajectories": count,
+                        "trajectory_samples": emitted,
+                    })
+                    break
+            if not report.detail["trajectories"]:
+                report.aborted = "no feasible optimal excitation trajectory"
+        finally:
+            report.detail["completed_trajectories"] = len(
+                report.detail["trajectories"])
+            report.duration_s = self.clock() - start
+        return report
+
+    def run_training(self) -> PhaseReport:
+        return self._run_trajectory_set(
+            PHASE_INERTIA, self.plan.optimal_training_trajectories,
+            self._TRAINING_FREQUENCY_SCALES, self.plan.seed + 10001)
+
+    def run_optimal_validation(self) -> PhaseReport:
+        return self._run_trajectory_set(
+            PHASE_VALIDATION, self.plan.optimal_validation_trajectories,
+            self._VALIDATION_FREQUENCY_SCALES, self.plan.seed + 50021)
+
+    def run(self) -> CampaignResult:
+        """Low-speed and Fourier training, then independent Fourier validation."""
+        self.aborted = None
+        phases = ([self.run_low_speed_friction]
+                  if not self.reports else [])
+        phases.extend((self.run_training, self.run_optimal_validation))
+        for phase in phases:
+            try:
+                report = phase()
+            except Abort as stop:
+                self.aborted = str(stop)
+                self.reports[-1].aborted = self.aborted
+                break
+            except Exception as error:  # noqa: BLE001
                 self.aborted = f"{self.reports[-1].phase}: {error}"
                 self.reports[-1].aborted = str(error)
                 break

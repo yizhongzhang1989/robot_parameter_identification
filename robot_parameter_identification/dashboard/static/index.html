@@ -109,6 +109,42 @@
     </div>
 
     <div class="card">
+      <h2 data-i18n="optimal.title">Optimal excitation identification</h2>
+      <p class="hint" data-i18n="optimal.hint">Load-conditioned low-speed
+        subtrajectories identify steady friction; distinct, cumulatively
+        optimized multi-joint Fourier trajectories identify rigid dynamics.
+        Separate Fourier trajectories remain untouched for validation.</p>
+      <div class="grid3">
+        <label class="field"><span data-i18n="optimal.training">training trajectories</span>
+          <input id="optimal-training" type="number" min="2" max="32" step="1" value="12"/>
+        </label>
+        <label class="field"><span data-i18n="optimal.validation">validation trajectories</span>
+          <input id="optimal-validation" type="number" min="1" max="8" step="1" value="3"/>
+        </label>
+        <label class="field"><span data-i18n="optimal.duration">seconds each</span>
+          <input id="optimal-duration" type="number" min="5" max="120" step="5" value="30"/>
+        </label>
+      </div>
+      <div class="grid3">
+        <label class="field"><span data-i18n="optimal.postures">low-speed load postures</span>
+          <input id="optimal-postures" type="number" min="1" max="5" step="1" value="3"/>
+        </label>
+        <label class="field"><span data-i18n="optimal.repeats">passes per direction</span>
+          <input id="optimal-repeats" type="number" min="1" max="5" step="1" value="2"/>
+        </label>
+        <label class="field"><span data-i18n="optimal.frequency">Fourier base frequency (Hz)</span>
+          <input id="optimal-frequency" type="number" min="0.02" max="0.3" step="0.01" value="0.08"/>
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-optimal" class="danger" disabled
+                data-i18n="optimal.start">Run optimal excitation</button>
+        <label class="inline"><input type="checkbox" id="optimal-reuse-friction">
+          <span data-i18n="optimal.reuse">reuse latest completed low-speed phase</span></label>
+      </div>
+    </div>
+
+    <div class="card">
       <h2 data-i18n="sweep.title">Load sweep</h2>
       <p class="hint" data-i18n="sweep.hint">Drives a speed ladder at a series
         of gravity loads, one joint at a time. The levels are searched for, not
@@ -144,6 +180,14 @@
       <canvas id="chart-error" height="150"></canvas>
       <table class="kv" id="verdict-table"></table>
       <p class="hint" id="recovery"></p>
+    </div>
+
+    <div class="card hidden" id="compare-card">
+      <h2 data-i18n="compare.title">Optimal excitation vs load sweep</h2>
+      <p class="hint" data-i18n="compare.hint">Both models are scored on the
+        same Fourier validation trajectories, which neither model trained on.</p>
+      <div id="compare-summary"></div>
+      <div class="scroll-x"><table class="live" id="compare-table"></table></div>
     </div>
 
     <div class="card">

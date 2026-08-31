@@ -169,6 +169,18 @@ function renderObstacleList() {
 
 $('btn-rehearse').addEventListener('click', () => post('/api/campaign', { mode: 'rehearsal' }));
 $('btn-hardware').addEventListener('click', () => post('/api/campaign', { mode: 'hardware' }));
+$('btn-optimal').addEventListener('click', () => post('/api/campaign', {
+  mode: 'optimal_excitation',
+  options: {
+    optimal_training_trajectories: parseInt($('optimal-training').value, 10),
+    optimal_validation_trajectories: parseInt($('optimal-validation').value, 10),
+    optimal_friction_postures: parseInt($('optimal-postures').value, 10),
+    optimal_friction_repeats: parseInt($('optimal-repeats').value, 10),
+    fourier_base_frequency_hz: parseFloat($('optimal-frequency').value),
+    fourier_duration_s: parseFloat($('optimal-duration').value),
+    reuse_friction: $('optimal-reuse-friction').checked,
+  },
+}));
 $('btn-home').addEventListener('click', () => post('/api/home', {}));
 $('btn-stop').addEventListener('click', () => post('/api/stop', {}));
 $('btn-sweep').addEventListener('click', () => post('/api/campaign', {
@@ -271,6 +283,7 @@ function renderRun(snapshot) {
   $('run-state').className = 'state' + (running ? ' running' : '');
   $('btn-rehearse').disabled = running || !snapshot.have_model;
   $('btn-hardware').disabled = running || !snapshot.rehearsal_passed;
+  $('btn-optimal').disabled = running || !snapshot.rehearsal_passed;
   // Homing runs no identification, so the rehearsal gate does not apply; it
   // would only block recovering an arm the plant already refuses to arm.
   $('btn-home').disabled = running || !snapshot.have_model;
@@ -301,6 +314,9 @@ function renderRun(snapshot) {
   }
   if (progress.pose != null) {
     bits.push(`${t('run.pose')} ${progress.pose}/${progress.poses ?? '?'}`);
+  }
+  if (progress.trajectory != null) {
+    bits.push(`${t('optimal.trajectory')} ${progress.trajectory}/${progress.trajectories ?? '?'}`);
   }
   if (progress.worst_deg != null) {
     bits.push(t('run.worst', { v: progress.worst_deg }));
@@ -430,13 +446,51 @@ function renderResult(snapshot) {
 
   $('params').innerHTML = joints.map((entry, i) => {
     const friction = entry.friction || {};
+    const components = entry.components || {};
     const physical = (friction.coulomb ?? 0) >= 0 && (friction.viscous ?? 0) >= 0;
     return `<div class="param-row"><span title="${label(i)}">${label(i)}</span>`
       + `<span class="muted">c ${(friction.coulomb ?? 0).toFixed(3)} ${state.unit}`
+      + `${components.load_friction ? ` \u00b7 \u03bc ${(friction.load_friction ?? 0).toFixed(3)}` : ''}`
       + ` \u00b7 v ${(friction.viscous ?? 0).toFixed(4)} ${state.unit}/(\u00b0/s)</span>`
       + `<span class="badge ${physical ? 'ok' : 'bad'}">`
       + `${t(physical ? 'params.physical' : 'params.unphysical')}</span></div>`;
   }).join('') || `<span class="muted">${t('params.none')}</span>`;
+  renderComparison(result, names);
+}
+
+function renderComparison(result, names) {
+  const card = $('compare-card');
+  const comparison = result?.comparison;
+  card.classList.toggle('hidden', !comparison || !Object.keys(comparison).length);
+  if (!comparison || !Object.keys(comparison).length) return;
+  if (!comparison.available) {
+    $('compare-summary').innerHTML = `<p class="hint">${t('compare.unavailable')}: `
+      + `${comparison.reason || ''}</p>`;
+    $('compare-table').innerHTML = '';
+    return;
+  }
+  const signed = (value) => Number.isFinite(value)
+    ? `${value >= 0 ? '+' : ''}${value.toFixed(1)}%` : '—';
+  const statusClass = comparison.target_met ? 'ok' : 'bad';
+  $('compare-summary').innerHTML = `<p><span class="badge ${statusClass}">`
+    + `${t(comparison.target_met ? 'compare.met' : 'compare.missed')}</span></p>`
+    + `<p class="hint">${t('compare.mean')}: `
+    + `${comparison.optimal_mean_validation_rms_a.toFixed(4)} / `
+    + `${comparison.sweep_mean_validation_rms_a.toFixed(4)} ${state.unit || 'A'} `
+    + `(${signed(comparison.mean_improvement_percent)}); ${t('compare.worst')}: `
+    + `${comparison.optimal_worst_validation_rms_a.toFixed(4)} / `
+    + `${comparison.sweep_worst_validation_rms_a.toFixed(4)} ${state.unit || 'A'} `
+    + `(${signed(comparison.worst_improvement_percent)})</p>`;
+  const rows = comparison.joints || [];
+  $('compare-table').innerHTML = `<tr><th>${t('live.joint')}</th>`
+    + `<th class="num">${t('compare.optimal')}</th>`
+    + `<th class="num">${t('compare.sweep')}</th>`
+    + `<th class="num">${t('compare.improvement')}</th></tr>`
+    + rows.map((entry, index) => `<tr><td>${names[index] || entry.name || index + 1}</td>`
+      + `<td class="num">${entry.optimal_validation_rms_a.toFixed(4)}</td>`
+      + `<td class="num">${entry.sweep_validation_rms_a.toFixed(4)}</td>`
+      + `<td class="num ${entry.optimal_better ? 'ok' : 'bad'}">`
+      + `${signed(entry.improvement_percent)}</td></tr>`).join('');
 }
 
 function renderRuns(runs) {

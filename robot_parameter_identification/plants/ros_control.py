@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 
-from ..interfaces import MotionFailed, SignalMap
+from ..interfaces import DriveLimitExceeded, MotionFailed, SignalMap
 from ..profile import RobotProfile
 
 # A quintic zero-velocity endpoint trajectory peaks near 1.875x its average
@@ -28,6 +28,12 @@ MINIMUM_SEGMENT_S = 1.0
 SETTLE_S = 0.6
 NEUTRAL_TOLERANCE_DEG = 1.0
 TELEMETRY_REFRESH_S = 1.0
+# Only to keep the cruise arithmetic finite: the plan owns how slow a pass is,
+# and a floor high enough to matter would run a rung the report never named.
+MINIMUM_TRAVERSE_SPEED_DEG_S = 1e-3
+# Below this the servo's own speed ripple is a large share of the demand, so
+# the window has to be long enough to average it.
+CRAWL_SPEED_DEG_S = 0.1
 
 
 def differentiate(times_s, values, window: int = 5) -> np.ndarray:
@@ -166,6 +172,9 @@ class HardwareConfig:
     # pass; one long one is a better measurement of it.
     window_span_s: float = 0.1
     window_maximum_span_s: float = 1.5
+    # A crawl is held far longer than a normal pass, and its speed ripple only
+    # averages out over seconds. The cruise still bounds it.
+    window_crawl_span_s: float = 8.0
     # How far the joint may travel inside a window. Averaging across a wider
     # arc than this starts averaging across a changing gravity term.
     window_arc_deg: float = 6.0
@@ -195,7 +204,7 @@ class HardwarePlant:
 
     def __init__(self, profile: RobotProfile,
                  config: HardwareConfig | None = None,
-                 collision_model=None, node=None) -> None:
+                 collision_model=None, node=None, monitor=None) -> None:
         self.profile = profile
         self.joint_names = list(profile.joint_names)
         self.joint_count = profile.joint_count
@@ -213,10 +222,37 @@ class HardwarePlant:
         self._passes = 0
         self.raw_frames: list[dict] = []
         self._previous_position: tuple[np.ndarray | None, float] = (None, 0.0)
+        self._position_history: list[tuple[float, np.ndarray]] = []
         self._client = None
         self._rclpy = None
         self._context = None
         self._executor = None
+        self.monitor = monitor
+        self._monitor_trip: str | None = None
+        self._monitor_trip_detail: dict = {}
+
+    def set_monitor(self, monitor) -> None:
+        """Watch every raw frame and latch the first safety violation."""
+        self.monitor = monitor
+        self._monitor_trip = None
+        self._monitor_trip_detail = {}
+
+    def _check_monitor(self, sample: dict, now: float | None = None) -> None:
+        if self.monitor is None or self._monitor_trip is not None:
+            return
+        trip = self.monitor.check(
+            sample, time.monotonic() if now is None else float(now))
+        if trip:
+            self._monitor_trip = str(trip)
+            self._monitor_trip_detail = dict(
+                getattr(self.monitor, "last_trip", None) or {})
+
+    def _raise_if_monitor_tripped(self) -> None:
+        if self._monitor_trip is not None:
+            detail = getattr(self, "_monitor_trip_detail", {})
+            raise DriveLimitExceeded(
+                f"telemetry guard: {self._monitor_trip}",
+                joint=detail.get("joint"), kind=detail.get("kind", ""))
 
     # -- lifecycle -------------------------------------------------------
 
@@ -308,9 +344,16 @@ class HardwarePlant:
             return
 
         position = np.degrees(np.asarray(columns["position"], dtype=float))
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        if stamp is not None:
+            stamp_s = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        else:
+            stamp_s = time.monotonic()
+        position_speed = self._position_speed(position, stamp_s)
         frame = {
             "position_deg": position.tolist(),
-            "speed_deg_s": self._speed(columns, position),
+            "speed_deg_s": self._speed(columns, position_speed),
+            "safety_speed_deg_s": position_speed.tolist(),
             "current_a": [float(v) for v in columns["effort"]],
             "temperature_c": [float(v) for v in columns.get("temperature", [])],
             "voltage_v": [float(v) for v in columns.get("voltage", [])],
@@ -325,18 +368,15 @@ class HardwarePlant:
         # arrive in bursts whenever the executor gets a slice, so arrival time
         # compresses a second of motion into a millisecond and any speed
         # differentiated from it is meaningless.
-        stamp = getattr(getattr(message, "header", None), "stamp", None)
-        if stamp is not None:
-            frame["stamp_s"] = float(stamp.sec) + float(stamp.nanosec) * 1e-9
-        else:
-            frame["stamp_s"] = time.monotonic()
+        frame["stamp_s"] = stamp_s
+        self._check_monitor(frame)
         with self._lock:
             self._latest = frame
             self._latest_at = time.monotonic()
             if self._buffering:
                 self._buffer.append(frame)
 
-    def _speed(self, columns: dict, position_deg: np.ndarray) -> list[float]:
+    def _speed(self, columns: dict, position_speed: np.ndarray) -> list[float]:
         """Mapped velocity when the drive publishes one, else differentiated.
 
         The signal map promises velocity is optional; without this that promise
@@ -345,13 +385,29 @@ class HardwarePlant:
         if "velocity" in columns:
             return np.degrees(
                 np.asarray(columns["velocity"], dtype=float)).tolist()
-        now = time.monotonic()
+        return position_speed.tolist()
+
+    def _position_speed(self, position_deg: np.ndarray,
+                        stamp_s: float) -> np.ndarray:
+        """Short position/time fit for guards, robust to one quantized frame."""
+        position = np.asarray(position_deg, dtype=float)
         previous, at = self._previous_position
-        self._previous_position = (position_deg, now)
-        gap = now - at
+        self._previous_position = (position.copy(), float(stamp_s))
+        gap = float(stamp_s) - at
         if previous is None or gap <= 1e-4 or gap > 0.5:
-            return [0.0] * len(position_deg)
-        return ((position_deg - previous) / gap).tolist()
+            self._position_history = [(float(stamp_s), position.copy())]
+            return np.zeros_like(position)
+        self._position_history.append((float(stamp_s), position.copy()))
+        del self._position_history[:-5]
+        if len(self._position_history) < 2:
+            return np.zeros_like(position)
+        times = np.asarray([entry[0] for entry in self._position_history])
+        positions = np.asarray([entry[1] for entry in self._position_history])
+        centred = times - times.mean()
+        denominator = float(centred @ centred)
+        if denominator <= 0.0:
+            return np.zeros_like(position)
+        return (centred[:, None] * positions).sum(axis=0) / denominator
 
     def _spin_for(self, seconds: float) -> None:
         if self._rclpy is None or self._node is None:
@@ -401,20 +457,27 @@ class HardwarePlant:
                 self.raw_frames.append(stored)
         return frames
 
-    def _window_span(self, speed_deg_s: float) -> float:
+    def _window_span(self, speed_deg_s: float,
+                     cruise_s: float | None = None) -> float:
         """The longest window this speed can fill without crossing much arc."""
         speed = abs(float(speed_deg_s))
         if speed <= 0.0:
             return self.config.window_maximum_span_s
         by_arc = self.config.window_arc_deg / speed
-        return float(min(max(by_arc, self.config.window_span_s),
-                         self.config.window_maximum_span_s))
+        ceiling = self.config.window_maximum_span_s
+        if speed < CRAWL_SPEED_DEG_S:
+            ceiling = max(ceiling, self.config.window_crawl_span_s)
+        if cruise_s:
+            # Half the cruise at most, so neither ramp is averaged back in.
+            ceiling = min(ceiling, 0.5 * float(cruise_s))
+        return float(min(max(by_arc, self.config.window_span_s), ceiling))
 
     def _observations(self, frames: list[dict], tag: str,
-                      speed_deg_s: float = 0.0) -> list[dict]:
+                      speed_deg_s: float = 0.0,
+                      cruise_s: float | None = None) -> list[dict]:
         """The fitted samples one motion contributes to the regression."""
         windows = pick_windows(frames, self.config.windows_per_move,
-                               self._window_span(speed_deg_s))
+                               self._window_span(speed_deg_s, cruise_s))
         found = []
         for index, burst in enumerate(windows):
             fitted = fit_window(burst, self.joint_count)
@@ -482,6 +545,8 @@ class HardwarePlant:
             try:
                 self._attempt(points, on_frame)
                 return
+            except DriveLimitExceeded:
+                raise
             except MotionFailed as failure:
                 if attempt >= attempts:
                     raise MotionFailed(
@@ -505,6 +570,7 @@ class HardwarePlant:
 
     def _attempt(self, points, on_frame=None):
         """Send one trajectory and pump telemetry until the controller is done."""
+        self._raise_if_monitor_tripped()
         goal = self._goal(points)
         duration = points[-1][2]
         send_future = self._client.send_goal_async(goal)
@@ -535,6 +601,7 @@ class HardwarePlant:
         try:
             while not result_future.done():
                 self._spin_once(0.01)
+                self._raise_if_monitor_tripped()
                 now = time.monotonic()
                 if now >= next_sample:
                     next_sample = now + period
@@ -546,6 +613,7 @@ class HardwarePlant:
             self._wait(cancel, 3.0)
             raise
         capture(time.monotonic())
+        self._raise_if_monitor_tripped()
         wrapped = result_future.result()
         if wrapped is None or (
                 wrapped.result.error_code
@@ -590,7 +658,7 @@ class HardwarePlant:
 
         end = start.copy()
         end[joint] += distance_deg
-        speed = max(speed_deg_s, 0.1)
+        speed = max(float(speed_deg_s), MINIMUM_TRAVERSE_SPEED_DEG_S)
         velocity = np.zeros(self.joint_count)
         velocity[joint] = math.copysign(speed, distance_deg)
 
@@ -619,7 +687,7 @@ class HardwarePlant:
             self._execute(points, lambda _t, frame: collected.append(frame))
         finally:
             frames = self._harvest(tag, "B_friction")
-        for observation in self._observations(frames, tag, speed):
+        for observation in self._observations(frames, tag, speed, cruise):
             yield observation
 
     def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float):

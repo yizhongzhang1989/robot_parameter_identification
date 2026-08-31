@@ -9,6 +9,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -390,6 +391,57 @@ class ReportTest(unittest.TestCase):
             story = loadsweep_report.summarise(folder)
             self.assertEqual(story["records"], 0)
             self.assertTrue(loadsweep_report.render(story))
+
+    def test_sweep_model_is_scored_on_external_validation_samples(self):
+        class OneJointArm:
+            joint_count = 1
+            joint_names = ["joint1"]
+
+            @staticmethod
+            def inverse_dynamics(_position, _velocity, _acceleration):
+                return np.array([2.0])
+
+            @staticmethod
+            def joint_loads(_position):
+                return np.array([[3.0, 0.0, 0.0, 0.0]])
+
+        friction = {"width": 1.0, "viscous": 0.0,
+                    "c0": 0.2, "ck": 0.0, "d0": 0.0, "dk": 0.0,
+                    "vs0": 1.0, "vsk": 0.0}
+        model = {"joints": [{
+            "joint": 0, "name": "joint1", "fit": friction,
+            "signed_amps_per_nm": 0.5, "amps_per_nm_used": 0.5,
+            "effort_offset_a": 0.1,
+        }]}
+        speed = 2.0
+        expected = 0.5 * 2.0 + 0.1 + float(
+            loadsweep_report.curve(friction, speed, 3.0))
+        observations = [SimpleNamespace(
+            position_deg=[0.0], velocity_deg_s=[speed],
+            acceleration_deg_s2=[0.0], current_a=[expected])]
+
+        scored = loadsweep_report.score_validation(
+            OneJointArm(), observations, model)
+
+        self.assertTrue(scored["available"])
+        self.assertAlmostEqual(scored["validation_rms_a"][0], 0.0, places=12)
+
+    def test_legacy_rows_recover_signed_torque_from_the_saved_pose(self):
+        class Arm:
+            @staticmethod
+            def inverse_dynamics(pose_deg):
+                return np.array([float(pose_deg[0])])
+
+        rows = []
+        for direction, current in (("+", 2.2), ("-", 1.8)):
+            rows.append({
+                "joint": 0, "level": 1, "speed_deg_s": 2.0,
+                "direction": direction, "current_a": current,
+                "temperature_c": 30.0, "pose_deg": [-3.0],
+                "load": {"axial_nm": 3.0},
+            })
+        table = loadsweep_report.split(rows, arm=Arm())
+        self.assertEqual(table[0]["signed"], -3.0)
 
 
 if __name__ == "__main__":

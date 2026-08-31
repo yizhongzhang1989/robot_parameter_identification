@@ -47,7 +47,8 @@ FRICTION_COLUMNS = ("coulomb", "viscous", "offset")
 # smaller. `stribeck` carries F_static - F_coulomb, so >= 0 is exactly
 # "static friction is at least dynamic friction".
 NONNEGATIVE_COLUMNS = (
-    "coulomb", "viscous", "stribeck", "actuator_inertia", "load_friction")
+    "coulomb", "viscous", "stribeck", "actuator_inertia", "load_friction",
+    "load_stribeck")
 PHYSICAL_PASSES = 4
 
 
@@ -403,7 +404,8 @@ def _solve(rigid: np.ndarray, velocities: np.ndarray, accelerations: np.ndarray,
     least-squares problem.
     """
     loads = np.zeros(target.size)
-    passes = LOAD_FRICTION_PASSES if components.load_friction else 1
+    passes = (LOAD_FRICTION_PASSES
+              if components.load_friction or components.load_stribeck else 1)
     outcome = None
     for _ in range(passes):
         stacked = _stack(rigid, velocities, accelerations, components, loads)
@@ -419,7 +421,8 @@ def _solve(rigid: np.ndarray, velocities: np.ndarray, accelerations: np.ndarray,
 
 
 def _choose_stribeck(rigid, velocities, accelerations, components, target,
-                     tolerance, maximum_condition, rigid_width, seed):
+                     tolerance, maximum_condition, rigid_width, seed,
+                     selection_groups=None, transition_rows=None):
     """Keep the optional friction columns each joint's held-back data wants.
 
     Adding a column almost never worsens the error it was fitted on, so the
@@ -429,16 +432,147 @@ def _choose_stribeck(rigid, velocities, accelerations, components, target,
     heaviest joint and nothing at all on the wrist, which carries no load in
     any pose.
     """
-    for name, switch in (("stribeck", "stribeck_search"),
-                         ("load_friction", "load_friction_search")):
-        components = _choose_column(
-            name, switch, rigid, velocities, accelerations, components, target,
-            tolerance, maximum_condition, rigid_width, seed)
-    return components
+    # Load is the larger effect on this arm. Selecting Stribeck first lets it
+    # absorb load variation, then collapse to zero when the load column arrives.
+    components = _choose_column(
+        "load_friction", "load_friction_search", rigid, velocities,
+        accelerations, components, target, tolerance, maximum_condition,
+        rigid_width, seed, selection_groups)
+    return _choose_stribeck_family(
+        rigid, velocities, accelerations, components, target, tolerance,
+        maximum_condition, rigid_width, seed, selection_groups,
+        transition_rows)
+
+
+def _selection_folds(rows: int, seed: int, groups=None):
+    """Cross-validation rows, keeping every tagged motion in one fold."""
+    rng = np.random.default_rng(seed)
+    if groups is not None:
+        groups = np.asarray(groups, dtype=object)
+        if groups.size != rows:
+            raise ValueError("selection_groups must match the sample count")
+        unique = np.asarray(list(dict.fromkeys(groups.tolist())), dtype=object)
+        if unique.size >= STRIBECK_FOLDS:
+            unique = unique[rng.permutation(unique.size)]
+            return [np.flatnonzero(np.isin(groups, group_fold))
+                    for group_fold in np.array_split(unique, STRIBECK_FOLDS)]
+    return list(np.array_split(rng.permutation(rows), STRIBECK_FOLDS))
+
+
+def _selection_partitions(rows: int, seed: int, groups=None, score_rows=None):
+    """Train/test indices, scoring dedicated friction rows when available."""
+    selected = np.arange(rows)
+    if score_rows is not None:
+        mask = np.asarray(score_rows, dtype=bool)
+        if mask.size != rows:
+            raise ValueError("transition_rows must match the sample count")
+        marked = np.flatnonzero(mask)
+        if marked.size >= STRIBECK_FOLDS * 8:
+            selected = marked
+
+    all_groups = None if groups is None else np.asarray(groups, dtype=object)
+    selected_groups = None if all_groups is None else all_groups[selected]
+    folds = _selection_folds(
+        selected.size, seed, selected_groups)
+    all_rows = np.arange(rows)
+    partitions = []
+    for local_test in folds:
+        test = selected[local_test]
+        if all_groups is None:
+            keep = np.setdiff1d(all_rows, test, assume_unique=True)
+        else:
+            held = np.unique(all_groups[test])
+            keep = np.flatnonzero(~np.isin(all_groups, held))
+        if test.size and keep.size:
+            partitions.append((keep, test))
+    return partitions
+
+
+def _component_score(candidate, rigid, velocities, accelerations, target,
+                     tolerance, maximum_condition, rigid_width, partitions):
+    """Pooled held-out RMS, rebuilding load only from each training fold."""
+    squared = 0.0
+    samples = 0
+    for keep, test in partitions:
+        outcome = _solve(
+            rigid[keep], velocities[keep], accelerations[keep], candidate,
+            target[keep], tolerance, maximum_condition, rigid_width)
+        if outcome is None:
+            return None
+        _, columns, solution, _rank, _condition = outcome
+        blank = _stack(
+            rigid[test], velocities[test], accelerations[test], candidate,
+            np.zeros(test.size))
+        loads = _rigid_current(blank, columns, solution, rigid_width)
+        scored = _stack(
+            rigid[test], velocities[test], accelerations[test], candidate,
+            loads)
+        error = target[test] - scored[:, columns] @ solution
+        squared += float(error @ error)
+        samples += int(error.size)
+    return None if not samples else float(np.sqrt(squared / samples))
+
+
+def _choose_stribeck_family(
+    rigid, velocities, accelerations, components, target, tolerance,
+    maximum_condition, rigid_width, seed, selection_groups=None,
+    transition_rows=None,
+):
+    """Select no/base/load/both Stribeck terms and their shared decay width."""
+    search_base = bool(components.stribeck_search)
+    search_load = bool(components.load_stribeck_search)
+    search_width = tuple(components.stribeck_speed_search or ())
+    if not search_base and not search_load and not search_width:
+        return components
+    if target.size < STRIBECK_FOLDS * 8:
+        return replace(
+            components, stribeck_search=False,
+            load_stribeck_search=False, stribeck_speed_search=())
+
+    baseline = replace(
+        components,
+        stribeck=(False if search_base else components.stribeck),
+        load_stribeck=(False if search_load else components.load_stribeck),
+        stribeck_search=False, load_stribeck_search=False,
+        stribeck_speed_search=())
+    widths = tuple(dict.fromkeys((components.stribeck_speed_deg_s,
+                                  *search_width)))
+    base_values = (False, True) if search_base else (baseline.stribeck,)
+    load_values = (False, True) if search_load else (baseline.load_stribeck,)
+    candidates = [baseline]
+    for base_enabled in base_values:
+        for load_enabled in load_values:
+            if not base_enabled and not load_enabled:
+                continue
+            for width in widths:
+                candidates.append(replace(
+                    baseline, stribeck=base_enabled,
+                    load_stribeck=load_enabled,
+                    stribeck_speed_deg_s=float(width)))
+
+    partitions = _selection_partitions(
+        target.size, seed, selection_groups, transition_rows)
+    scored = [
+        (_component_score(
+            candidate, rigid, velocities, accelerations, target, tolerance,
+            maximum_condition, rigid_width, partitions), candidate)
+        for candidate in candidates
+    ]
+    usable = [(score, candidate) for score, candidate in scored
+              if score is not None]
+    if not usable:
+        return baseline
+    reference = scored[0][0]
+    best_score, best = min(usable, key=lambda entry: entry[0])
+    if (reference is None
+            or best_score > reference * (1.0 - STRIBECK_GAIN)):
+        return baseline
+    return best
 
 
 def _choose_column(name, switch, rigid, velocities, accelerations, components,
-                   target, tolerance, maximum_condition, rigid_width, seed):
+                   target, tolerance, maximum_condition, rigid_width, seed,
+                   selection_groups=None):
     """Cross-validate one optional column and keep it only if it earns its place."""
     if not getattr(components, switch, False):
         return components
@@ -446,8 +580,7 @@ def _choose_column(name, switch, rigid, velocities, accelerations, components,
     if rows < STRIBECK_FOLDS * 8:
         return replace(components, **{switch: False})
 
-    order = np.random.default_rng(seed).permutation(rows)
-    folds = np.array_split(order, STRIBECK_FOLDS)
+    folds = _selection_folds(rows, seed, selection_groups)
     scores = {}
     for enabled in (False, True):
         trial = replace(components, **{name: enabled, switch: False})
@@ -546,6 +679,7 @@ def fit_joint(
     accelerations: list[float] | None = None,
     components: ModelComponents | None = None,
     transition_rows: list[bool] | None = None,
+    selection_groups=None,
 ) -> JointRegression:
     """Regress one joint's measured current onto its dynamics columns."""
     if components is None:
@@ -564,7 +698,8 @@ def fit_joint(
 
     components = _choose_stribeck(rigid, velocities, accelerations, components,
                                   target, tolerance, maximum_condition,
-                                  rigid_width, seed)
+                                  rigid_width, seed, selection_groups,
+                                  transition_rows)
     extra_names = components.column_names()
 
     outcome = _fit_transition(rigid, velocities, accelerations, components,
@@ -625,7 +760,7 @@ def predict_joint(regression: JointRegression, regressor: np.ndarray,
         return float(rigid[regression.columns] @ regression.parameters)
     extra = extra_row(velocity, acceleration, components)
     row = np.concatenate([rigid, extra])
-    if components.load_friction:
+    if components.load_friction or components.load_stribeck:
         load = _rigid_current(
             row[None, :], regression.columns, regression.parameters,
             rigid.size)[0]

@@ -252,7 +252,7 @@ def design_friction_sweeps(
                                        high, postures, collision_free,
                                        candidates, rng):
             start = posture.copy()
-            start[joint] = centre - room / 2.0
+            start[joint] = posture[joint] - room / 2.0
             sweeps.append(FrictionSweep(
                 joint, start.tolist(), float(room), speeds,
                 load=tuple(arm.joint_loads(posture)[joint].tolist())))
@@ -281,7 +281,11 @@ def _sweep_postures(arm, joint, base, centre, room, low, high, wanted,
     if wanted > 1 and collision_free is not None:
         for _ in range(candidates):
             pose = rng.uniform(low, high)
-            pose[joint] = centre
+            # The swept joint's own angle is part of the load on it: joint one's
+            # axis is horizontal, so pinning its centre at home caps it at a
+            # third of the torque it carries across the range.
+            pose[joint] = float(np.clip(pose[joint], low[joint] + room / 2.0,
+                                        high[joint] - room / 2.0))
             if _sweep_free(pose, joint, room, collision_free):
                 found.append(pose)
     if not found or wanted < 1:
@@ -300,6 +304,37 @@ def _spread_by_load(arm, joint, poses, wanted):
     instead of dominating.
     """
     loads = np.array([arm.joint_loads(pose)[joint] for pose in poses])
+    return [poses[index] for index in _choose_by_load(loads, wanted)]
+
+
+def _choose_by_load(loads, wanted):
+    """Indices spanning the load range the joint actually carries.
+
+    Load-dependent friction is linear in the axial torque, so where that term
+    varies the rungs are spread evenly across it: the heaviest posture is the
+    one measurement that cannot be replaced, and a middle rung is what tells a
+    straight line from a curve. Farthest-point spread over all four terms does
+    neither, because a posture extreme in a lesser term wins the distance while
+    the torque the motor works against goes unswept.
+
+    Where gravity cannot load the joint about its own axis -- the last joint
+    carries no axial torque in any pose -- the terms that do move decide.
+    """
+    loads = np.asarray(loads, dtype=float)
+    wanted = max(int(wanted), 0)
+    if not wanted or not len(loads):
+        return []
+    axial = np.abs(loads[:, 0])
+    if axial.max() - axial.min() > 1e-9:
+        chosen: list[int] = []
+        for target in np.linspace(axial.min(), axial.max(), wanted):
+            order = np.argsort(np.abs(axial - target))
+            for index in order:
+                if int(index) not in chosen:
+                    chosen.append(int(index))
+                    break
+        return chosen
+
     span = loads.max(axis=0) - loads.min(axis=0)
     scaled = loads / np.where(span > 1e-9, span, 1.0)
     # Home is index zero when it was admissible, and it is the posture every
@@ -312,7 +347,7 @@ def _spread_by_load(arm, joint, poses, wanted):
             break
         chosen.append(pick)
         gap = np.minimum(gap, np.linalg.norm(scaled - scaled[pick], axis=1))
-    return [poses[index] for index in chosen]
+    return chosen
 
 
 @dataclass
@@ -352,6 +387,73 @@ class FourierTrajectory:
         }
 
 
+@dataclass
+class RampedFourierTrajectory:
+    """The same Fourier path with zero-velocity, zero-acceleration endpoints."""
+
+    trajectory: FourierTrajectory
+    ramp_s: float
+
+    @property
+    def duration_s(self) -> float:
+        return float(self.trajectory.duration_s + self.ramp_s)
+
+    def sample(self, time_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        wall_time = float(np.clip(time_s, 0.0, self.duration_s))
+        core_duration = float(self.trajectory.duration_s)
+        if self.ramp_s <= 0.0:
+            return self.trajectory.sample(min(wall_time, core_duration))
+        if wall_time <= 0.0:
+            position, _velocity, _acceleration = self.trajectory.sample(0.0)
+            return position, np.zeros_like(position), np.zeros_like(position)
+        if wall_time >= self.duration_s:
+            position, _velocity, _acceleration = self.trajectory.sample(
+                core_duration)
+            return position, np.zeros_like(position), np.zeros_like(position)
+
+        ramp = float(self.ramp_s)
+        if wall_time < ramp:
+            share = wall_time / ramp
+            phase = ramp * (share ** 3 - 0.5 * share ** 4)
+            phase_rate = 3.0 * share ** 2 - 2.0 * share ** 3
+            phase_acceleration = (6.0 * share - 6.0 * share ** 2) / ramp
+        elif wall_time <= core_duration:
+            phase = wall_time - 0.5 * ramp
+            phase_rate = 1.0
+            phase_acceleration = 0.0
+        else:
+            share = (wall_time - core_duration) / ramp
+            phase = (core_duration - 0.5 * ramp
+                     + ramp * (share - share ** 3 + 0.5 * share ** 4))
+            phase_rate = 1.0 - 3.0 * share ** 2 + 2.0 * share ** 3
+            phase_acceleration = (-6.0 * share + 6.0 * share ** 2) / ramp
+
+        position, velocity, acceleration = self.trajectory.sample(phase)
+        wall_velocity = velocity * phase_rate
+        wall_acceleration = (
+            acceleration * phase_rate ** 2 + velocity * phase_acceleration)
+        return position, wall_velocity, wall_acceleration
+
+    def as_dict(self) -> dict:
+        payload = self.trajectory.as_dict()
+        payload["ramp_s"] = float(self.ramp_s)
+        payload["execution_duration_s"] = self.duration_s
+        return payload
+
+
+def ramp_fourier_trajectory(
+    trajectory: FourierTrajectory, ramp_s: float,
+) -> FourierTrajectory | RampedFourierTrajectory:
+    """Return a time-scaled path that enters and leaves the Fourier motion at rest."""
+    ramp = float(ramp_s)
+    if not np.isfinite(ramp) or ramp < 0.0:
+        raise ValueError("ramp_s must be finite and non-negative")
+    if ramp == 0.0:
+        return trajectory
+    return RampedFourierTrajectory(
+        trajectory, min(ramp, 0.25 * float(trajectory.duration_s)))
+
+
 def _trajectory_violates(
     trajectory: FourierTrajectory, limits: DesignLimits, samples: int = 120,
 ) -> bool:
@@ -372,12 +474,35 @@ def design_fourier_trajectory(
     arm: ident.ArmModel, limits: DesignLimits, centre_deg: np.ndarray | None = None,
     harmonics: int = 3, base_frequency_hz: float = 0.1, duration_s: float = 20.0,
     attempts: int = 60, seed: int = 0, collision_free=None,
+    conditioning_rows: list[np.ndarray] | None = None,
+    randomize_centre: bool = False, start_deg=None,
+    minimum_amplitude_fraction: float = 0.2,
+    joint_amplitude_scale=None,
 ) -> FourierTrajectory | None:
-    """Search random Fourier coefficients for the best-conditioned feasible one."""
+    """Search random Fourier coefficients for the best-conditioned feasible one.
+
+    ``conditioning_rows`` makes a sequence informative as a whole instead of
+    selecting several individually good but redundant trajectories.  A
+    randomized centre explores different gravity configurations, while
+    ``start_deg`` screens the straight transit that ``Plant.track`` performs
+    before following the periodic motion.
+    """
+    minimum_amplitude_fraction = float(minimum_amplitude_fraction)
+    if (not np.isfinite(minimum_amplitude_fraction)
+            or not 0.0 <= minimum_amplitude_fraction <= 1.0):
+        raise ValueError("minimum_amplitude_fraction must be between zero and one")
+    amplitude_scale = np.ones(arm.joint_count) if joint_amplitude_scale is None else np.asarray(
+        joint_amplitude_scale, dtype=float)
+    if (amplitude_scale.shape != (arm.joint_count,)
+            or not np.isfinite(amplitude_scale).all()
+            or np.any(amplitude_scale < 0.0)
+            or np.any(amplitude_scale > 1.0)):
+        raise ValueError("joint_amplitude_scale must have one 0..1 value per joint")
     rng = np.random.default_rng(seed)
     low, high = limits.usable()
     centre = np.zeros(arm.joint_count) if centre_deg is None else np.clip(
         np.asarray(centre_deg, dtype=float), low, high)
+    prior_rows = list(conditioning_rows or [])
     omega = 2.0 * np.pi * base_frequency_hz
     # Keep every harmonic under the speed and acceleration ceilings by construction.
     speed_budget = limits.maximum_speed_deg_s / max(1, harmonics)
@@ -388,25 +513,46 @@ def design_fourier_trajectory(
         amplitudes, phases = [], []
         for harmonic in range(1, harmonics + 1):
             rate = omega * harmonic
-            ceiling = min(speed_budget / rate, accel_budget / (rate * rate))
+            ceiling = (min(speed_budget / rate,
+                           accel_budget / (rate * rate)) * amplitude_scale)
             amplitudes.append(
-                rng.uniform(0.2 * ceiling, ceiling, arm.joint_count).tolist())
+                rng.uniform(minimum_amplitude_fraction * ceiling, ceiling,
+                            arm.joint_count).tolist())
             phases.append(rng.uniform(0.0, 2.0 * np.pi, arm.joint_count).tolist())
+        candidate_centre = centre
+        if randomize_centre and centre_deg is None:
+            excursion = np.sum(np.abs(np.asarray(amplitudes, dtype=float)), axis=0)
+            centre_low, centre_high = low + excursion, high - excursion
+            if np.any(centre_low >= centre_high):
+                continue
+            candidate_centre = rng.uniform(centre_low, centre_high)
         trajectory = FourierTrajectory(
-            centre.tolist(), amplitudes, phases, base_frequency_hz, duration_s)
+            candidate_centre.tolist(), amplitudes, phases,
+            base_frequency_hz, duration_s)
         if _trajectory_violates(trajectory, limits):
             continue
-        rows, blocked = [], False
+        if (collision_free is not None and start_deg is not None
+                and not _path_free(start_deg, trajectory.sample(0.0)[0],
+                                   collision_free)):
+            continue
+        blocked = False
+        if collision_free is not None:
+            for step in range(max(120, 30 * harmonics)):
+                time_s = duration_s * step / max(120, 30 * harmonics)
+                position, _velocity, _acceleration = trajectory.sample(time_s)
+                if not collision_free(position):
+                    blocked = True
+                    break
+        if blocked:
+            continue
+        rows = []
         for step in range(40):
             time_s = duration_s * step / 40
             position, velocity, acceleration = trajectory.sample(time_s)
-            if collision_free is not None and not collision_free(position):
-                blocked = True
-                break
             rows.append(arm.torque_regressor(position, velocity, acceleration))
-        if blocked or not rows:
+        if not rows:
             continue
-        score = ident.stacked_condition_number(rows)
+        score = ident.stacked_condition_number(prior_rows + rows)
         if score < best_score:
             best, best_score = trajectory, score
     return best

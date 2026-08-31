@@ -119,6 +119,34 @@ class SmoothCoulombTest(unittest.TestCase):
         self.assertLess(np.abs(coefficient * smooth - target).max(), 1e-9)
 
 
+class LoadFrictionShapeTest(unittest.TestCase):
+    def test_load_column_keeps_direction_while_coulomb_reverses_smoothly(self):
+        components = model.ModelComponents(
+            offset=False, load_friction=True,
+            coulomb_transition_deg_s=1.8)
+        names = components.column_names()
+        near = model.extra_row(0.001, 0.0, components, load_a=2.5)
+        back = model.extra_row(-0.001, 0.0, components, load_a=2.5)
+
+        self.assertLess(abs(near[names.index("coulomb")]), 0.001)
+        self.assertEqual(near[names.index("load_friction")], 2.5)
+        self.assertEqual(back[names.index("load_friction")], -2.5)
+
+    def test_load_stribeck_scales_the_decay_by_rigid_load(self):
+        components = model.ModelComponents(
+            friction=False, offset=False, load_stribeck=True,
+            stribeck_speed_deg_s=1.0)
+        names = components.column_names()
+        slow = model.extra_row(0.2, 0.0, components, load_a=2.5)
+        unloaded = model.extra_row(0.2, 0.0, components, load_a=0.0)
+        back = model.extra_row(-0.2, 0.0, components, load_a=2.5)
+
+        column = names.index("load_stribeck")
+        self.assertGreater(slow[column], 0.0)
+        self.assertEqual(unloaded[column], 0.0)
+        self.assertAlmostEqual(back[column], -slow[column])
+
+
 class ConsistencyTest(unittest.TestCase):
     def test_the_urdf_parameters_are_physically_feasible(self):
         verdicts = consistency.check_parameters(arm_model().inertial_parameters())
