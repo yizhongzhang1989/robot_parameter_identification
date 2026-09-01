@@ -18,7 +18,8 @@ import time
 
 import numpy as np
 
-from ..interfaces import DriveLimitExceeded, MotionFailed, SignalMap
+from ..interfaces import (DriveLimitExceeded, EFFORT_SOURCES, MotionFailed,
+                          SignalMap)
 from ..profile import RobotProfile
 
 # A quintic zero-velocity endpoint trajectory peaks near 1.875x its average
@@ -286,9 +287,12 @@ class HardwarePlant:
                 f"{self.config.action} is unavailable")
         self._spin_for(2.0)
         if self.sample() is None:
+            signals = self.config.signals
             raise TelemetryUnavailable(
                 f"{self.config.state_topic} is not publishing "
-                f"{self.config.signals.required_interfaces()} for every joint")
+                f"{signals.position!r} and one of "
+                f"{sorted(signals.effort_channels().values())} "
+                "for every joint")
         if self.config.require_neutral_start:
             position = np.asarray(self.sample()["position_deg"], dtype=float)
             if np.max(np.abs(position)) > NEUTRAL_TOLERANCE_DEG:
@@ -318,19 +322,20 @@ class HardwarePlant:
     def _on_state(self, message) -> None:
         signals = self.config.signals
         by_name = dict(zip(message.joint_names, message.interface_values))
-        required = signals.required_interfaces()
-        optional = signals.optional_interfaces()
+        # Every mapped effort channel is read, not only the fitted one: a drive
+        # reporting both is worth recording in full, and which one gets fitted
+        # is settled below from what actually arrives.
+        roles = {**signals.optional_interfaces(), **signals.effort_channels()}
         columns: dict[str, list[float]] = {}
         for name in self.joint_names:
             entry = by_name.get(name)
             if entry is None:
                 return
             values = dict(zip(entry.interface_names, entry.values))
-            if not all(interface in values for interface in required):
+            if signals.position not in values:
                 return
             columns.setdefault("position", []).append(values[signals.position])
-            columns.setdefault("effort", []).append(values[signals.effort])
-            for role, interface in optional.items():
+            for role, interface in roles.items():
                 if interface in values:
                     columns.setdefault(role, []).append(values[interface])
 
@@ -338,9 +343,14 @@ class HardwarePlant:
         # A channel that is short on any joint is unusable for all of them.
         columns = {role: values for role, values in columns.items()
                    if len(values) == count}
+        arrived = [source for source in EFFORT_SOURCES if source in columns]
+        if not arrived:
+            return
+        signals = self._settle(arrived)
+        effort = columns[signals.effort_source]
         if not np.isfinite(np.asarray(columns["position"], dtype=float)).all():
             return
-        if not np.isfinite(np.asarray(columns["effort"], dtype=float)).all():
+        if not np.isfinite(np.asarray(effort, dtype=float)).all():
             return
 
         position = np.degrees(np.asarray(columns["position"], dtype=float))
@@ -354,16 +364,17 @@ class HardwarePlant:
             "position_deg": position.tolist(),
             "speed_deg_s": self._speed(columns, position_speed),
             "safety_speed_deg_s": position_speed.tolist(),
-            "current_a": [float(v) for v in columns["effort"]],
+            "current_a": [float(v) for v in effort],
             "temperature_c": [float(v) for v in columns.get("temperature", [])],
             "voltage_v": [float(v) for v in columns.get("voltage", [])],
             "enabled": [v > 0.999 for v in columns.get("enabled", [])],
             "fault_code": [int(v) for v in columns.get("fault_code", [])],
             "arm_status": None,
         }
-        spare = "torque" if signals.effort_source == "current" else "current"
-        if spare in columns:
-            frame[f"{spare}_measured"] = [float(v) for v in columns[spare]]
+        if "current" in arrived:
+            frame["drive_current_a"] = [float(v) for v in columns["current"]]
+        if "torque" in arrived:
+            frame["joint_torque_nm"] = [float(v) for v in columns["torque"]]
         # The publisher's own stamp, not the time this callback ran. Messages
         # arrive in bursts whenever the executor gets a slice, so arrival time
         # compresses a second of motion into a millisecond and any speed
@@ -375,6 +386,24 @@ class HardwarePlant:
             self._latest_at = time.monotonic()
             if self._buffering:
                 self._buffer.append(frame)
+
+    def _settle(self, arrived: list) -> SignalMap:
+        """Fit against a channel the arm publishes, not one it was asked for.
+
+        Both channels are mapped by default, so the preference usually holds
+        and this changes nothing. When it does change, the unit of every
+        identified parameter changes with it, so it is not done quietly.
+        """
+        signals = self.config.signals
+        settled = signals.settled_among(arrived)
+        if settled is signals:
+            return signals
+        self.config.signals = settled
+        if self._node is not None:
+            self._node.get_logger().warn(
+                f"{signals.effort_source} is not published; fitting against "
+                f"{settled.effort_source} ({settled.effort_unit}) instead")
+        return settled
 
     def _speed(self, columns: dict, position_speed: np.ndarray) -> list[float]:
         """Mapped velocity when the drive publishes one, else differentiated.
@@ -620,11 +649,15 @@ class HardwarePlant:
                 != self._action_type.Result.SUCCESSFUL):
             raise MotionFailed("the trajectory did not complete successfully")
 
-    def hold_pose(self, pose_deg) -> dict:
-        """Move there, let the servo settle, and average a few frames at rest."""
+    def move_to(self, pose_deg) -> None:
+        """Drive there and stop. Nothing is collected, so a jog costs nothing."""
         target = np.asarray(pose_deg, dtype=float)
         duration = self._duration_for(target, self.config.maximum_speed_deg_s)
         self._execute([(target, np.zeros(self.joint_count), duration)])
+
+    def hold_pose(self, pose_deg) -> dict:
+        """Move there, let the servo settle, and average a few frames at rest."""
+        self.move_to(pose_deg)
         self._spin_for(self.config.settle_s)
         return self.dwell()
 

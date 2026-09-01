@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 import csv
 import json
+import math
+import re
 import threading
 import time
 import traceback
@@ -28,7 +30,38 @@ from ..model import ModelComponents
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
 
-IDLE, RUNNING = "idle", "running"
+IDLE, RUNNING, JOGGING = "idle", "running", "jogging"
+# An envelope typed into the panel is an operator's envelope, so it is labelled
+# and guarded exactly as a hand-written file is.
+EDITED_SOURCE = "<edited in the dashboard>"
+PROFILE_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.yaml")
+OBSTACLE_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.json")
+# A ceiling nobody supplied is infinite, and JSON has no way to say so.
+UNBOUNDED_LIMITS = ("continuous_current_a", "peak_current_a")
+
+
+def _without_infinities(value):
+    if isinstance(value, dict):
+        return {key: _without_infinities(entry)
+                for key, entry in value.items()}
+    if isinstance(value, list):
+        return [_without_infinities(entry) for entry in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _with_infinities(payload: dict) -> dict:
+    """A blank ceiling comes back from the panel as null; restore what it means."""
+    document = dict(payload or {})
+    limits = dict(document.get("limits") or {})
+    for key in UNBOUNDED_LIMITS:
+        values = limits.get(key)
+        if isinstance(values, (list, tuple)):
+            limits[key] = [math.inf if entry is None or entry == "" else entry
+                           for entry in values]
+    document["limits"] = limits
+    return document
 
 
 def _swept_here(record, joint: int) -> bool:
@@ -82,6 +115,11 @@ REHEARSAL_TOLERANCE = 0.02
 # Homing is a recovery move from an unknown pose, so it goes slowly whatever
 # speed the campaign was configured for.
 HOMING_SPEED_DEG_S = 10.0
+# Jogging is hand-driven, so it is capped well below anything the campaign uses:
+# the operator is watching the arm, not a plot, and has no undo.
+JOG_SPEED_DEG_S = 10.0
+# How long the jog worker naps when no new pose has been asked for.
+JOG_POLL_S = 0.05
 OPTIMAL_MODE = "optimal_excitation"
 
 
@@ -162,6 +200,8 @@ class IdentificationService:
         self.urdf_text = ""
         self.driven_joints: list[str] = []
         self.configured_profile = profile
+        # What the launch supplied, kept so an edit can be undone.
+        self.launch_profile = profile
         self.profile_source = "configured" if profile is not None else "none"
         self.components = ModelComponents()
         self.plan = None
@@ -177,6 +217,8 @@ class IdentificationService:
         self._started_at = 0.0
         self._samples: list[dict] = []
         self._options: dict = {}
+        # The pose a slider last asked for, or None once it has been driven.
+        self._jog_target: list[float] | None = None
 
     # -- model -----------------------------------------------------------
 
@@ -204,6 +246,18 @@ class IdentificationService:
         self.driven_joints = names
         self.note(f"controller drives {len(names)} joints")
         return self._rebuild()
+
+    def adopt_signals(self, signals) -> None:
+        """Take the effort channel the robot turned out to publish.
+
+        Recorded rather than silent: the unit of every identified parameter
+        follows from which channel is fitted.
+        """
+        if signals == self.config.telemetry.signals:
+            return
+        self.config.telemetry = replace(self.config.telemetry, signals=signals)
+        self.note(f"effort read from {signals.effort_source} "
+                  f"in {signals.effort_unit}")
 
     def _rebuild(self) -> bool:
         """Model, profile and obstacle scene, from whatever is known so far."""
@@ -277,6 +331,92 @@ class IdentificationService:
     def have_model(self) -> bool:
         return self.arm is not None
 
+    # -- robot profile ---------------------------------------------------
+
+    def profile_payload(self) -> dict:
+        """The envelope in force, in the shape a profile file has.
+
+        There is always one to edit, including the first time an arm is ever
+        run: with no file the module derives a profile from the URDF and the
+        controller's joint list, and that derivation is what the panel edits.
+        A file is somewhere to save the answer, not a prerequisite for having
+        one.
+        """
+        profile = self.profile
+        return {
+            "have_profile": profile is not None,
+            "source": self.profile_source,
+            "origin": profile.source if profile is not None else "",
+            "edited": profile is not None and profile.source == EDITED_SOURCE,
+            "save_target": str(self._save_target()),
+            "editable": self._state == IDLE,
+            "current_guard": (profile is not None
+                              and autoprofile.current_guard_active(profile)),
+            "dark_guards": list(self._dark_guards()),
+            "profile": (_without_infinities(profile.as_dict())
+                        if profile is not None else None),
+        }
+
+    def apply_profile(self, payload: dict) -> dict:
+        """Install an edited envelope, on the same terms as a written one.
+
+        A number shown in a form and applied by an operator is that operator's
+        number, which is the standard a hand-written file is held to as well.
+        The one ceiling nobody can guess still gates on its own value: leave a
+        current limit at infinity and the current guard stays off regardless.
+        """
+        self._require_idle("the envelope cannot change while a run is going")
+        document = _with_infinities(payload)
+        notes = dict(document.get("notes") or {})
+        # The derivation's note says the current ceilings are unset, which an
+        # edit may have just made untrue.
+        notes.pop("derived", None)
+        notes["edited"] = ("Applied from the dashboard. Every value here was "
+                           "entered by an operator.")
+        document["notes"] = notes
+        profile = RobotProfile.from_dict(document, source=EDITED_SOURCE)
+        with self._lock:
+            self.configured_profile = profile
+        if not self._rebuild():
+            self.note(f"envelope edited: {profile.name}, waiting for a model")
+            return {"ok": True, "profile": self.profile_payload()}
+        self.note(f"envelope edited: {profile.name}")
+        return {"ok": True, "profile": self.profile_payload()}
+
+    def reset_profile(self) -> dict:
+        """Back to the launch's file, or to a fresh derivation from the URDF."""
+        self._require_idle("the envelope cannot change while a run is going")
+        with self._lock:
+            self.configured_profile = self.launch_profile
+        self._rebuild()
+        self.note("envelope reset to what the launch supplied")
+        return {"ok": True, "profile": self.profile_payload()}
+
+    def save_profile(self, name: str = "") -> dict:
+        if self.profile is None:
+            return {"ok": False, "message": "no profile to save yet"}
+        path = self.profile.to_yaml(self._save_target(name))
+        self.note(f"profile written to {path}")
+        return {"ok": True, "path": str(path)}
+
+    def _save_target(self, name: str = "") -> Path:
+        """Where a save may land, which is never wherever the caller says.
+
+        The web surface listens on every interface, so honouring a path from a
+        request would be an arbitrary file write. A name is only a name, and it
+        is written beside the results this dashboard was started with.
+        """
+        root = Path(self.config.output_directory)
+        cleaned = str(name or "").strip()
+        if not cleaned:
+            return (Path(self.config.profile_path) if self.config.profile_path
+                    else root / "profile.yaml")
+        if not PROFILE_FILE_NAME.fullmatch(cleaned):
+            raise ValueError(
+                "a profile file name may use letters, digits, dot, dash and "
+                f"underscore, and must end in .yaml: {cleaned!r}")
+        return root / cleaned
+
     # -- obstacles -------------------------------------------------------
 
     def obstacles(self) -> list[dict]:
@@ -316,6 +456,43 @@ class IdentificationService:
     def obstacle_path(self) -> Path | None:
         raw = (self.config.obstacle_path or "").strip()
         return Path(raw).expanduser() if raw else None
+
+    def save_obstacles(self, name: str = "") -> dict:
+        """Write the scene where the operator says, so each arm keeps its own.
+
+        The launch path is where edits are kept automatically; this is how a
+        scene gets a name worth carrying to another robot.
+        """
+        if self.scene is None:
+            return {"ok": False, "message": "no model yet"}
+        try:
+            target = self._obstacle_save_target(name)
+        except ValueError as error:
+            return {"ok": False, "message": str(error)}
+        try:
+            self.scene.save(target)
+        except OSError as error:
+            return {"ok": False, "message": f"not saved: {error}"}
+        self.note(f"obstacles written to {target}")
+        return {"ok": True, "path": str(target)}
+
+    def _obstacle_save_target(self, name: str = "") -> Path:
+        """Where a save may land, which is never wherever the caller says.
+
+        Same rule as the profile: the web surface listens on every interface,
+        so honouring a path from a request would be an arbitrary file write. A
+        name is only a name.
+        """
+        cleaned = str(name or "").strip()
+        if not cleaned:
+            launched = self.obstacle_path()
+            return (launched if launched is not None
+                    else Path(self.config.output_directory) / "obstacles.json")
+        if not OBSTACLE_FILE_NAME.fullmatch(cleaned):
+            raise ValueError(
+                "an obstacle file name may use letters, digits, dot, dash and "
+                f"underscore, and must end in .json: {cleaned!r}")
+        return Path(self.config.output_directory) / cleaned
 
     def _persist_obstacles(self) -> None:
         """Save after every edit; a scene lost on restart is a scene retyped."""
@@ -365,6 +542,23 @@ class IdentificationService:
         if self.bridge is None:
             return None
         return self.bridge.latest_sample()
+
+    def telemetry_since(self, cursor: int) -> dict:
+        """Telemetry the panel has not seen yet, at the rate it arrived.
+
+        Polling for the newest frame alone would alias: a 200 Hz current read
+        ten times a second is not a slower current read, it is a different
+        signal with the peaks removed.
+        """
+        names = list(self.arm.joint_names) if self.arm is not None else []
+        history = getattr(self.bridge, "history_since", None)
+        if history is None:
+            sample = self.latest_sample()
+            return {"cursor": 0, "dropped": 0, "joint_names": names,
+                    "frames": [sample] if sample else []}
+        payload = history(max(0, int(cursor or 0)))
+        payload["joint_names"] = names
+        return payload
 
     def connection(self) -> dict:
         described = self.config.telemetry.describe()
@@ -569,6 +763,140 @@ class IdentificationService:
 
     def running(self) -> bool:
         return self._state == RUNNING
+
+    # -- jogging ---------------------------------------------------------
+
+    def jog(self, body: dict) -> dict:
+        """One endpoint for the three things a slider does."""
+        action = str((body or {}).get("action") or "").strip()
+        if action == "start":
+            return self.jog_start()
+        if action == "stop":
+            return self.jog_stop()
+        if action == "move":
+            return self.jog_to((body or {}).get("position_deg"))
+        return {"ok": False, "message": f"unknown jog action {action!r}"}
+
+    def jog_start(self) -> dict:
+        """Hold a plant open for the session rather than one per slider release.
+
+        Opening one costs an action handshake and a spin for state -- seconds,
+        which is nothing once and unusable per drag.
+        """
+        if not self.have_model():
+            return {"ok": False, "message": "no /robot_description yet"}
+        if self.profile is None:
+            return {"ok": False, "message": "no robot profile loaded"}
+        if self.bridge is None:
+            return {"ok": False, "message": "no ROS bridge; cannot drive hardware"}
+        with self._lock:
+            if self._state == JOGGING:
+                return {"ok": True, "message": "already jogging"}
+            if self._state != IDLE:
+                return {"ok": False, "message": f"{self._activity} is running"}
+            self._state = JOGGING
+            self._activity = "jogging"
+            self._abort.clear()
+            self._jog_target = None
+            self._started_at = time.monotonic()
+            self.progress = {"mode": "jogging", "phase": "starting"}
+        self._worker = threading.Thread(target=self._run_jog, daemon=True,
+                                        name="identification-jog")
+        self._worker.start()
+        return {"ok": True, "message": "jogging enabled"}
+
+    def jog_to(self, position_deg) -> dict:
+        """Ask for a pose. The newest ask wins; a drag is not a queue."""
+        with self._lock:
+            if self._state != JOGGING:
+                return {"ok": False, "message": "jogging is not enabled"}
+        try:
+            target = self._screened_pose(position_deg)
+        except ValueError as error:
+            return {"ok": False, "message": str(error)}
+        with self._lock:
+            self._jog_target = target
+        return {"ok": True, "target_deg": [round(value, 2) for value in target]}
+
+    def jog_stop(self) -> dict:
+        with self._lock:
+            if self._state != JOGGING:
+                return {"ok": True, "message": "not jogging"}
+        self._abort.set()
+        return {"ok": True, "message": "jogging stopped"}
+
+    def jog_limits_deg(self) -> list[float]:
+        """How far each joint may be jogged: the campaign's own envelope.
+
+        Deliberately not the URDF's: the URDF describes the arm, not the bench
+        it is bolted to, and a slider is the easiest way there is to drive an
+        arm into its surroundings.
+        """
+        if self.plan is None or self.arm is None:
+            return []
+        return [round(float(value), 1)
+                for value in self.plan.design_limits(self.arm).upper_deg]
+
+    def _screened_pose(self, position_deg) -> list[float]:
+        """Clamp to the envelope, then refuse anything that would hit something.
+
+        Both checks belong here rather than in the browser: the request does
+        not have to have come from this dashboard, and the arm has no idea what
+        is bolted around it.
+        """
+        limits = self.jog_limits_deg()
+        values = [float(value) for value in (position_deg or [])]
+        if not limits:
+            raise ValueError("no motion plan yet")
+        if len(values) != len(limits):
+            raise ValueError(f"expected {len(limits)} joint angles, "
+                             f"got {len(values)}")
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("joint angles must be finite")
+        clamped = [max(-limit, min(limit, value))
+                   for value, limit in zip(values, limits)]
+        report = self.collision_report(clamped)
+        if report.get("available") and not report.get("clear", True):
+            touching = ", ".join(
+                str(contact) for contact in (report.get("contacts") or [])[:3])
+            raise ValueError("that pose is in collision"
+                             + (f": {touching}" if touching else ""))
+        return clamped
+
+    def _run_jog(self) -> None:
+        plant = None
+        try:
+            plant = self.bridge.hardware_plant(
+                self.profile, self.scene, require_neutral_start=False,
+                maximum_speed_deg_s=JOG_SPEED_DEG_S)
+            setter = getattr(plant, "set_monitor", None)
+            if setter is not None:
+                setter(self._monitor())
+            self.note(f"jogging enabled at {JOG_SPEED_DEG_S:g} deg/s")
+            self._on_progress("jogging", {})
+            while not self._abort.is_set():
+                with self._lock:
+                    target, self._jog_target = self._jog_target, None
+                if target is None:
+                    time.sleep(JOG_POLL_S)
+                    continue
+                plant.move_to(target)
+                self._on_progress(
+                    "jogging", {"to_deg": [round(value, 1) for value in target]})
+        except Exception as error:  # noqa: BLE001 - a crash must not be silent
+            self.note(f"jogging stopped: {error}")
+            self.progress = {"mode": "jogging", "phase": "failed",
+                             "error": str(error),
+                             "traceback": traceback.format_exc()[-2000:]}
+        else:
+            self.note("jogging disabled")
+            self.progress = {"phase": "idle"}
+        finally:
+            self._release(plant)
+            with self._lock:
+                self._state = IDLE
+                self._activity = ""
+                self._jog_target = None
 
     def _run(self, mode: str) -> None:
         if mode == "load_sweep":
@@ -1242,16 +1570,18 @@ class IdentificationService:
                 "parameter_count": self.arm.parameter_count if self.arm else 0,
                 "effort_unit": self.config.telemetry.signals.effort_unit,
                 "profile_source": self.profile_source,
+                "profile_edited": (self.profile is not None
+                                   and self.profile.source == EDITED_SOURCE),
                 "current_guard": (
                     self.profile is not None
                     and self.config.telemetry.signals.effort_source == "current"
                     and autoprofile.current_guard_active(self.profile)),
                 "driven_joints": list(self.driven_joints),
-                "reach_deg": ([round(v, 1) for v in self.plan.design_limits(
-                    self.arm).upper_deg]
-                    if self.plan is not None and self.arm is not None else []),
+                "reach_deg": self.jog_limits_deg(),
+                "jogging": self._state == JOGGING,
                 "rehearsal_passed": self.rehearsal_passed,
                 "obstacles": self.obstacles(),
+                "obstacle_file": str(self._obstacle_save_target()),
                 "frames": self.frame_names(),
                 "collision": self.collision_report(),
                 "progress": dict(self.progress),

@@ -1,7 +1,9 @@
 """The dashboard surface, exercised without ROS and without a robot."""
 
+from pathlib import Path
 import json
 import math
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
@@ -88,6 +90,57 @@ class ObstacleApiTest(unittest.TestCase):
     def test_collision_report_is_honest_without_a_model(self):
         blank = IdentificationService(DashboardConfig())
         self.assertFalse(blank.collision_report([0.0])["available"])
+
+
+class ObstacleSaveTest(unittest.TestCase):
+    """Naming the scene, so each arm can keep its own."""
+
+    def saving_service(self, directory, launched=""):
+        made = IdentificationService(DashboardConfig(
+            output_directory=directory, obstacle_path=launched))
+        made.adopt_description(synthetic_urdf())
+        return made
+
+    def test_a_named_scene_reads_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.saving_service(directory)
+            made.add_obstacle({"parent_frame": f"{PREFIX}base_link"})
+            written = made.save_obstacles("left_arm_cell.json")
+            self.assertTrue(written["ok"])
+            self.assertEqual(Path(written["path"]).name, "left_arm_cell.json")
+            again = json.loads(Path(written["path"]).read_text())
+            self.assertEqual(again["schema_version"], 1)
+            self.assertEqual(len(again["obstacles"]), 1)
+
+    def test_a_save_lands_beside_the_results_and_nowhere_else(self):
+        # The web surface listens on every interface, so a path from a request
+        # would be an arbitrary file write.
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.saving_service(directory)
+            for attempt in ("../escape.json", "/etc/passwd", "sub/dir.json",
+                            "no_suffix", "scene.yaml"):
+                answer = made.save_obstacles(attempt)
+                self.assertFalse(answer["ok"], attempt)
+                self.assertIn(".json", answer["message"])
+            self.assertFalse((Path(directory) / ".." / "escape.json").exists())
+
+    def test_no_name_keeps_the_file_the_launch_named(self):
+        made = self.saving_service("results", launched="/tmp/given.json")
+        self.assertEqual(str(made._obstacle_save_target()), "/tmp/given.json")
+
+    def test_without_a_launch_file_it_still_has_somewhere_to_go(self):
+        made = self.saving_service("results")
+        self.assertEqual(Path(made._obstacle_save_target()).name,
+                         "obstacles.json")
+
+    def test_saving_is_reachable_over_http(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.saving_service(directory)
+            routes = build_routes(made, None)
+            answer = routes["/api/obstacles"][1](
+                {"action": "save", "name": "cell.json"})
+            self.assertTrue(answer["ok"])
+            self.assertTrue(Path(answer["path"]).exists())
 
 
 class RunGateTest(unittest.TestCase):
@@ -407,12 +460,17 @@ class FakePlant:
         self.closed = False
         self.opened_with = {}
         self.monitor = None
+        self.moves = []
 
     def set_monitor(self, monitor):
         self.monitor = monitor
 
     def sample(self):
         return {"position_deg": list(self.position)}
+
+    def move_to(self, pose_deg):
+        self.moves.append([float(value) for value in pose_deg])
+        self.position = [float(value) for value in pose_deg]
 
     def park(self):
         self.parked = True
@@ -533,6 +591,91 @@ class HomingTest(unittest.TestCase):
         self.assertTrue(routes["/api/home"][1]({})["ok"])
         self.wait(made)
         self.assertTrue(plant.parked)
+
+
+class JogTest(unittest.TestCase):
+    """Hand-driving the arm, and the screening that stands between."""
+
+    def jog_service(self):
+        plant = FakePlant([0.0] * 7)
+        made = IdentificationService(DashboardConfig(), bridge=FakeBridge(plant),
+                                     profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        return made, plant
+
+    def settle(self, wanted, timeout_s=10.0):
+        import time
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if wanted():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def started(self):
+        made, plant = self.jog_service()
+        self.assertTrue(made.jog_start()["ok"])
+        self.assertTrue(self.settle(lambda: plant.opened_with))
+        self.addCleanup(made.jog_stop)
+        return made, plant
+
+    def test_jogging_needs_a_robot(self):
+        blank = IdentificationService(DashboardConfig())
+        self.assertFalse(blank.jog_start()["ok"])
+
+    def test_a_session_opens_the_plant_off_neutral_and_slowly(self):
+        _made, plant = self.started()
+        self.assertFalse(plant.opened_with["require_neutral_start"])
+        self.assertLessEqual(plant.opened_with["maximum_speed_deg_s"], 15.0)
+
+    def test_a_requested_pose_reaches_the_controller(self):
+        made, plant = self.started()
+        self.assertTrue(made.jog_to([3.0] + [0.0] * 6)["ok"])
+        self.assertTrue(self.settle(lambda: plant.moves))
+        self.assertAlmostEqual(plant.moves[-1][0], 3.0)
+
+    def test_a_pose_past_the_envelope_is_clamped_not_refused(self):
+        made, _plant = self.started()
+        limit = made.jog_limits_deg()[0]
+        answer = made.jog_to([limit + 500.0] + [0.0] * 6)
+        self.assertTrue(answer["ok"])
+        self.assertAlmostEqual(answer["target_deg"][0], limit, places=1)
+
+    def test_the_wrong_number_of_angles_is_refused(self):
+        made, _plant = self.started()
+        answer = made.jog_to([0.0, 0.0])
+        self.assertFalse(answer["ok"])
+        self.assertIn("expected", answer["message"])
+
+    def test_a_nonsense_angle_is_refused(self):
+        made, _plant = self.started()
+        self.assertFalse(made.jog_to([float("nan")] + [0.0] * 6)["ok"])
+
+    def test_moving_without_a_session_is_refused(self):
+        made, _plant = self.jog_service()
+        self.assertFalse(made.jog_to([0.0] * 7)["ok"])
+
+    def test_a_campaign_cannot_start_while_jogging(self):
+        made, _plant = self.started()
+        answer = made.start("rehearsal")
+        self.assertFalse(answer["ok"])
+        self.assertIn("jogging", answer["message"])
+
+    def test_stopping_releases_the_plant(self):
+        made, plant = self.jog_service()
+        made.jog_start()
+        self.assertTrue(self.settle(lambda: plant.opened_with))
+        made.jog_stop()
+        self.assertTrue(self.settle(lambda: plant.closed))
+        self.assertFalse(made.snapshot()["jogging"])
+
+    def test_jogging_is_reachable_over_http(self):
+        made, _plant = self.jog_service()
+        routes = build_routes(made, None)
+        self.assertIn("/api/jog", routes)
+        self.assertEqual(routes["/api/jog"][0], "POST")
+        self.assertFalse(routes["/api/jog"][1]({"action": "wiggle"})["ok"])
 
 
 class ViewerStateTest(unittest.TestCase):

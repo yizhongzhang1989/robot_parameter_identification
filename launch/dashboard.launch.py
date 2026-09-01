@@ -8,11 +8,25 @@ Switching to another arm -- the other half of a dual-arm, or a different robot
 entirely -- is a change of arguments, not of code::
 
     ros2 launch robot_parameter_identification dashboard.launch.py \\
-        follow_joint_trajectory_action:=/left_arm_controller/follow_joint_trajectory \\
+        controller:=left_arm_joint_trajectory_controller \\
         port:=8301 obstacle_file:=/home/me/left_arm_obstacles.json
 
+Naming the controller is enough: the trajectory action and the controller-state
+topic both follow from it. ``follow_joint_trajectory_action`` remains for a
+controller whose action does not sit under its own name.
+
+A signal that reaches ROS on its own topic rather than the robot's state topic
+is added rather than special-cased::
+
+    extra_telemetry_topics:="['/right_arm/motor_currents']" \\
+        signal.current:=motor_current
+
+Those topics are ``control_msgs/DynamicJointState`` and are merged by joint
+name. If the robot publishes a quantity on no topic at all, republish it onto
+one of these; that boundary is what keeps robot-specific code out of here.
+
 Types matter here. A launch substitution is a string, and rclpy refuses a
-string where the node declared a double, so numeric arguments are wrapped in
+string where the node declared a double, so non-string arguments are wrapped in
 ParameterValue with an explicit value_type rather than passed raw.
 """
 
@@ -34,19 +48,26 @@ TEXT_ARGUMENTS = (
     ("dynamic_joint_state_topic", "/dynamic_joint_states",
      "control_msgs/DynamicJointState source; blank falls back to joint_states"),
     ("robot_description_topic", "/robot_description", "URDF source"),
+    ("controller", "",
+     "the ros2_control controller that drives the arm, by name; its trajectory "
+     "action and controller_state topic follow from it"),
     ("follow_joint_trajectory_action",
      "/joint_trajectory_controller/follow_joint_trajectory",
-     "the only path used to command motion"),
+     "the only path used to command motion; overrides 'controller' when given"),
     ("effort_source", "current",
-     "which channel the identification regresses against: current or torque. "
-     "The unit of every identified parameter follows from this."),
+     "which channel the identification regresses against when the arm offers "
+     "both: current or torque. An arm publishing only the other one overrides "
+     "this. The unit of every identified parameter follows from it."),
     ("signal.position", "position", "interface carrying joint position"),
     ("signal.velocity", "velocity",
      "interface carrying joint velocity; blank differentiates position"),
     ("signal.current", "current",
      "interface carrying motor current; blank if the drive has none"),
-    ("signal.torque", "",
-     "interface carrying joint torque; blank if the drive has none"),
+    ("signal.torque", "effort",
+     "interface carrying joint torque; blank if the drive has none. Defaults "
+     "to 'effort' because that is the only effort-like interface ros2_control "
+     "standardises on Humble, so an arm publishing either channel is read "
+     "without configuration and one publishing both has both shown."),
     ("signal.temperature", "temperature",
      "interface carrying joint temperature; blank disables the thermal guard"),
     ("signal.enabled", "enabled",
@@ -59,8 +80,12 @@ TEXT_ARGUMENTS = (
      "window is a default rather than a measurement."),
 )
 
-NUMERIC_ARGUMENTS = (
+TYPED_ARGUMENTS = (
     ("port", "8300", int, "web port"),
+    ("extra_telemetry_topics", "['']", List[str],
+     "further control_msgs/DynamicJointState topics carrying signals the main "
+     "state topic does not, merged by joint name. Name the interface each one "
+     "carries with the matching signal.* argument."),
     ("telemetry_stale_s", "0.5", float,
      "how old a telemetry frame may be before it counts as lost"),
     ("maximum_speed_deg_s", "0.0", float,
@@ -80,14 +105,14 @@ def generate_launch_description() -> LaunchDescription:
         for name, default, text in TEXT_ARGUMENTS
     ] + [
         DeclareLaunchArgument(name, default_value=default, description=text)
-        for name, default, _type, text in NUMERIC_ARGUMENTS
+        for name, default, _type, text in TYPED_ARGUMENTS
     ]
 
     parameters = {name: LaunchConfiguration(name)
                   for name, _default, _text in TEXT_ARGUMENTS}
     parameters.update({
         name: ParameterValue(LaunchConfiguration(name), value_type=value_type)
-        for name, _default, value_type, _text in NUMERIC_ARGUMENTS
+        for name, _default, value_type, _text in TYPED_ARGUMENTS
     })
 
     return LaunchDescription(declarations + [

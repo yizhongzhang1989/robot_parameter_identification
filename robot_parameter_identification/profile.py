@@ -223,6 +223,22 @@ class RobotProfile:
         if not path.is_file():            raise ProfileError(f"profile not found: {path}")
         return cls.from_dict(_resolve_extends(path), source=str(path))
 
+    def to_yaml(self, path: str | Path) -> Path:
+        """Write this profile out in the form :meth:`from_yaml` reads back.
+
+        Provenance and the joint count are dropped: one says where this copy
+        came from rather than what the arm is, and the other is implied by the
+        names. An unset current ceiling stays ``.inf``, which round-trips.
+        """
+        payload = self.as_dict()
+        payload.pop("source", None)
+        payload["joints"].pop("count", None)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(payload, sort_keys=False,
+                                       allow_unicode=True))
+        return path
+
     def as_dict(self) -> dict:
         return {
             "schema_version": SCHEMA_VERSION,

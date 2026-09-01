@@ -1,161 +1,245 @@
 # robot_parameter_identification
 
-Dynamic parameter identification for robot arms, as a module you can point at a
-robot you did not build.
+机械臂动力学参数辨识模块——可以直接指向一台并非你自己搭建的机器人。
 
-Identifies rigid-body inertial parameters and a joint friction model by
-commanding a designed excitation campaign and regressing measured effort against
-the rigid-body regressor. Ships a web dashboard with a live 3D view and an
-editable obstacle scene that feeds collision screening.
+它下发一段设计好的激励轨迹，把实测力矩（或电流）对刚体回归矩阵做回归，从而辨识刚体惯性参数与关节摩擦模型。模块自带一个 Web 面板，包含实时 3D 视图，以及一个可编辑的障碍物场景，供碰撞筛查使用。
 
-## The contract with your robot
+## 快速开始
 
-The module never talks to a driver, an SDK or a vendor protocol. It speaks only
-standard ROS, and it is explicit about what it needs.
+以本机 RM75 双臂为例，按**第一次接一台臂**来写：此刻没有任何配置文件，也不需要有。
 
-| Purpose | Interface | Required |
+### 1. 启动机器人
+
+本模块不参与这一步，用你平时的方式启动即可：
+
+```bash
+cd ~/Documents/RobotControl
+source /opt/ros/humble/setup.bash && source install/setup.bash
+ros2 launch robot_bringup real.launch.py
+```
+
+它只要三样东西，本机上分别是轨迹控制器 `right_arm_joint_trajectory_controller`、`/robot_description`、`/dynamic_joint_states`。
+
+### 2. 启动面板（另开终端）
+
+```bash
+cd ~/Documents/RobotControl
+source /opt/ros/humble/setup.bash && source install/setup.bash
+ros2 launch robot_parameter_identification dashboard.launch.py \
+    controller:=right_arm_joint_trajectory_controller
+```
+
+打开 <http://localhost:8300>。只有 `controller` 必须给：action 和 `controller_state` 话题都由它推出，受控关节由控制器自己宣告，其余全走默认值。左臂把它换成 `left_arm_joint_trajectory_controller` 并加 `port:=8301`。
+
+### 3. 在面板里把这条臂描述清楚
+
+「连接」卡片 →「编辑机器人档案」。此刻的档案是从 URDF 推导来的：位置和速度限位已经有了，**电流上限是空的**——它推不出来，URDF 只给牛·米，换算需要力矩常数，而那正是待辨识量之一。
+
+- 填上逐关节的连续/峰值电流，电流保护当场生效；没实测过就留空，保护如实关闭
+- 收紧工作空间限位：URDF 描述的是臂，不是它旁边的工作台
+- 温度上限、母线电压窗口照驱动器手册填
+- **应用**立即生效，**保存为文件**存成 YAML；下次用 `profile_path:=` 指过去就不必再填
+
+本机 RM75 右臂已经有一份填好的：`config/rm75_parameter_identification.yaml`。
+
+### 4. 跑起来
+
+1. 先在左侧 3D 视图里把工作台、夹具画成盒子——激励会提出机械臂从未到过的位姿，碰撞筛查靠的就是它们
+2. **Rehearse（预演）** 必须先通过。它植入已知摩擦并要求辨识器找回来，正是这道闸门抓到过拟合悄悄返回全零
+3. 通过后 **Run on hardware** / **Run optimal excitation** / **Sweep loads** 才解锁
+4. **Home** 不设闸门：它不做辨识，存在的意义就是把一台已被拒绝使能的臂救回来
+
+结果写在启动面板时所在目录下的 `identification_results/`。
+
+### 之后可能要加的参数
+
+| 参数 | 何时需要 |
+|---|---|
+| `profile_path:=...` | 已经存好一份档案，不想每次重填 |
+| `maximum_speed_deg_s:=60.0` | 计划速度默认封顶 10 °/s；黏滞摩擦在爬行速度下根本看不出来 |
+| `signal.voltage:=voltage` | 驱动器有 `voltage` 接口、档案又给了电压窗口，母线电压保护才真正生效 |
+| `obstacle_file:=/tmp/right_arm_obstacles.json` | 让画好的障碍物场景在两次会话之间留存 |
+
+## 与机器人之间的约定
+
+模块从不与驱动、SDK 或厂商私有协议打交道。它只讲标准 ROS，并且明确列出自己需要什么。
+
+| 用途 | 接口 | 是否必需 |
 |---|---|---|
-| Command motion | `control_msgs/action/FollowJointTrajectory` | yes |
-| Kinematics and inertia priors | `/robot_description` (`std_msgs/String`) | yes |
-| Joint telemetry | `sensor_msgs/JointState` **or** `control_msgs/DynamicJointState` | yes |
+| 下发运动 | `control_msgs/action/FollowJointTrajectory` | 是 |
+| 运动学与惯性先验 | `/robot_description`（`std_msgs/String`） | 是 |
+| 关节遥测 | `sensor_msgs/JointState` **或** `control_msgs/DynamicJointState` | 是 |
 
-From telemetry it needs two signals per joint and can use five more:
+遥测中每个关节有两路信号是必需的，另有五路可选：
 
-| Signal | Required | Without it |
+| 信号 | 是否必需 | 缺失时的后果 |
 |---|---|---|
-| `position` | yes | — |
-| `effort` (motor current or joint torque) | yes | — |
-| `velocity` | no | differentiated from position |
-| `temperature` | no | no thermal ceiling guard |
-| `enabled` | no | no drive-enabled guard |
-| `fault_code` | no | no fault guard |
-| `voltage` | no | no bus-voltage guard |
+| `position` | 是 | — |
+| `effort`（电机电流或关节力矩） | 是 | — |
+| `velocity` | 否 | 由位置差分得到 |
+| `temperature` | 否 | 没有温度上限保护 |
+| `enabled` | 否 | 没有驱动使能保护 |
+| `fault_code` | 否 | 没有故障码保护 |
+| `voltage` | 否 | 没有母线电压保护 |
 
-**If your robot does not publish something, republish it yourself.** Write a
-small node that turns whatever your driver gives you into a `JointState` or a
-`DynamicJointState` interface, and point the module at it. That boundary is
-deliberate: it keeps every robot-specific line of code outside this repo.
+**如果你的机器人不发布某个量，就自己把它转发出来。** 写一个小节点，把驱动给你的任何数据转成 `JointState` 或 `DynamicJointState` 接口，然后把模块指向它。这个边界是刻意划出来的：它把所有与具体机器人相关的代码都挡在本仓库之外。
 
-Names are configuration, not code. A robot that calls its current
-`motor_current` and its temperature `temp` is described like this:
+命名属于配置，而非代码。一台把电流叫做 `motor_current`、把温度叫做 `temp` 的机器人，这样描述即可：
 
 ```yaml
 telemetry:
   dynamic_joint_state_topic: /dynamic_joint_states
   signals:
     position: position
-    velocity: velocity      # null differentiates position instead
-    current: motor_current  # null if the drive reports no current
-    torque: null            # map both if the drive reports both
-    effort_source: current  # which one the fit regresses against
+    velocity: velocity      # 置 null 则改为由位置差分得到
+    current: motor_current  # 驱动不上报电流时置 null
+    torque: effort          # 默认值；驱动不上报力矩时置 null
+    effort_source: current  # 两路都有时优先回归哪一路
     temperature: temp
-    enabled: null           # not published; the enable guard is reported off
+    enabled: null           # 未发布；面板会标明该保护处于关闭状态
     fault_code: null
 ```
 
-The unit of every identified parameter follows from `effort_source`, so it
-cannot disagree with the channel actually read: `current` gives amperes,
-`torque` gives newton-metres. A drive reporting both records the one it does
-not fit alongside.
+**两路默认都会去找，因此通常什么都不用配。** `effort` 是 Humble 上 ros2_control 唯一标准化的力矩类接口名，`current` 是后续版本对另一路的命名，所以这两个默认值合起来覆盖了绝大多数机器人：只发 `current` 的（如 RM75）、只发 `effort` 的（如 UR、Franka、KUKA），都能直接读到。
 
-The dashboard states which guards are dark because a signal is unmapped, rather
-than skipping them silently.
+`effort_source` 是**偏好而非要求**。驱动只发另一路时，它有权否决这个偏好：模块会自动改用实际到达的那一路，并在日志和面板笔记里写明改用了什么、单位是什么。一个从不到达的通道不是"在两个量之间做选择"，而是一次没有报错的停摆。
 
-## What it does not command
+每个辨识参数的单位都由 `effort_source` 推导而来，因此不可能与实际读取的通道相矛盾：`current` 得到安培，`torque` 得到牛·米。**若驱动两者都上报，两路都会记录，并在面板上各占一列。**
 
-Only positions, through the trajectory action. Effort is the quantity being
-measured, so commanding it would beg the question. The module never switches
-controllers on its own.
+两路都找不到时，模块会节流地打印一条日志，列出它要的接口名和话题上实际有的接口名——这样接一台新机器人时，第一眼就知道该把哪个 `signal.*` 指到哪。
 
-## Obstacles and collision screening
+面板会明确指出哪些保护因为信号未映射而处于关闭状态，而不是悄悄跳过它们。
 
-The campaign proposes poses the arm has never held, so something has to veto the
-ones that would hit the bench. That check runs on the model, using Pinocchio's
-collision backend — no dependency beyond the one the dynamics already needs.
+### 某个量不在主状态话题上
 
-Obstacles are boxes **bound to a frame**. A box on the base frame is a bench; a
-box on a distal link is a tool or a payload shroud and travels with the arm. You
-place them by dragging in the 3D view; the pose is stored relative to the parent
-frame, so the kinematics do the rest.
-
-## The dashboard
+有些量只通过厂商自己的节点进入 ROS，不在 `joint_states` / `dynamic_joint_states` 里。这种情况不作特例处理：把它转发成一个 `control_msgs/DynamicJointState` 话题，然后在启动时列出来即可。附加话题按关节名合并，并且优先于主状态话题——你既然专门指名了它，那就是在声明这个量从哪来。
 
 ```bash
-ros2 launch robot_parameter_identification dashboard.launch.py \
-    port:=8300 \
-    profile_path:=/path/to/your_arm.yaml \
-    follow_joint_trajectory_action:=/your_controller/follow_joint_trajectory \
-    signal.effort:=current
+extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_current
 ```
 
-Then open `http://localhost:8300`.
+## 它不会下发什么
 
-The left half is the arm, drawn from forward kinematics on the same model the
-collision check and the regression use, so the picture cannot drift from the
-maths. Click a box to select it, drag the gizmo to move, rotate or resize it,
-and pick the frame it is bolted to from the dropdown.
+只下发位置，且只通过轨迹 action。力矩本身正是被测量的对象，去指令它就成了循环论证。模块也绝不会自作主张切换控制器。
 
-The right half is built around the plots that actually decide whether a fit is
-any good:
+## 机器人档案
 
-- **Fit quality** — training, holdout and validation error side by side per
-  joint. Training error can always be made small; only the third bar counts.
-- **Friction curve** — the fitted curve laid over the samples it was fitted to.
-  A curve on its own looks convincing no matter how wrong it is; this is the
-  view where a reversal model that misses at low speed becomes obvious.
-- **Residual against speed** — structure here is unmodelled physics, not noise.
-- **Excitation** — condition number per joint against its cap, so a parameter
-  the experiment barely moved is visible rather than merely reported.
-- **Parameters** — per joint, badged physical or unphysical.
+档案里装的是属于**这条臂**、而不属于方法的每一个数字：机械限位、工作空间限位、逐关节连续/峰值电流、温度上限、超速跳闸、母线电压窗口、限位余量。方法本身对这些一无所知，换一台机器人就是换一份档案。
 
-A hardware run is gated once: a rehearsal must pass first. That gate is not
-ceremony -- the rehearsal plants known friction and has to find it again, and it
-is what caught the fit quietly returning zero. Homing is not gated, because it
-runs no identification and its whole purpose is recovering an arm the plant
-already refuses to arm. The connection panel names any guard that is dark
-because the robot does not publish its signal.
+**没有档案也能跑。** 第一次接一台从没标定过的臂时，本来就不该先手写一份 YAML 才允许开机：模块会从 `/robot_description` 和控制器上报的受控关节列表推导一份，位置与速度限位取自 URDF。
 
-## Status
+推导不出来的只有一样：**电流上限**。URDF 用牛·米描述力矩，换算成驱动电流需要力矩常数，而那恰好是待辨识量之一。编一个数两头都错——偏小会中止本来正常的运行，偏大等于没有保护——所以推导出的档案把电流上限留作无穷大，电流保护如实地保持关闭。
 
-Working and tested:
+面板「连接」卡片里的**编辑机器人档案**打开一个弹窗，上面列出档案里的每一项，逐关节的用表格，包络用输入框，改完点应用即刻生效。填上电流上限，电流保护当场就武装起来；留空就是留空，保护宁可不生效，也不拿一个猜出来的阈值去跳闸。
 
-- identification core — regression, excitation design, four-phase campaign,
-  physical-consistency checks. Carried over from a stack that has completed six
-  hardware runs on a 7-DOF arm.
-- the ROS contract above (`interfaces.py`)
-- obstacle scene and collision screening (`obstacles.py`)
-- a dependency-light rehearsal plant for dry runs (`plants/analytic.py`)
-- the dashboard: node, HTTP API, 3D view, obstacle editing, charts
+面板里应用的数字和手写文件里的数字享受同等待遇——两者都是操作员给的。「连接」卡片会把当前档案标为 `面板内已修改`，好让人区分「正在生效的」和「存在盘上的」。
 
-`133 passed, 3 skipped`.
+**保存**把当前档案写成 YAML，下次用 `profile_path:=` 指过去即可。写入位置只能是启动时的结果目录，或启动时 `profile_path` 指定的那个文件——面板监听在所有网卡上，采信请求里的路径就等于开放任意文件写。
 
-Verified against a live 7-DOF arm: all static assets served, 36 link transforms
-and 16 meshes rendered through the mesh proxy, obstacles added over HTTP and
-screened for collision, telemetry and action server both detected.
+## 障碍物与碰撞筛查
 
-Still to do:
+激励实验会提出机械臂从未到过的位姿，因此必须有人否决那些会撞上工作台的位姿。该检查在模型上运行，使用 Pinocchio 的碰撞后端——不引入动力学之外的任何额外依赖。
 
-- three test modules still import the old MuJoCo plant and are skipped; they
-  need porting to the analytic plant
-- the planned-pose ghost in the 3D view is stubbed, not drawn
-- no campaign has yet been run end to end through this dashboard
+障碍物是**绑定到某个坐标系**的长方体。绑在 base 坐标系上的盒子就是工作台；绑在末端连杆上的盒子则是工具或负载护罩，会随臂一起运动。你在 3D 视图里拖拽即可放置，位姿按相对父坐标系存储，其余交给运动学。
 
-### A caveat worth knowing
+### 场景文件
 
-The rehearsal plant shares its rigid-body model with the identifier, so a clean
-rehearsal proves the *pipeline*, not the *physics*. It cannot catch an error
-that lives in the model itself. When a second engine is installed, cross-check
-against it; `plants.independent_engine_available()` says whether one is.
+用 `obstacle_file:=<路径>` 启动，场景就有了归宿：**每次编辑后立即写盘，启动时自动读回**，不需要手动保存。写入采用先写临时文件再改名的方式，中途断电不会留下半个场景。不给这个参数时场景只存在于内存里。
 
-## Running the tests
+换一台机器人时文件名当然要换，所以障碍物面板里有一个**另存为**：填个文件名再点它，场景会写进结果目录，下次启动那台臂时用 `obstacle_file:=` 指过去即可。留空则覆盖启动时指定的那个文件。
+
+只接受文件名，不接受路径——面板监听在所有网卡上，采信请求里的路径就等于开放任意文件写。`../escape.json`、`/etc/passwd`、`sub/dir.json`、不以 `.json` 结尾的，一律拒绝并说明理由。
+
+文件格式是带版本号的 JSON，每个障碍物都自报形状：
+
+```json
+{
+  "schema_version": 1,
+  "obstacles": [
+    {"shape": "box", "parent_frame": "universe", "name": "bench",
+     "size_m": [0.4, 0.6, 0.05], "xyz_m": [0.3, 0.0, -0.05],
+     "rpy_deg": [0.0, 0.0, 0.0], "enabled": true, "id": "0fa5f899"}
+  ]
+}
+```
+
+**这个格式是为了以后加形状而设计的**，扩展点有三处：
+
+- `shape` 字段人人都有。今天只认 `box`；将来加圆柱，就是在 `obstacles.py` 的 `SHAPES` 和 `_geometry_for` 里各加一处。
+- **不认识的形状会被跳过并说明原因，而不是被当成盒子读进来**，也不会连累文件里其余的障碍物。今天的版本读到一个 `cylinder` 会记一条"obstacle dropped: unknown obstacle shape 'cylinder'"，其余照常载入。
+- `schema_version` 只在旧版本读不动新文件时才会拒绝：版本号比本 build 高就报错，而不是猜。
+
+同一份文件因此可以在不同机型、不同版本之间共享——绑在本机器人没有的坐标系上的盒子同样是跳过而非致命。
+
+## 手动点动
+
+面板的运行卡片里，每个关节各有一根滑块，松手时下发一次目标位姿。
+
+它走的是**辨识时同一个 `FollowJointTrajectory` action**，因此没有第二条命令通路需要单独保证安全。三重约束：
+
+- 行程取**辨识包络**（`reach_deg`）而非 URDF 极限——URDF 描述的是这条臂，不是它被螺栓固定在什么上面，而滑块是把臂开进周围环境最容易的方式。超出范围的请求被**夹紧**，不是拒绝。
+- 每个目标位姿在下发前先过一次**障碍物碰撞筛查**，撞了就拒绝并说明撞到什么。
+- 速度上限固定在 10 °/s，远低于辨识用的任何速度：操作员看的是机械臂，不是曲线，而且没有撤销。
+
+点动会**独占**轨迹控制器，所以启用期间辨识按钮全部禁用，反之亦然。夹紧和筛查都在服务端做——请求不一定来自这个面板。
+
+## 面板
+
+启动方式见上面的[快速开始](#快速开始)。要点只有一条：面板与机器人分两步起，它只连接一台已经在跑的机器人，绝不代你启动任何东西。
+
+`controller` 就是全部：轨迹 action 和 `controller_state` 话题都由它推导出来，受控关节列表则由控制器自己宣告，不用你来告诉它。若某个控制器的 action 不在自己的名字下，可以用 `follow_joint_trajectory_action` 给出完整路径，它优先生效。
+
+其余每一个与具体机器人有关的量都是启动参数：遥测话题、各信号的接口名、附加话题、工作空间限位、最高扫掠速度、障碍物文件、端口。换一条臂——双臂中的另一条，或者另一台机器人——改的是参数，不是代码。
+
+左半屏是机械臂，由正运动学绘制，用的正是碰撞检查和回归所用的同一套模型，因此画面不会与数学脱节。点击盒子可选中，拖拽 gizmo 可平移、旋转或改变尺寸，并可从下拉框中选择它固连的坐标系。
+
+左下角是**实时信号**：位置、速度、电流（或力矩）、温度一并列出，只列这台机器人真的在发布的那几路——没人发布的量宁可不出现，也不画成一条零线冒充读数。只有位置带指示条，条的满量程就是这个关节自己的行程，所以它同时告诉你"还剩多少余量"，这是单个数字给不出的。曲线有三档：**收起**只留数值，**默认**在数值右侧并排，**展开**让曲线占满整块面板。画哪一路自己点，关节用颜色区分，点关节名即可把它从曲线里去掉。
+
+这块面板不走状态轮询，而是从 `/api/telemetry` 按游标取增量：状态轮询要捎带碰撞检查和目录扫描，快不起来；而机器人以上百赫兹发布，每秒采它四次得到的不是一个更慢的信号，而是另一个被削掉了峰值的信号。桥接层留一小段帧缓存，面板按游标把没看过的全部取走，标题上那个 Hz 就是它实际收到的速率。
+
+右半屏围绕真正能判断拟合好坏的那几张图组织：
+
+- **拟合质量** —— 每个关节的训练、留出与验证误差并排显示。训练误差总能做小；只有第三根柱子才算数。
+- **摩擦曲线** —— 拟合曲线叠加在用于拟合的样本点上。一条曲线单独看总是很有说服力，无论它错得多离谱；正是在这张图里，低速段失准的换向模型才会暴露出来。
+- **残差-转速图** —— 这里出现的结构是未建模的物理，不是噪声。
+- **激励充分性** —— 每个关节的条件数与其上限对照，让某个实验几乎没激励到的参数变得可见，而不只是被顺带报告一下。
+- **参数** —— 按关节列出，并标注物理可行 / 不可行。
+
+硬件运行只设一道闸门：必须先通过一次预演（rehearsal）。这道闸门不是走过场——预演会植入已知摩擦并要求把它重新辨识出来，正是它抓到了拟合悄悄返回全零的问题。归零（homing）不设闸门，因为它不做任何辨识，其全部意义就在于把一台已被拒绝使能的臂救回来。连接面板会点名任何因机器人未发布对应信号而关闭的保护。
+
+## 状态
+
+已工作并经过测试：
+
+- 辨识核心 —— 回归、激励设计、四阶段实验流程、物理一致性检查。承接自一套已在 7 自由度臂上完成六次硬件运行的实现。
+- 上文所述的 ROS 约定（`interfaces.py`）
+- 障碍物场景与碰撞筛查（`obstacles.py`）
+- 用于干跑的轻依赖预演被控对象（`plants/analytic.py`）
+- 面板：节点、HTTP API、3D 视图、障碍物编辑、图表
+
+`133 passed, 3 skipped`。
+
+已在一台真实 7 自由度臂上验证：全部静态资源正常服务，36 个连杆变换与 16 个网格经由 mesh 代理渲染，障碍物可通过 HTTP 添加并参与碰撞筛查，遥测与 action server 均被正确检测到。
+
+尚待完成：
+
+- 仍有三个测试模块引用旧的 MuJoCo 被控对象因而被跳过，需要迁移到解析被控对象
+- 3D 视图中的规划位姿残影仍是桩实现，尚未绘制
+- 还没有任何一次完整实验流程通过本面板端到端跑完
+
+### 一个值得知道的告诫
+
+预演被控对象与辨识器共用同一套刚体模型，因此一次干净的预演证明的是**流程**，而不是**物理**。它无法发现模型自身内部的错误。等第二套引擎装上之后，应当与之交叉验证；`plants.independent_engine_available()` 会告诉你是否已有可用的独立引擎。
+
+## 运行测试
 
 ```bash
 source /opt/ros/humble/setup.bash
 PYTHONPATH="$PWD:$PWD/test:$PYTHONPATH" python3 -m pytest -q test
 ```
 
-The suite builds its own 7-DOF arm, so no robot description need be installed.
+测试套件会自行构建一台 7 自由度臂，因此无需安装任何机器人描述文件。
 
-## License
+## 许可证
 
-Apache-2.0.
+Apache-2.0。

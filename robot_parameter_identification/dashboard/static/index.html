@@ -56,6 +56,11 @@
                 data-i18n="obst.delete">delete</button>
         <button id="obst-clear" class="small" data-i18n="obst.clear">clear</button>
       </div>
+      <div class="row save">
+        <input id="obst-file" type="text" spellcheck="false"/>
+        <button id="obst-save" class="small" data-i18n="obst.save">save as</button>
+      </div>
+      <p class="hint" id="obst-where"></p>
       <div class="row">
         <button id="gizmo-move" class="small sel" data-i18n="obst.move">move</button>
         <button id="gizmo-rotate" class="small" data-i18n="obst.rotate">rotate</button>
@@ -86,7 +91,33 @@
       <ul id="obst-list"></ul>
     </div>
 
-    <div class="overlay" id="jointbars"><div id="joint-bars"></div></div>
+    <div class="overlay" id="jointbars">
+      <div class="row title">
+        <strong data-i18n="signals.title">Live signals</strong>
+        <span id="signal-rate" class="muted"></span>
+        <div class="spacer"></div>
+        <span class="muted" id="plot-label" data-i18n="signals.plot">plot</span>
+        <span class="row" id="signal-tabs"></span>
+        <span class="row" id="plot-modes">
+          <button class="small" data-plot="off" data-i18n="signals.off">off</button>
+          <button class="small" data-plot="normal" data-i18n="signals.normal">default</button>
+          <button class="small" data-plot="big" data-i18n="signals.big">expand</button>
+        </span>
+      </div>
+      <p class="hint" id="signal-waiting" data-i18n="signals.waiting">Waiting
+        for telemetry.</p>
+      <div id="signal-body">
+        <div id="signal-left">
+          <div id="signal-head" class="jb head"></div>
+          <div id="joint-bars"></div>
+        </div>
+        <div id="trace-box">
+          <canvas id="chart-trace" height="200"></canvas>
+          <p class="hint" data-i18n="signals.pick">Click a joint to keep it out
+            of the plot.</p>
+        </div>
+      </div>
+    </div>
   </section>
 
   <!-- ---------------- right panel ---------------- -->
@@ -106,6 +137,18 @@
       <p class="hint" id="ack-hint"></p>
       <div id="phasebar" class="phases"></div>
       <div id="progress-line" class="muted">not started</div>
+
+      <h3 data-i18n="jog.title">Jog</h3>
+      <p class="hint" data-i18n="jog.hint">Drives the same trajectory
+        controller the campaign uses. Travel is the identification envelope,
+        not the URDF's, and every pose is screened against the obstacle scene
+        before the arm is asked to go there.</p>
+      <div class="row">
+        <button id="btn-jog" class="danger" disabled
+                data-i18n="jog.enable">Enable jogging</button>
+        <button id="btn-jog-zero" disabled data-i18n="jog.zero">All to zero</button>
+      </div>
+      <div id="jog-sliders" class="jog"></div>
     </div>
 
     <div class="card">
@@ -161,16 +204,13 @@
     </div>
 
     <div class="card">
-      <h2 data-i18n="live.title">Live telemetry</h2>
-      <p class="hint" data-i18n="live.hint">Straight from the state topic, one
-        row per joint.</p>
-      <div class="scroll-x"><table class="live" id="live-table"></table></div>
-    </div>
-
-    <div class="card">
       <h2 data-i18n="conn.title">Connection</h2>
       <table class="kv" id="conn-table"></table>
       <p class="hint" id="guards"></p>
+      <div class="row">
+        <button id="btn-profile" class="small"
+                data-i18n="profile.open">Edit envelope</button>
+      </div>
     </div>
 
     <div class="card">
@@ -235,6 +275,47 @@
 </main>
 
 <div id="toast" class="hidden"></div>
+
+<!-- ---------------- robot envelope editor ---------------- -->
+<div id="profile-modal" class="modal hidden">
+  <div class="sheet">
+    <header class="sheet-head">
+      <h2 data-i18n="profile.title">Robot envelope</h2>
+      <span id="profile-origin" class="muted"></span>
+      <div class="spacer"></div>
+      <button id="profile-close" class="small" data-i18n="profile.close">close</button>
+    </header>
+
+    <div class="sheet-body">
+      <p class="hint" data-i18n="profile.hint">Every number that belongs to
+        this arm rather than to the method. There is one to edit before any
+        file exists: without a file the module derives it from the URDF and
+        the controller's joint list.</p>
+      <p class="hint" id="profile-state"></p>
+
+      <label class="field"><span data-i18n="profile.name">name</span>
+        <input id="profile-name" type="text"/></label>
+
+      <h3 data-i18n="profile.limits">Per joint</h3>
+      <p class="hint" data-i18n="profile.current_hint">Leave a current ceiling
+        blank when nobody has measured it. Blank means no limit, and the
+        current guard stays off rather than trip on a guess.</p>
+      <div class="scroll-x"><table class="live" id="profile-joints"></table></div>
+
+      <h3 data-i18n="profile.envelope">Envelope</h3>
+      <div class="grid3" id="profile-envelope"></div>
+    </div>
+
+    <footer class="sheet-foot">
+      <button id="profile-apply" data-i18n="profile.apply">Apply</button>
+      <button id="profile-reset" class="small" data-i18n="profile.reset">Reset</button>
+      <div class="spacer"></div>
+      <label class="field"><span data-i18n="profile.filename">save as</span>
+        <input id="profile-file" type="text" placeholder="my_arm.yaml"/></label>
+      <button id="profile-save" class="small" data-i18n="profile.save">Save file</button>
+    </footer>
+  </div>
+</div>
 
 <script type="module" src="/viewer.js"></script>
 <script type="module" src="/charts.js"></script>

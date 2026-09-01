@@ -12,6 +12,10 @@ class SignalMapTest(unittest.TestCase):
         self.assertEqual(signals.position, "position")
         self.assertEqual(signals.effort, "current")
 
+    def test_both_effort_channels_are_looked_for_without_being_configured(self):
+        self.assertEqual(SignalMap().effort_channels(),
+                         {"current": "current", "torque": "effort"})
+
     def test_position_cannot_be_blank(self):
         with self.assertRaises(ValueError):
             SignalMap(position="")
@@ -38,12 +42,29 @@ class SignalMapTest(unittest.TestCase):
         both = SignalMap(current="current", torque="torque",
                          effort_source="current")
         self.assertEqual(both.effort, "current")
-        self.assertEqual(both.optional_interfaces().get("torque"), "torque")
+        self.assertEqual(both.effort_channels(),
+                         {"current": "current", "torque": "torque"})
+
+    def test_a_drive_that_publishes_the_preference_keeps_it(self):
+        signals = SignalMap()
+        self.assertIs(signals.settled_among(["current", "torque"]), signals)
+        self.assertIs(signals.settled_among(["current"]), signals)
+
+    def test_a_drive_publishing_only_the_other_channel_overrides_it(self):
+        settled = SignalMap().settled_among(["torque"])
+        self.assertEqual(settled.effort_source, "torque")
+        self.assertEqual(settled.effort, "effort")
+        self.assertEqual(settled.effort_unit, "newton_metre")
+
+    def test_nothing_arriving_leaves_the_preference_alone(self):
+        signals = SignalMap()
+        self.assertIs(signals.settled_among([]), signals)
 
     def test_a_torque_only_drive_is_supported(self):
         signals = SignalMap(current=None, torque="effort",
                             effort_source="torque")
-        self.assertEqual(signals.required_interfaces(), ("position", "effort"))
+        self.assertEqual(signals.required_interfaces(), ("position",))
+        self.assertEqual(signals.effort_channels(), {"torque": "effort"})
         self.assertNotIn("current", signals.optional_interfaces())
 
     def test_optional_signals_may_be_absent(self):
@@ -107,11 +128,49 @@ class TelemetrySpecTest(unittest.TestCase):
         original = TelemetrySpec(signals=JOINT_STATE_MAP, stale_after_s=1.5)
         self.assertEqual(TelemetrySpec.from_dict(original.as_dict()), original)
 
+    def test_a_signal_may_arrive_on_a_topic_of_its_own(self):
+        spec = TelemetrySpec(
+            extra_dynamic_joint_state_topics=("/arm/motor_currents",))
+        self.assertIn("/arm/motor_currents", spec.describe()["extra_topics"])
+
+    def test_blank_extra_topics_are_dropped_rather_than_subscribed(self):
+        spec = TelemetrySpec(
+            extra_dynamic_joint_state_topics=["", "  ", "/arm/currents"])
+        self.assertEqual(spec.extra_dynamic_joint_state_topics,
+                         ("/arm/currents",))
+
+    def test_extra_topics_survive_a_round_trip(self):
+        original = TelemetrySpec(
+            extra_dynamic_joint_state_topics=("/arm/currents",))
+        self.assertEqual(TelemetrySpec.from_dict(original.as_dict()), original)
+
 
 class CommandSpecTest(unittest.TestCase):
     def test_the_only_command_path_is_a_standard_action(self):
         self.assertTrue(CommandSpec().follow_joint_trajectory_action
                         .endswith("/follow_joint_trajectory"))
+
+    def test_naming_the_controller_is_enough(self):
+        spec = CommandSpec.for_controller("left_arm_jtc")
+        self.assertEqual(spec.follow_joint_trajectory_action,
+                         "/left_arm_jtc/follow_joint_trajectory")
+        self.assertEqual(spec.controller_state_topic,
+                         "/left_arm_jtc/controller_state")
+
+    def test_a_leading_slash_on_the_controller_is_not_a_second_one(self):
+        self.assertEqual(
+            CommandSpec.for_controller("/left_arm_jtc"),
+            CommandSpec.for_controller("left_arm_jtc"))
+
+    def test_a_blank_controller_is_refused_rather_than_guessed(self):
+        with self.assertRaises(ValueError):
+            CommandSpec.for_controller("  ")
+
+    def test_the_controller_state_topic_follows_a_full_action_path(self):
+        spec = CommandSpec(
+            follow_joint_trajectory_action="/odd/place/follow_joint_trajectory")
+        self.assertEqual(spec.controller_state_topic,
+                         "/odd/place/controller_state")
 
     def test_round_trip_through_a_dict(self):
         original = CommandSpec(follow_joint_trajectory_action="/a/b",

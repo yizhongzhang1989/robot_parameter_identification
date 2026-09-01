@@ -71,10 +71,15 @@ class SignalMap:
     """
 
     position: str = "position"
-    # Map whichever the drive publishes; map both if it publishes both.
+    # Both are mapped by default so a drive publishing either one is readable
+    # with no configuration: "effort" is the only effort-like name ros2_control
+    # standardises on Humble, and "current" is what the later releases call the
+    # other one. A drive publishing both has both recorded.
     current: str | None = "current"
-    torque: str | None = None
-    # Which of the two the identification regresses against.
+    torque: str | None = "effort"
+    # Which of the two the identification regresses against when both arrive.
+    # A drive that publishes only the other one overrides this; see
+    # :meth:`settled_among`.
     effort_source: str = "current"
     velocity: str | None = "velocity"
     temperature: str | None = "temperature"
@@ -108,22 +113,41 @@ class SignalMap:
     def effort_unit(self) -> str:
         return EFFORT_UNIT_BY_SOURCE[self.effort_source]
 
+    def effort_channels(self) -> dict[str, str]:
+        """Effort source -> interface name, for every channel that is mapped.
+
+        Ordered by ``EFFORT_SOURCES``, which is also the preference order when
+        a drive turns out to publish both.
+        """
+        return {source: getattr(self, source) for source in EFFORT_SOURCES
+                if getattr(self, source)}
+
+    def settled_among(self, sources) -> "SignalMap":
+        """This map with ``effort_source`` set to a channel that arrived.
+
+        The configured source is a preference, not a demand. A drive that
+        publishes only the other channel gets to veto it, because a source that
+        never arrives is not a choice between two quantities -- it is a stall
+        with no error message. Callers announce the switch, since the unit of
+        every identified parameter changes with it.
+        """
+        present = [source for source in EFFORT_SOURCES if source in sources]
+        if not present or self.effort_source in present:
+            return self
+        return replace(self, effort_source=present[0])
+
     def required_interfaces(self) -> tuple[str, ...]:
-        """Interface names a sample must carry before it is usable."""
-        return (self.position, self.effort)
+        """Interface names every sample must carry.
+
+        The effort channels are alternatives rather than requirements -- one of
+        them is enough -- so they are listed by :meth:`effort_channels`.
+        """
+        return (self.position,)
 
     def optional_interfaces(self) -> dict[str, str]:
-        """Signal -> interface name, for the optional signals that are mapped.
-
-        The effort channel that was not selected is included: a drive that
-        reports both is worth recording in full even though only one is fitted.
-        """
-        mapped = {name: getattr(self, name) for name in OPTIONAL_SIGNALS
-                  if getattr(self, name)}
-        spare = "torque" if self.effort_source == "current" else "current"
-        if getattr(self, spare):
-            mapped[spare] = getattr(self, spare)
-        return mapped
+        """Signal -> interface name, for the optional signals that are mapped."""
+        return {name: getattr(self, name) for name in OPTIONAL_SIGNALS
+                if getattr(self, name)}
 
     def missing_guards(self) -> tuple[str, ...]:
         """Safety guards that cannot run because their signal is unmapped.
@@ -183,9 +207,22 @@ class TelemetrySpec:
     # because it is the only one that can carry current or temperature.
     joint_state_topic: str = "/joint_states"
     dynamic_joint_state_topic: str = "/dynamic_joint_states"
+    # Signals the robot publishes somewhere other than its main state topic:
+    # more DynamicJointState topics, merged by joint name. A drive whose
+    # current only reaches ROS through a vendor node is republished onto one of
+    # these instead of being special-cased here. They win over the main topic,
+    # because naming one is an explicit statement of where a signal comes from.
+    extra_dynamic_joint_state_topics: tuple[str, ...] = ()
     signals: SignalMap = SignalMap()
     # Samples older than this are treated as no sample at all.
     stale_after_s: float = 0.5
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "extra_dynamic_joint_state_topics",
+            tuple(str(topic).strip()
+                  for topic in self.extra_dynamic_joint_state_topics
+                  if str(topic).strip()))
 
     def transport(self) -> str:
         if self.dynamic_joint_state_topic:
@@ -204,7 +241,11 @@ class TelemetrySpec:
         return {
             "transport": self.transport(),
             "topic": self.topic(),
+            "extra_topics": list(self.extra_dynamic_joint_state_topics),
             "required": list(self.signals.required_interfaces()),
+            # Alternatives, not requirements: whichever of these the robot
+            # publishes is the one that gets fitted.
+            "effort_options": self.signals.effort_channels(),
             "optional": self.signals.optional_interfaces(),
             "missing_guards": list(self.signals.missing_guards()),
             "effort_source": self.signals.effort_source,
@@ -239,6 +280,26 @@ class CommandSpec:
     # never switches controllers on its own.
     controller_manager: str = "/controller_manager"
     robot_description_topic: str = "/robot_description"
+
+    @property
+    def controller(self) -> str:
+        """The controller the action belongs to, e.g. ``/left_arm_jtc``."""
+        return self.follow_joint_trajectory_action.rsplit(
+            "/follow_joint_trajectory", 1)[0]
+
+    @property
+    def controller_state_topic(self) -> str:
+        """Where that controller says which joints it actually drives."""
+        return f"{self.controller}/controller_state"
+
+    @classmethod
+    def for_controller(cls, controller: str, **rest) -> "CommandSpec":
+        """Naming the controller is enough; the action follows from it."""
+        name = str(controller).strip().strip("/")
+        if not name:
+            raise ValueError("controller name cannot be blank")
+        return cls(follow_joint_trajectory_action=
+                   f"/{name}/follow_joint_trajectory", **rest)
 
     def as_dict(self) -> dict:
         return asdict(self)

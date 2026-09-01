@@ -17,8 +17,19 @@ def build_routes(service, node=None) -> dict:
     """path -> (method, handler). Handlers take the decoded JSON body."""
     return {
         "/api/state": ("GET", lambda _body: service.snapshot()),
+        "/api/telemetry": ("GET",
+                           lambda query: service.telemetry_since(
+                               query.get("since", 0))),
         "/api/runs": ("GET", lambda _body: {"runs": service.runs()}),
         "/api/viewer": ("GET", lambda _body: _viewer(service, node)),
+        "/api/profile": ("GET", lambda _body: service.profile_payload()),
+        "/api/profile/apply": ("POST",
+                               lambda body: service.apply_profile(
+                                   body.get("profile") or {})),
+        "/api/profile/save": ("POST",
+                              lambda body: service.save_profile(
+                                  str(body.get("name", "")))),
+        "/api/profile/reset": ("POST", lambda _body: service.reset_profile()),
         "/api/obstacles": ("POST", lambda body: _obstacles(service, body)),
         "/api/collision": ("POST",
                            lambda body: service.collision_report(
@@ -28,6 +39,7 @@ def build_routes(service, node=None) -> dict:
                               str(body.get("mode", "rehearsal")),
                               body.get("options") or {})),
         "/api/home": ("POST", lambda _body: service.home()),
+        "/api/jog": ("POST", lambda body: service.jog(body)),
         "/api/stop": ("POST", lambda _body: service.stop()),
     }
 
@@ -39,7 +51,7 @@ def _viewer(service, node) -> dict:
 
 
 def _obstacles(service, body: dict):
-    """One endpoint, four verbs, because the UI edits a list not a resource."""
+    """One endpoint, several verbs, because the UI edits a list not a resource."""
     action = str(body.get("action", "replace"))
     if action == "add":
         return {"ok": True, "obstacle": service.add_obstacle(
@@ -52,6 +64,8 @@ def _obstacles(service, body: dict):
         return {"ok": True}
     if action == "clear":
         return {"ok": True, "obstacles": service.replace_obstacles([])}
+    if action == "save":
+        return service.save_obstacles(str(body.get("name", "")))
     return {"ok": True,
             "obstacles": service.replace_obstacles(body.get("obstacles") or [])}
 
@@ -80,7 +94,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._run_file(path[len("/runs/"):])
         route = self.server.routes.get(path)
         if route and route[0] == "GET":
-            return self._json_result(route[1], {})
+            # Query parameters reach a GET handler in the same shape a POST
+            # body does, so handlers never learn which verb carried them.
+            query = {key: values[0]
+                     for key, values in parse_qs(parsed.query).items()}
+            return self._json_result(route[1], query)
         return self._static(path)
 
     def do_POST(self) -> None:  # noqa: N802

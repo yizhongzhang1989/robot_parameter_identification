@@ -8,8 +8,8 @@
 const INK = '#e6e9ef';
 const MUTED = '#8b93a5';
 const LINE = '#262c38';
-const SERIES = ['#4da3ff', '#e0b341', '#35c08a', '#e2565a',
-                '#b07de0', '#4fd0d0', '#e08a4d'];
+export const SERIES = ['#4da3ff', '#e0b341', '#35c08a', '#e2565a',
+                       '#b07de0', '#4fd0d0', '#e08a4d'];
 
 function setup(canvas) {
   const ratio = Math.min(devicePixelRatio || 1, 2);
@@ -101,6 +101,73 @@ export function drawErrors(canvas, result, unit) {
   ctx.fillStyle = MUTED;
   ctx.textAlign = 'right';
   ctx.fillText(unit || 'A', box.right, box.top + 4);
+  ctx.textAlign = 'left';
+}
+
+/* ---------------- rolling trace: one signal, every joint ---------------- */
+
+export function drawTrace(canvas, series, options = {}) {
+  const { ctx, width, height } = setup(canvas);
+  const live = series.filter(
+    (entry) => entry.values.some((value) => Number.isFinite(value)));
+  if (!live.length) return empty(ctx, width, height, options.empty || 'no data');
+
+  const box = { left: 42, right: width - 6, top: 8, bottom: height - 12 };
+  let low = Infinity;
+  let high = -Infinity;
+  for (const entry of live) {
+    for (const value of entry.values) {
+      if (!Number.isFinite(value)) continue;
+      low = Math.min(low, value);
+      high = Math.max(high, value);
+    }
+  }
+  // A flat signal still deserves a chart; without a floor the scale collapses
+  // and the line lands on the axis.
+  const margin = Math.max((high - low) * 0.08, Math.abs(high) * 1e-3, 1e-6);
+  low -= margin;
+  high += margin;
+
+  const count = Math.max(...live.map((entry) => entry.values.length));
+  const span = Math.max(1, count - 1);
+  const x = (index) => box.left + (index / span) * (box.right - box.left);
+  const y = (value) =>
+    box.bottom - ((value - low) / (high - low)) * (box.bottom - box.top);
+
+  axes(ctx, box);
+  if (low < 0 && high > 0) {
+    ctx.strokeStyle = LINE;
+    ctx.beginPath();
+    ctx.moveTo(box.left, y(0));
+    ctx.lineTo(box.right, y(0));
+    ctx.stroke();
+  }
+
+  ctx.lineWidth = 1.4;
+  for (const entry of live) {
+    ctx.strokeStyle = entry.colour;
+    ctx.beginPath();
+    let drawing = false;
+    entry.values.forEach((value, index) => {
+      if (!Number.isFinite(value)) { drawing = false; return; }
+      if (drawing) ctx.lineTo(x(index), y(value));
+      else ctx.moveTo(x(index), y(value));
+      drawing = true;
+    });
+    ctx.stroke();
+  }
+
+  const digits = high - low < 1 ? 3 : 1;
+  ctx.fillStyle = MUTED;
+  ctx.fillText(high.toFixed(digits), 2, box.top + 4);
+  ctx.fillText(low.toFixed(digits), 2, box.bottom);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = INK;
+  ctx.fillText(options.unit || '', box.right, box.top + 4);
+  if (options.window) {
+    ctx.fillStyle = MUTED;
+    ctx.fillText(options.window, box.right, box.bottom - 2);
+  }
   ctx.textAlign = 'left';
 }
 

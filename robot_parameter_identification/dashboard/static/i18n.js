@@ -31,6 +31,26 @@ const DICT = {
   'view.labels': { en: 'labels', zh: '标签' },
   'view.ghost': { en: 'planned pose', zh: '规划位姿' },
 
+  'signals.title': { en: 'Live signals', zh: '实时信号' },
+  'signals.plot': { en: 'plot', zh: '曲线' },
+  'signals.off': { en: 'off', zh: '收起' },
+  'signals.normal': { en: 'default', zh: '默认' },
+  'signals.big': { en: 'expand', zh: '展开' },
+  'signals.pick': {
+    en: 'Click a joint to keep it out of the plot.',
+    zh: '点关节可把它从曲线里去掉。',
+  },
+  'signals.nodata': { en: 'no data yet', zh: '暂无数据' },
+  'signals.waiting': {
+    en: 'Waiting for telemetry.',
+    zh: '等待遥测数据。',
+  },
+  'signals.lost': {
+    en: 'Telemetry stopped. The last frame is not left on screen, because a '
+      + 'frozen number reads exactly like a live one.',
+    zh: '遥测已中断。最后一帧不会继续留在屏上——冻住的数字看起来和实时的一模一样。',
+  },
+
   'obst.title': { en: 'Obstacles', zh: '障碍物' },
   'obst.add': { en: '+ box', zh: '+ 方块' },
   'obst.delete': { en: 'delete', zh: '删除' },
@@ -49,6 +69,14 @@ const DICT = {
     zh: '固定在基座上的方块代表工作台；固定在连杆上的方块会随手臂一起运动。',
   },
   'obst.nomodel': { en: 'no model yet', zh: '尚未载入模型' },
+  'obst.save': { en: 'save as', zh: '另存为' },
+  'obst.saved': { en: 'scene written to {v}', zh: '场景已写入 {v}' },
+  'obst.where': {
+    en: 'edits are kept in {v}; type a name to save a copy, then launch the '
+      + 'next arm with obstacle_file:= pointing at it',
+    zh: '编辑会自动保存到 {v}；填个名字可另存一份，'
+      + '下次启动另一台机器人时用 obstacle_file:= 指过去',
+  },
 
   /* ---- run ---- */
   'run.title': { en: 'Run', zh: '运行' },
@@ -128,6 +156,7 @@ const DICT = {
   'conn.title': { en: 'Connection', zh: '连接' },
   'conn.transport': { en: 'transport', zh: '传输方式' },
   'conn.topic': { en: 'topic', zh: '话题' },
+  'conn.extra_topics': { en: 'extra topics', zh: '附加话题' },
   'conn.action': { en: 'action', zh: '动作服务' },
   'conn.effort_unit': { en: 'identified quantity', zh: '辨识量' },
   'conn.sample_age': { en: 'data age', zh: '数据时延' },
@@ -146,13 +175,72 @@ const DICT = {
     zh: '尚无机器人档案：正在等待控制器上报它所驱动的关节名。在此之前无法运行。',
   },
 
-  /* ---- live telemetry ---- */
-  'live.title': { en: 'Live telemetry', zh: '实时数据' },
-  'live.hint': {
-    en: 'Straight from the state topic, one row per joint. A dash means the '
-      + 'robot does not publish that quantity.',
-    zh: '直接来自状态话题，每个关节一行。短横线表示该机器人不发布此量。',
+  /* ---- robot envelope editor ---- */
+  'profile.open': { en: 'Edit envelope', zh: '编辑机器人档案' },
+  'profile.title': { en: 'Robot envelope', zh: '机器人档案' },
+  'profile.close': { en: 'close', zh: '关闭' },
+  'profile.hint': {
+    en: 'Every number that belongs to this arm rather than to the method. '
+      + 'There is one to edit before any file exists: without a file the '
+      + 'module derives it from the URDF and the joints the controller drives.',
+    zh: '所有属于这条臂、而非属于方法的数字。没有配置文件时也照样可以改：'
+      + '模块会从 URDF 和控制器所驱动的关节推导出一份，这里编辑的就是它。',
   },
+  'profile.nomodel': {
+    en: 'Nothing to edit yet: waiting for /robot_description and for the '
+      + 'controller to name the joints it drives.',
+    zh: '暂无可编辑内容：正在等待 /robot_description 以及控制器上报受控关节名。',
+  },
+  'profile.busy': {
+    en: 'A run is going. The envelope is shown but cannot change until it ends.',
+    zh: '正在运行中。档案只读，运行结束后才能修改。',
+  },
+  'profile.guard_on': {
+    en: 'Current ceilings are set, so the current guard is armed.',
+    zh: '电流上限已设定，电流保护已生效。',
+  },
+  'profile.guard_off': {
+    en: 'No current ceiling is set, so the current guard is off. That is the '
+      + 'honest state until somebody measures one.',
+    zh: '未设定电流上限，因此电流保护未生效。在有人实测出来之前，这就是如实的状态。',
+  },
+  'profile.name': { en: 'name', zh: '名称' },
+  'profile.limits': { en: 'Per joint', zh: '逐关节' },
+  'profile.envelope': { en: 'Envelope', zh: '包络' },
+  'profile.joint': { en: 'joint', zh: '关节' },
+  'profile.position': { en: 'reach', zh: '机械限位' },
+  'profile.workspace': { en: 'workspace cap', zh: '工作空间限位' },
+  'profile.continuous': { en: 'continuous', zh: '连续电流' },
+  'profile.peak': { en: 'peak', zh: '峰值电流' },
+  'profile.current_hint': {
+    en: 'Leave a current ceiling blank when nobody has measured it. Blank '
+      + 'means no limit, and the current guard stays off rather than trip on '
+      + 'a guess.',
+    zh: '没实测过的电流上限就留空。留空表示无上限，电流保护宁可不生效，'
+      + '也不拿一个猜出来的阈值去跳闸。',
+  },
+  'profile.temperature_c': { en: 'temperature ceiling', zh: '温度上限' },
+  'profile.sustained_speed_deg_s': { en: 'campaign speed ceiling', zh: '实验速度上限' },
+  'profile.peak_speed_deg_s': { en: 'overspeed trip', zh: '超速跳闸' },
+  'profile.position_margin_deg': { en: 'limit margin', zh: '限位余量' },
+  'profile.minimum_voltage_v': { en: 'minimum bus voltage', zh: '母线电压下限' },
+  'profile.maximum_voltage_v': { en: 'maximum bus voltage', zh: '母线电压上限' },
+  'profile.sustained_current_window_s': { en: 'continuous-current window', zh: '连续电流窗口' },
+  'profile.sustained_speed_window_s': { en: 'sustained-speed window', zh: '持续速度窗口' },
+  'profile.current_slew_a_s': { en: 'current slew', zh: '电流变化率' },
+  'profile.sender_gap_s': { en: 'sender gap', zh: '发送间隔' },
+  'profile.telemetry_stale_s': { en: 'telemetry stale after', zh: '遥测过期时间' },
+  'profile.probe_current_fraction': { en: 'probe current fraction', zh: '试探电流比例' },
+  'profile.apply': { en: 'Apply', zh: '应用' },
+  'profile.reset': { en: 'Reset', zh: '还原' },
+  'profile.save': { en: 'Save file', zh: '保存为文件' },
+  'profile.filename': { en: 'save as', zh: '文件名' },
+  'profile.applied': { en: 'envelope applied', zh: '档案已应用' },
+  'profile.from_panel': { en: 'edited here', zh: '面板内已修改' },
+  'profile.was_reset': { en: 'envelope reset', zh: '档案已还原' },
+  'profile.saved': { en: 'written to {v}', zh: '已写入 {v}' },
+
+  /* ---- signal names, shared by the live overlay and the tables ---- */
   'live.joint': { en: 'joint', zh: '关节' },
   'live.position': { en: 'position', zh: '位置' },
   'live.speed': { en: 'speed', zh: '速度' },
@@ -160,10 +248,25 @@ const DICT = {
   'live.torque': { en: 'torque', zh: '扭矩' },
   'live.temperature': { en: 'temperature', zh: '温度' },
   'live.voltage': { en: 'voltage', zh: '电压' },
-  'live.fault': { en: 'fault', zh: '故障' },
-  'live.disabled': { en: 'off', zh: '未使能' },
-  'live.waiting': { en: 'waiting for telemetry', zh: '等待遥测数据' },
-  'live.fitted': { en: 'fitted', zh: '用于辨识' },
+
+  /* ---- jogging ---- */
+  'jog.title': { en: 'Jog', zh: '点动' },
+  'jog.hint': {
+    en: 'Drives the same trajectory controller the campaign uses. Travel is '
+      + 'the identification envelope, not the URDF\u2019s, and every pose is '
+      + 'screened against the obstacle scene before the arm is asked to go '
+      + 'there.',
+    zh: '走的是辨识时同一个轨迹控制器。行程取辨识包络而非 URDF 的极限，'
+      + '并且每个目标位姿在下发前都会先做一次障碍物碰撞筛查。',
+  },
+  'jog.enable': { en: 'Enable jogging', zh: '启用点动' },
+  'jog.disable': { en: 'Disable jogging', zh: '停用点动' },
+  'jog.zero': { en: 'All to zero', zh: '全部归零' },
+  'jog.nomodel': {
+    en: 'Waiting for a model and a motion plan.',
+    zh: '等待模型与运动规划就绪。',
+  },
+  'phase.jogging': { en: 'jogging', zh: '点动中' },
 
   /* ---- results ---- */
   'fit.title': { en: 'Fit quality', zh: '拟合质量' },
