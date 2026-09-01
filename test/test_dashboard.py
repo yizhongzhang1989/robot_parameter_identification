@@ -133,6 +133,19 @@ class ObstacleSaveTest(unittest.TestCase):
         self.assertEqual(Path(made._obstacle_save_target()).name,
                          "obstacles.json")
 
+    def test_a_file_that_does_not_exist_yet_is_still_the_target(self):
+        # Naming a scene the first time is how a scene gets started; refusing
+        # to write until the file already exists is a chicken and an egg.
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cell" / "scene.json"
+            made = self.saving_service(directory, launched=str(target))
+            self.assertEqual(made._obstacle_save_target(), target)
+            self.assertEqual(made.snapshot()["obstacle_autosave"], str(target))
+            made.add_obstacle({"parent_frame": f"{PREFIX}base_link"})
+            self.assertTrue(target.exists())
+            self.assertEqual(
+                len(json.loads(target.read_text())["obstacles"]), 1)
+
     def test_saving_is_reachable_over_http(self):
         with tempfile.TemporaryDirectory() as directory:
             made = self.saving_service(directory)

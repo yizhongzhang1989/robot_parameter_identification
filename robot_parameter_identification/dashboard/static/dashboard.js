@@ -170,10 +170,14 @@ function renderObstacleList() {
   const boxes = state.snapshot?.obstacles || [];
   $('obst-count').textContent = String(boxes.length);
   const where = state.snapshot?.obstacle_file || '';
+  const autosave = state.snapshot?.obstacle_autosave || '';
   $('obst-file').placeholder = where.split('/').pop() || 'obstacles.json';
   // Saying where it already goes is the point: the name is what gets carried
   // to the next arm, and the launch argument is where it is picked up again.
-  $('obst-where').textContent = where ? t('obst.where', { v: where }) : '';
+  // Without obstacle_file:= nothing is kept at all, and a hint naming a file
+  // anyway is how a drawn scene goes missing across a restart.
+  $('obst-where').textContent = autosave
+    ? t('obst.where', { v: autosave }) : t('obst.nowhere');
   list.innerHTML = '';
   for (const box of boxes) {
     const item = document.createElement('li');

@@ -77,6 +77,14 @@ const DICT = {
     zh: '编辑会自动保存到 {v}；填个名字可另存一份，'
       + '下次启动另一台机器人时用 obstacle_file:= 指过去',
   },
+  'obst.nowhere': {
+    en: 'this dashboard was launched without obstacle_file:=, so nothing was '
+      + 'loaded and edits are lost on restart. Type a name and save, then '
+      + 'relaunch with obstacle_file:= pointing at it.',
+    zh: '本次启动没有指定 obstacle_file:=，所以没有载入任何障碍物，'
+      + '所做的编辑重启后会丢失。填个名字保存，'
+      + '下次启动时用 obstacle_file:= 指过去。',
+  },
 
   /* ---- run ---- */
   'run.title': { en: 'Run', zh: '运行' },

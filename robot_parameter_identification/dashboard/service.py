@@ -506,7 +506,18 @@ class IdentificationService:
 
     def _restore_obstacles(self) -> bool:
         path = self.obstacle_path()
-        if path is None or self.scene is None or not path.exists():
+        if self.scene is None:
+            return False
+        # An empty scene has three causes and they are not interchangeable:
+        # nothing was asked for, what was asked for is not there, or the file
+        # was read. Saying nothing makes all three look like the same bug.
+        if path is None:
+            self.note("obstacle_file was not set: the scene starts empty and "
+                      "edits are lost on restart unless you save them")
+            return False
+        if not path.exists():
+            self.note(f"no obstacle file at {path.resolve()} yet: the scene "
+                      "starts empty and the first edit creates it there")
             return False
         try:
             skipped = self.scene.load(path)
@@ -1582,6 +1593,9 @@ class IdentificationService:
                 "rehearsal_passed": self.rehearsal_passed,
                 "obstacles": self.obstacles(),
                 "obstacle_file": str(self._obstacle_save_target()),
+                # Where edits are written by themselves, which is nowhere
+                # unless the launch named a file.
+                "obstacle_autosave": str(self.obstacle_path() or ""),
                 "frames": self.frame_names(),
                 "collision": self.collision_report(),
                 "progress": dict(self.progress),

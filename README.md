@@ -31,6 +31,16 @@ ros2 launch robot_parameter_identification dashboard.launch.py \
 
 打开 <http://localhost:8300>。只有 `controller` 必须给：action 和 `controller_state` 话题都由它推出，受控关节由控制器自己宣告，其余全走默认值。左臂把它换成 `left_arm_joint_trajectory_controller` 并加 `port:=8301`。
 
+**画过障碍物之后，这条命令就不够了。** `obstacle_file` 默认为空，为空即「场景只在内存里」：上次画好的盒子不会回来，这次画的也不会留下。第一次可以不给，之后每次都要给：
+
+```bash
+ros2 launch robot_parameter_identification dashboard.launch.py \
+    controller:=right_arm_joint_trajectory_controller \
+    obstacle_file:=config/rm75_obstacles.json
+```
+
+相对路径按**启动面板时所在的目录**解析，因此上面这条要在 `~/Documents/RobotControl` 下敲。**指一个还不存在的文件是对的用法**：它就是这次的保存目标，第一次编辑会把它连同父目录一起建出来。面板的笔记区会写明这一次到底发生了什么——载入了几个、路径上还没有文件（附绝对路径）、还是压根没给这个参数——空场景的三种成因不会长得一模一样。
+
 ### 3. 在面板里把这条臂描述清楚
 
 「连接」卡片 →「编辑机器人档案」。此刻的档案是从 URDF 推导来的：位置和速度限位已经有了，**电流上限是空的**——它推不出来，URDF 只给牛·米，换算需要力矩常数，而那正是待辨识量之一。
@@ -44,7 +54,7 @@ ros2 launch robot_parameter_identification dashboard.launch.py \
 
 ### 4. 跑起来
 
-1. 先在左侧 3D 视图里把工作台、夹具画成盒子——激励会提出机械臂从未到过的位姿，碰撞筛查靠的就是它们
+1. 先在左侧 3D 视图里把工作台、夹具画成盒子——激励会提出机械臂从未到过的位姿，碰撞筛查靠的就是它们。**想让它们下次还在，启动时必须带 `obstacle_file:=`**
 2. **Rehearse（预演）** 必须先通过。它植入已知摩擦并要求辨识器找回来，正是这道闸门抓到过拟合悄悄返回全零
 3. 通过后 **Run on hardware** / **Run optimal excitation** / **Sweep loads** 才解锁
 4. **Home** 不设闸门：它不做辨识，存在的意义就是把一台已被拒绝使能的臂救回来
@@ -58,7 +68,7 @@ ros2 launch robot_parameter_identification dashboard.launch.py \
 | `profile_path:=...` | 已经存好一份档案，不想每次重填 |
 | `maximum_speed_deg_s:=60.0` | 计划速度默认封顶 10 °/s；黏滞摩擦在爬行速度下根本看不出来 |
 | `signal.voltage:=voltage` | 驱动器有 `voltage` 接口、档案又给了电压窗口，母线电压保护才真正生效 |
-| `obstacle_file:=/tmp/right_arm_obstacles.json` | 让画好的障碍物场景在两次会话之间留存 |
+| `obstacle_file:=config/rm75_obstacles.json` | 让画好的障碍物场景在两次会话之间留存；不给它，场景既不会读回也不会保存 |
 
 ## 与机器人之间的约定
 
@@ -144,7 +154,11 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 
 ### 场景文件
 
-用 `obstacle_file:=<路径>` 启动，场景就有了归宿：**每次编辑后立即写盘，启动时自动读回**，不需要手动保存。写入采用先写临时文件再改名的方式，中途断电不会留下半个场景。不给这个参数时场景只存在于内存里。
+用 `obstacle_file:=<路径>` 启动，场景就有了归宿：**每次编辑后立即写盘，启动时自动读回**，不需要手动保存。写入采用先写临时文件再改名的方式，中途断电不会留下半个场景。相对路径按启动面板时所在的目录解析。
+
+**路径上还没有文件，不是错误，而是新建一份场景的正确开头。** 读不到就从空场景开始，但这个路径依旧是保存目标：第一次编辑就把文件连同父目录一起建出来。把「已存在」当成写盘的前提，第一份场景就永远无从诞生。
+
+**不给这个参数，就没有任何东西被自动保存**——场景只存在于内存里，进程一停就没了，只有「另存为」写过的文件还在。面板不会假装相反：没给 `obstacle_file:=` 时，障碍物卡片直接说明本次启动不会留存，而不是指着一个从没被写过的路径说「编辑会自动保存到这里」。
 
 换一台机器人时文件名当然要换，所以障碍物面板里有一个**另存为**：填个文件名再点它，场景会写进结果目录，下次启动那台臂时用 `obstacle_file:=` 指过去即可。留空则覆盖启动时指定的那个文件。
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 import collections
 import re
+import signal
 import threading
 import time
 import xml.etree.ElementTree as ElementTree
@@ -20,6 +21,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
+from rclpy.signals import SignalHandlerOptions
 from std_msgs.msg import String
 
 from ..interfaces import (CommandSpec, EFFORT_SOURCES, SignalMap,
@@ -575,12 +577,25 @@ def _triple(element, attribute: str, fallback) -> list[float]:
 
 
 def main(args=None) -> None:
-    rclpy.init(args=args)
+    # rclpy's own handler shuts the context down from inside the signal, which
+    # destroys the subscription handles the executor is mid-take on: every
+    # Ctrl-C and every pkill then ends in "Unable to convert call argument to
+    # Python object" and exit code 1. Stopping the loop first and tearing down
+    # afterwards is the same shutdown in the order the objects allow.
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = DashboardNode()
+    stopping = threading.Event()
+
+    def stop(signum, _frame) -> None:
+        stopping.set()
+        # A second one still forces out, in case teardown is what is stuck.
+        signal.signal(signum, signal.SIG_DFL)
+
+    for received in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(received, stop)
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+        while rclpy.ok() and not stopping.is_set():
+            rclpy.spin_once(node, timeout_sec=0.1)
     finally:
         node.destroy_node()
         if rclpy.ok():
