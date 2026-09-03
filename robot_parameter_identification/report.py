@@ -19,17 +19,32 @@ RESULT_NAME = "result.json"
 OBSERVATIONS_NAME = "observations.csv"
 RAW_FRAMES_NAME = "raw_frames.csv"
 REPORT_NAME = "report.html"
+GRAVITY_MODEL_NAME = "gravity_model.json"
+MODEL_URDF_NAME = "robot_description.urdf"
 
 # Column order per joint in the CSV. Kept explicit so the header and the rows
 # cannot drift apart.
 JOINT_COLUMNS = ("position_deg", "velocity_deg_s", "acceleration_deg_s2",
                  "effort", "temperature_c")
 # Every frame behind a fitted observation, at the publisher's full rate.
-RAW_COLUMNS = ("position_deg", "velocity_deg_s", "effort", "temperature_c")
+RAW_CHANNELS = (
+  ("position_deg", "position_deg", 5),
+  ("velocity_deg_s", "speed_deg_s", 5),
+  ("effort", "current_a", 6),
+  ("temperature_c", "temperature_c", 2),
+)
+OPTIONAL_RAW_CHANNELS = (
+  ("voltage_v", "voltage_v", 3),
+  ("enabled", "enabled", None),
+  ("fault_code", "fault_code", None),
+  ("drive_current_a", "drive_current_a", 6),
+  ("joint_torque_nm", "joint_torque_nm", 6),
+)
 
 
 def write_run(directory, payload: dict, observations=None,
-              stamp: str | None = None, raw_frames=None) -> Path:
+              stamp: str | None = None, raw_frames=None,
+              model_urdf: str = "") -> Path:
     """Create one folder for this run and fill it. Returns the folder."""
     mode = str(payload.get("mode") or "run")
     stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
@@ -37,6 +52,13 @@ def write_run(directory, payload: dict, observations=None,
     folder.mkdir(parents=True, exist_ok=True)
     (folder / RESULT_NAME).write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if payload.get("gravity_model"):
+      (folder / GRAVITY_MODEL_NAME).write_text(
+        json.dumps(payload["gravity_model"], indent=2,
+               ensure_ascii=False), encoding="utf-8")
+      if model_urdf:
+        (folder / MODEL_URDF_NAME).write_text(
+          str(model_urdf), encoding="utf-8")
     names = joint_names(payload)
     rows = write_observations(folder / OBSERVATIONS_NAME, observations or [],
                               names)
@@ -91,9 +113,14 @@ def write_raw_frames(path, frames, names: list[str]) -> int:
     collapse from a burst of frames to one sample can be checked rather than
     taken on trust.
     """
+    frames = list(frames)
+    channels = list(RAW_CHANNELS)
+    channels.extend(
+      channel for channel in OPTIONAL_RAW_CHANNELS
+      if any(frame.get(channel[1]) for frame in frames))
     header = ["phase", "motion", "frame", "stamp_s"]
     for name in names:
-        header += [f"{name}.{column}" for column in RAW_COLUMNS]
+      header += [f"{name}.{column}" for column, _key, _digits in channels]
     written = 0
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -102,10 +129,11 @@ def write_raw_frames(path, frames, names: list[str]) -> int:
             row = [frame.get("phase", ""), frame.get("motion", ""),
                    frame.get("frame", ""), _round(frame.get("stamp_s"), 6)]
             for index in range(len(names)):
-                row += [_round(_item(frame, "position_deg", index), 5),
-                        _round(_item(frame, "speed_deg_s", index), 5),
-                        _round(_item(frame, "current_a", index), 6),
-                        _round(_item(frame, "temperature_c", index), 2)]
+              for _column, key, digits in channels:
+                value = _item(frame, key, index)
+                row.append(
+                  int(value) if digits is None and value is not None
+                  else _round(value, digits or 0))
             writer.writerow(row)
             written += 1
     return written
@@ -150,7 +178,9 @@ def render_report(payload: dict, observation_rows: int = 0,
         "rawRows": raw_rows,
         "stamp": stamp or time.strftime("%Y%m%d-%H%M%S"),
         "files": {"result": RESULT_NAME, "observations": OBSERVATIONS_NAME,
-                  "raw": RAW_FRAMES_NAME},
+                  "raw": RAW_FRAMES_NAME,
+                  "gravityModel": GRAVITY_MODEL_NAME,
+                  "modelUrdf": MODEL_URDF_NAME},
     }
     blob = json.dumps(document, ensure_ascii=False, default=_plain)
     # A literal </script> inside the data would end the block early.
@@ -174,10 +204,19 @@ def _plain(value):
 # stale in the other.
 TEXT = {
     "title": {"en": "Identification report", "zh": "参数辨识报告"},
+  "title.gravity": {"en": "Gravity effort model report",
+            "zh": "重力驱动量模型报告"},
+  "title.gravity_rehearsal": {"en": "Analytic gravity rehearsal report",
+                "zh": "解析重力预演报告"},
     "subtitle": {
         "en": "What was measured, what was fitted, and how far to trust it.",
         "zh": "本次测量了什么、拟合出了什么，以及结果可信到什么程度。",
     },
+  "subtitle.gravity": {
+    "en": "Hardware provenance, the pair-averaged gravity predictor, "
+        "independent validation, and the boundary of what may be deployed.",
+    "zh": "真机数据溯源、成对平均重力预测器、独立验证，以及可部署范围的明确边界。",
+  },
     "lang": {"en": "中文", "zh": "English"},
 
     "verdict.head": {"en": "Verdict", "zh": "总体判定"},
@@ -188,6 +227,18 @@ TEXT = {
     "verdict.pass.say": {
         "en": "Every joint met its limits. The parameters may be used.",
         "zh": "所有关节均满足判定标准，辨识参数可以使用。",
+    },
+    "verdict.gravity.pass.say": {
+      "en": "Independent validation passed for this empirical effort-domain "
+          "gravity predictor. This does not validate physical link masses "
+          "or install the model in a runtime controller.",
+      "zh": "该电流/驱动量域经验重力预测器已通过独立位姿验证。"
+          "这不代表连杆质量与质心已被物理辨识，也不代表模型已装入运行时控制器。",
+    },
+    "verdict.gravity_rehearsal.pass.say": {
+      "en": "The analytic rehearsal recovered its planted model. It validates "
+          "the calculation path, not hardware measurements.",
+      "zh": "解析预演已复现预设模型；它验证的是计算链路，不是真机测量。",
     },
     "verdict.warn.say": {
         "en": "The run completed, but at least one joint is weakly determined. "
@@ -212,6 +263,10 @@ TEXT = {
     "summary.mode": {"en": "mode", "zh": "运行方式"},
     "summary.mode.hardware": {"en": "hardware", "zh": "真机"},
     "summary.mode.rehearsal": {"en": "rehearsal", "zh": "预演"},
+    "summary.mode.gravity": {"en": "gravity hardware calibration",
+                 "zh": "重力真机标定"},
+    "summary.mode.gravity_rehearsal": {"en": "analytic gravity rehearsal",
+                       "zh": "解析重力预演"},
     "summary.mode.optimal_excitation": {
       "en": "optimal excitation", "zh": "最优激励轨迹辨识"},
     "summary.when": {"en": "recorded", "zh": "记录时间"},
@@ -224,7 +279,78 @@ TEXT = {
     "quantity.current": {"en": "motor current", "zh": "电机电流"},
     "quantity.torque": {"en": "joint torque", "zh": "关节扭矩"},
 
+        "provenance.head": {"en": "Data source and provenance", "zh": "数据来源与溯源"},
+        "provenance.hardware": {"en": "real hardware", "zh": "真机采集"},
+        "provenance.rehearsal": {"en": "analytic rehearsal", "zh": "解析预演"},
+        "provenance.other": {"en": "offline or simulated", "zh": "离线或仿真"},
+        "provenance.hardware.say": {
+        "en": "This result contains timestamped raw frames published while the "
+          "real trajectory controller moved the arm.",
+        "zh": "本结果包含真机轨迹控制器驱动机械臂期间发布的带时间戳原始帧。",
+        },
+        "provenance.rehearsal.say": {
+        "en": "This result came from the analytic plant. Zero raw hardware "
+          "frames is expected and must not be read as a real acquisition.",
+        "zh": "本结果来自解析被控对象。原始真机帧为零是预期行为，不能当作真机采集。",
+        },
+        "provenance.other.say": {
+        "en": "The artifact does not establish real-hardware provenance.",
+        "zh": "该产物不能证明来自真机采集。",
+        },
+        "provenance.source": {"en": "source", "zh": "来源"},
+        "provenance.raw": {"en": "raw frames", "zh": "原始帧"},
+        "provenance.observations": {"en": "fitted observations", "zh": "拟合观测"},
+        "provenance.duration": {"en": "publisher duration", "zh": "发布时长"},
+        "provenance.rate": {"en": "approximate raw rate", "zh": "原始帧约计频率"},
+        "provenance.topic": {"en": "telemetry topic", "zh": "遥测话题"},
+        "provenance.groups": {"en": "raw motion groups", "zh": "原始运动组"},
+        "provenance.phasecheck": {"en": "raw phase/tag mismatches",
+                      "zh": "原始 phase/tag 不一致"},
+        "provenance.software": {"en": "software", "zh": "软件环境"},
+        "provenance.profile": {"en": "profile source", "zh": "Profile 来源"},
+        "provenance.margin": {"en": "collision safety margin", "zh": "碰撞安全余量"},
+
+        "gravity.head": {"en": "Gravity compensation model", "zh": "重力补偿模型"},
+        "gravity.say": {
+        "en": "At each pose, positive and negative crossings are averaged at "
+          "every probe speed before fitting. Odd friction cancels before "
+          "the static Pinocchio regressor plus offset is solved.",
+        "zh": "每个位姿先在每档探针速度上平均正反向穿越，再进行拟合。"
+          "奇对称摩擦在进入静态 Pinocchio 回归量加偏置求解之前已经抵消。",
+        },
+        "gravity.empirical": {"en": "empirical effort predictor",
+              "zh": "经验驱动量预测器"},
+        "gravity.physical.missing": {
+        "en": "Physical link mass, center of mass, and rotational inertia are "
+          "not available. Current-domain fits are independent per output "
+          "joint and are not one shared SI rigid-body model.",
+        "zh": "没有得到物理连杆质量、质心与转动惯量。电流域拟合按输出关节独立进行，"
+          "并不是一套共享的 SI 刚体模型。",
+        },
+        "gravity.runtime.missing": {
+        "en": "Runtime controller loader: not integrated. The normal impedance "
+          "controller still computes gravity from the URDF.",
+        "zh": "运行时控制器加载器：尚未集成。常规阻抗控制器仍从 URDF 计算重力。",
+        },
+        "gravity.pairs.ok": {"en": "all direction/speed pairs complete",
+             "zh": "全部方向/速度配对完整"},
+        "gravity.pairs.bad": {"en": "incomplete direction/speed pairs",
+              "zh": "存在不完整方向/速度配对"},
+        "gravity.model": {"en": "model type", "zh": "模型类型"},
+        "gravity.hash": {"en": "URDF SHA-256", "zh": "URDF 哈希（SHA-256）"},
+        "gravity.trainposes": {"en": "training poses", "zh": "训练位姿"},
+        "gravity.validposes": {"en": "independent validation poses",
+               "zh": "独立验证位姿"},
+        "gravity.mean": {"en": "mean validation RMS", "zh": "平均验证均方根"},
+        "gravity.worst": {"en": "worst validation RMS", "zh": "最差验证均方根"},
+        "gravity.columns": {"en": "named retained columns and coefficients",
+            "zh": "保留列名称与系数"},
+        "gravity.speedcheck": {"en": "speed-pair consistency RMS",
+               "zh": "速度对一致性均方根"},
+
     "joints.head": {"en": "Per joint", "zh": "逐关节结果"},
+    "joints.head.gravity": {"en": "Directional friction nuisance fit",
+                "zh": "方向性摩擦干扰拟合"},
     "joints.say": {
         "en": "Coulomb friction is the constant part that opposes motion; "
           "viscous friction grows with speed. The load ratio multiplies "
@@ -237,6 +363,15 @@ TEXT = {
           "（A/A 或 N·m/N·m），并非直接测得的负载质量或力矩。"
           "验证误差在拟合从未见过的运动上测得，因此最能反映真实水平。",
     },
+        "joints.say.gravity": {
+        "en": "This separate fit explains directional probe differences so "
+          "friction can be audited. It is not the gravity model above. "
+          "Only two speed magnitudes were measured, so retained Stribeck "
+          "or load terms are empirical in-domain features, not identified physics.",
+        "zh": "这套独立拟合用于解释探针正反向差异，以便审计摩擦；它不是上方的重力模型。"
+          "实验只测了两档速度，因此保留的 Stribeck 或载荷项只是域内经验特征，"
+          "不能解释为已辨识的物理规律。",
+        },
     "col.joint": {"en": "joint", "zh": "关节"},
     "col.coulomb": {"en": "Coulomb", "zh": "库仑摩擦"},
     "col.load": {"en": "load ratio", "zh": "载荷比例"},
@@ -253,6 +388,8 @@ TEXT = {
     "col.reason": {"en": "reason", "zh": "原因"},
 
     "formula.head": {"en": "Fitted friction formulas", "zh": "拟合摩擦公式"},
+    "formula.head.gravity": {"en": "Directional friction diagnostic formulas",
+                 "zh": "方向性摩擦诊断公式"},
     "formula.say": {
       "en": "Numeric formulas used by the predictor. Here v is joint speed "
           "in degrees per second, L = |I_rigid| is the absolute rigid-body "
@@ -263,6 +400,13 @@ TEXT = {
           "L = |I_rigid| 为辨识单位下的刚体驱动量绝对值，I_f 为摩擦驱动量。"
           "摩擦图已扣除刚体重力与惯性，因此其峰值小于实测总驱动峰值。",
     },
+        "formula.say.gravity": {
+      "en": "These formulas belong to the nuisance fit, not the pair-averaged "
+        "gravity predictor. They are shown to audit what was cancelled; "
+        "do not extrapolate the two measured speeds into a physical friction law.",
+      "zh": "这些公式属于干扰项拟合，不属于成对平均重力预测器。"
+        "它们用于审计被抵消的成分；不要把两档实测速度外推为物理摩擦定律。",
+        },
         "formula.stribeck.on": {"en": "Stribeck retained", "zh": "保留 Stribeck"},
         "formula.stribeck.off": {"en": "Stribeck rejected", "zh": "拒绝 Stribeck"},
         "formula.stribeck.peak": {"en": "local low-speed peak", "zh": "存在低速局部尖峰"},
@@ -476,6 +620,13 @@ TEXT = {
         "zh": "A 重力：在多个位姿静止保持。B 摩擦：逐个关节做往复扫掠。"
               "C 惯性：沿平滑轨迹整体运动。D 验证：全新运动，仅用于评分。",
     },
+        "phases.gravity.say": {
+        "en": "A gravity: bidirectional crossings at designed training poses. "
+          "D validation: the same measurement at separately seeded poses "
+          "that never enter the fit.",
+        "zh": "A 重力：在设计的训练位姿做双向穿越。D 验证：在独立种子生成、"
+          "从未进入拟合的位姿执行同样测量。",
+        },
     "col.phase": {"en": "phase", "zh": "阶段"},
     "col.observations": {"en": "observations", "zh": "观测数"},
     "col.duration": {"en": "duration", "zh": "时长"},
@@ -516,6 +667,13 @@ TEXT = {
               "machine readable.",
         "zh": "拟合参数及本页所有汇总数值，机器可读格式。",
     },
+        "files.result.gravity": {
+        "en": "The self-describing pair-averaged gravity predictor, named "
+          "regressor columns, coefficients, model hash, provenance, "
+          "validation evidence, and explicit deployment limitations.",
+        "zh": "自描述的成对平均重力预测器、命名回归列、系数、模型哈希、数据溯源、"
+          "验证证据及明确的部署限制。",
+        },
     "files.observations": {
         "en": "One row per fitted sample: the phase, the motion it came from, "
               "how many raw frames the window held and how well they fitted a "
@@ -526,12 +684,25 @@ TEXT = {
               "随后是每个关节的位置、速度、加速度、驱动量和温度。这是拟合实际看到的数据。"
               "列名与 URDF 关节名对应。",
     },
+    "files.gravity_model": {
+      "en": "The gravity predictor alone: named columns, coefficients, model "
+          "identity, validation, and deployment status for a future loader.",
+      "zh": "独立重力预测器：命名列、系数、模型身份、验证与部署状态，供后续加载器使用。",
+    },
+    "files.model_urdf": {
+      "en": "The exact robot description whose hash and Pinocchio regressor "
+          "define this model.",
+      "zh": "定义本模型哈希与 Pinocchio 回归量的精确机器人描述。",
+    },
     "files.raw": {
         "en": "Every frame the driver published during each motion, at its full "
-              "rate. The fit does not use these; they are here so the collapse "
-              "from a burst of frames into one sample can be checked.",
+          "rate, including available voltage, enabled/fault state and "
+          "alternate current/torque channels. The fit does not use these; "
+          "they are here so the collapse from a burst into one sample and "
+          "the active safety evidence can be checked.",
         "zh": "每次运动中驱动器发布的每一帧，按其原始速率记录。拟合不使用这些数据，"
-              "提供它们是为了让由一批帧塌缩成一个样本的这一步可被核查。",
+          "并保留可用的电压、使能/故障状态及另一电流/力矩通道。提供它们是为了核查"
+          "由一批帧塌缩成一个样本的过程，以及当时实际生效的安全证据。",
     },
               "files.sources": {
               "en": "Paths to the original steady and dynamic observation/raw-frame "
@@ -610,12 +781,13 @@ h1{font-size:18px;margin:0;font-weight:600}
 h2{font-size:16px;margin:0 0 6px;font-weight:600}
 main{max-width:1080px;margin:0 auto;padding:24px 28px 80px}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;
-padding:18px 20px;margin:0 0 18px}
+padding:18px 20px;margin:0 0 18px;overflow-x:auto}
 .say{color:var(--muted);margin:0 0 14px;max-width:75ch}
 .spacer{flex:1}
 button{background:#222833;color:var(--ink);border:1px solid var(--line);
 border-radius:7px;padding:6px 14px;cursor:pointer;font-size:13px}
 button:hover{border-color:var(--accent)}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;
@@ -631,7 +803,7 @@ td.n{text-align:right}
 gap:12px}
 .kv{background:#1e232b;border-radius:8px;padding:10px 14px}
 .kv .k{color:var(--muted);font-size:12px}
-.kv .v{font-size:16px;font-variant-numeric:tabular-nums}
+.kv .v{font-size:16px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 canvas{width:100%;background:#151920;border-radius:8px;border:1px solid var(--line)}
 select{background:#222833;color:var(--ink);border:1px solid var(--line);
 border-radius:6px;padding:5px 10px}
@@ -653,6 +825,8 @@ padding:9px 0;border-bottom:1px solid var(--line);align-items:start}
 .formula-row:last-child{border-bottom:0}
 .formula-row code{white-space:normal;overflow-wrap:anywhere;line-height:1.7}
 .formula-note{margin-top:5px;color:var(--muted);font-size:12px;line-height:1.5}
+.model-columns{min-width:280px;max-width:580px;white-space:normal;
+overflow-wrap:anywhere;line-height:1.5}
 code{background:#222833;padding:1px 6px;border-radius:4px;font-size:12px}
 dl{margin:0}dt{margin-top:10px;font-weight:600}dd{margin:2px 0 0;color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
@@ -702,6 +876,11 @@ function verdictSection() {
     <td><span class="pill ${j.state}">${t('verdict.' + j.state)}</span></td>
     <td>${esc(j.reason || '')}</td></tr>`).join('');
   const skipped = P.skipped || [];
+  const gravity = P.gravity_model?.available && state === 'pass';
+  const verdictSay = gravity
+    ? t(P.mode === 'gravity_rehearsal'
+      ? 'verdict.gravity_rehearsal.pass.say' : 'verdict.gravity.pass.say')
+    : t('verdict.' + state + '.say');
   const gaps = skipped.length ? `<p class="say" style="color:var(--warn)">
       ${t('verdict.skipped')}: ${skipped.length} &mdash;
       ${esc(skipped.slice(0, 4).map(s => s.motion).join(', '))}${
@@ -709,13 +888,107 @@ function verdictSection() {
   return `<section>
     <h2 data-i18n="verdict.head"></h2>
     <p class="big"><span class="pill ${state}">${t('verdict.' + state)}</span></p>
-    <p class="say">${t('verdict.' + state + '.say')}</p>
+    <p class="say">${verdictSay}</p>
     ${P.aborted ? `<p class="say" style="color:var(--bad)">
       ${t('verdict.aborted')}: ${esc(P.aborted)}</p>` : ''}
     ${gaps}
     <table><thead><tr>
       <th data-i18n="col.joint"></th><th data-i18n="col.state"></th>
       <th data-i18n="col.reason"></th></tr></thead><tbody>${rows}</tbody></table>
+  </section>`;
+}
+
+function provenanceSection() {
+  const p = P.provenance;
+  if (!p) return '';
+  const hardware = p.source === 'real_hardware';
+  const rehearsal = p.source === 'analytic_rehearsal';
+  const state = p.hardware_evidence ? 'pass' : hardware ? 'fail'
+    : rehearsal ? 'warn' : 'unknown';
+  const sourceKey = hardware ? 'provenance.hardware'
+    : rehearsal ? 'provenance.rehearsal' : 'provenance.other';
+  const sayKey = hardware ? 'provenance.hardware.say'
+    : rehearsal ? 'provenance.rehearsal.say' : 'provenance.other.say';
+  const software = p.software || {};
+  const configuration = p.configuration || {};
+  const profile = configuration.profile || {};
+  const cells = [
+    ['provenance.source', t(sourceKey)],
+    ['provenance.raw', p.raw_frame_count ?? 0],
+    ['provenance.observations', p.fitted_observation_count ?? 0],
+    ['provenance.duration', p.publisher_duration_s == null
+      ? '—' : `${num(p.publisher_duration_s, 1)} s`],
+    ['provenance.rate', p.approximate_raw_rate_hz == null
+      ? '—' : `${num(p.approximate_raw_rate_hz, 1)} Hz`],
+    ['provenance.topic', p.telemetry_topic || '—'],
+    ['provenance.groups', p.raw_motion_groups ?? 0],
+    ['provenance.phasecheck', p.raw_phase_tag_mismatches ?? '—'],
+    ['provenance.software', [software.package_version,
+      `Python ${software.python_version || '?'}`,
+      `NumPy ${software.numpy_version || '?'}`,
+      `Pinocchio ${software.pinocchio_version || '?'}`].filter(Boolean).join(' · ')],
+    ['provenance.profile', profile.source || p.profile_source || '—'],
+    ['provenance.margin', configuration.collision_safety_margin_m == null
+      ? '—' : `${num(configuration.collision_safety_margin_m * 1000, 0)} mm`],
+  ];
+  return `<section><h2>${t('provenance.head')}</h2>
+    <p class="big"><span class="pill ${state}">${t(sourceKey)}</span></p>
+    <p class="say">${t(sayKey)}</p><div class="grid">
+    ${cells.map(([key, value]) => `<div class="kv"><div class="k">${t(key)}</div>
+      <div class="v mono">${esc(value)}</div></div>`).join('')}
+    </div></section>`;
+}
+
+function gravityModelSection() {
+  const model = P.gravity_model;
+  if (!model) return '';
+  if (!model.available) return `<section><h2>${t('gravity.head')}</h2>
+    <p class="big"><span class="pill fail">${t('verdict.fail')}</span></p>
+    <p class="say">${esc(model.reason || 'unavailable')}</p></section>`;
+  const pairing = model.pairing_audit || {};
+  const incomplete = [
+    ...(pairing.incomplete_training_poses || []),
+    ...(pairing.incomplete_validation_poses || []),
+    ...(pairing.malformed_training_tags || []),
+    ...(pairing.malformed_validation_tags || []),
+  ];
+  const validation = (model.external_validation_rms || []).map(Number)
+    .filter(Number.isFinite);
+  const mean = validation.length
+    ? validation.reduce((sum, value) => sum + value, 0) / validation.length : null;
+  const worst = validation.length ? Math.max(...validation) : null;
+  const cells = [
+    ['gravity.model', model.model_type || '—'],
+    ['gravity.trainposes', model.training_poses ?? 0],
+    ['gravity.validposes', model.external_validation_poses ?? 0],
+    ['gravity.mean', mean == null ? '—' : `${num(mean, 5)} ${UNIT}`],
+    ['gravity.worst', worst == null ? '—' : `${num(worst, 5)} ${UNIT}`],
+    ['gravity.hash', model.urdf_sha256 || '—'],
+  ];
+  const rows = (model.joints || []).map((joint, index) => {
+    const columns = joint.retained_columns || [];
+    const expression = columns.map((column) =>
+      `${column.feature}=${num(column.coefficient, 8)}`).join(' · ');
+    return `<tr><td>${esc(joint.output_joint || NAMES[index] || index + 1)}</td>
+      <td class="mono model-columns">${esc(expression || '—')}</td>
+      <td class="n">${num(joint.speed_pair_consistency_rms, 5)} ${UNIT}</td>
+      <td class="n">${num(joint.external_validation_rms, 5)} ${UNIT}</td></tr>`;
+  }).join('');
+  return `<section><h2>${t('gravity.head')}</h2>
+    <p class="big"><span class="pill pass">${t('gravity.empirical')}</span></p>
+    <p class="say">${t('gravity.say')}</p>
+    <p class="say"><code>${esc(model.predictor_equation || '')}</code></p>
+    <p class="say" style="color:var(--warn)">${t('gravity.physical.missing')}</p>
+    <p class="say" style="color:var(--warn)">${t('gravity.runtime.missing')}</p>
+    <p class="say"><span class="pill ${incomplete.length ? 'fail' : 'pass'}">
+      ${t(incomplete.length ? 'gravity.pairs.bad' : 'gravity.pairs.ok')}</span></p>
+    <div class="grid">${cells.map(([key, value]) =>
+      `<div class="kv"><div class="k">${t(key)}</div>
+       <div class="v mono">${esc(value)}</div></div>`).join('')}</div>
+    <h2 style="margin-top:20px">${t('gravity.columns')}</h2>
+    <table><thead><tr><th>${t('col.joint')}</th><th>${t('gravity.columns')}</th>
+      <th class="n">${t('gravity.speedcheck')}</th>
+      <th class="n">${t('col.valid')}</th></tr></thead><tbody>${rows}</tbody></table>
   </section>`;
 }
 
@@ -761,8 +1034,9 @@ function jointSection() {
       <td class="n">${entry.effective_rank ?? '—'}</td>
       <td class="n">${entry.samples ?? '—'}</td></tr>`;
   }).join('');
-  return `<section><h2 data-i18n="joints.head"></h2>
-    <p class="say" data-i18n="joints.say"></p>
+  const gravity = !!P.gravity_model;
+  return `<section><h2>${t(gravity ? 'joints.head.gravity' : 'joints.head')}</h2>
+    <p class="say">${t(gravity ? 'joints.say.gravity' : 'joints.say')}</p>
     <table><thead><tr>
       <th data-i18n="col.joint"></th>
       <th class="n">${t('col.coulomb')} (${UNIT})</th>
@@ -884,8 +1158,9 @@ function formulaSection() {
     <div><code>${esc(frictionFormula(entry))}</code>
       <div class="formula-note">${esc(formulaDiagnostic(entry, index))}</div></div>
     </div>`).join('');
-  return `<section><h2>${t('formula.head')}</h2>
-    <p class="say">${t('formula.say')}</p>
+  const gravity = !!P.gravity_model;
+  return `<section><h2>${t(gravity ? 'formula.head.gravity' : 'formula.head')}</h2>
+    <p class="say">${t(gravity ? 'formula.say.gravity' : 'formula.say')}</p>
     <div class="formula-list">${rows}</div></section>`;
 }
 
@@ -1007,7 +1282,7 @@ function phaseSection() {
     <td class="n">${num(p.peak_current_a, 3)} ${UNIT}</td>
     <td>${p.aborted ? esc(p.aborted) : t('none')}</td></tr>`).join('');
   return `<section><h2 data-i18n="phases.head"></h2>
-    <p class="say" data-i18n="phases.say"></p>
+    <p class="say">${t(P.gravity_model ? 'phases.gravity.say' : 'phases.say')}</p>
     <table><thead><tr>
       <th data-i18n="col.phase"></th><th class="n" data-i18n="col.observations"></th>
       <th class="n" data-i18n="col.duration"></th>
@@ -1041,7 +1316,17 @@ function rehearsalSection() {
 
 function planSection() {
   const plan = P.plan || {};
-  const rows = Object.keys(plan).sort().map((key) => `<tr>
+  const gravityKeys = [
+    'static_poses', 'static_candidates', 'gravity_validation_poses',
+    'gravity_probe_deg', 'gravity_probe_speed_deg_s',
+    'gravity_probe_speeds_deg_s', 'maximum_speed_deg_s',
+    'position_margin_deg', 'temperature_ceiling_c', 'workspace_limit_deg',
+    'workspace_range_deg', 'start_deg', 'seed',
+  ];
+  const keys = P.gravity_model
+    ? gravityKeys.filter((key) => Object.hasOwn(plan, key))
+    : Object.keys(plan).sort();
+  const rows = keys.map((key) => `<tr>
     <td class="mono">${esc(key)}</td>
     <td class="n mono">${esc(JSON.stringify(plan[key]))}</td></tr>`).join('');
   return `<section><h2 data-i18n="plan.head"></h2>
@@ -1051,14 +1336,16 @@ function planSection() {
 
 function fileSection() {
   const items = [
-    [DOC.files.result, 'files.result'],
+    [DOC.files.result, P.gravity_model ? 'files.result.gravity' : 'files.result'],
+    ...(P.gravity_model ? [[DOC.files.gravityModel, 'files.gravity_model']] : []),
+    ...(P.gravity_model ? [[DOC.files.modelUrdf, 'files.model_urdf']] : []),
     [DOC.files.observations, 'files.observations'],
     ...(DOC.rawRows ? [[DOC.files.raw, 'files.raw']] : []),
     ...(P.data_sources ? [['raw_frame_sources.json', 'files.sources']] : []),
     ['report.html', 'files.report'],
   ];
   return `<section><h2 data-i18n="files.head"></h2><dl>
-    ${items.map(([name, key]) => `<dt><code>${esc(name)}</code></dt>
+    ${items.map(([name, key]) => `<dt><a href="${esc(name)}"><code>${esc(name)}</code></a></dt>
       <dd>${t(key)}</dd>`).join('')}</dl></section>`;
 }
 
@@ -1522,9 +1809,14 @@ function redrawCharts() {
 
 function render() {
   document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  const gravityTitle = P.gravity_model
+    ? (P.mode === 'gravity_rehearsal' ? 'title.gravity_rehearsal' : 'title.gravity')
+    : 'title';
+  document.querySelector('h1').setAttribute('data-i18n', gravityTitle);
   document.getElementById('root').innerHTML = [
-    `<p class="say" data-i18n="subtitle"></p>`,
-    verdictSection(), summarySection(), jointSection(), formulaSection(),
+    `<p class="say" data-i18n="${P.gravity_model ? 'subtitle.gravity' : 'subtitle'}"></p>`,
+    provenanceSection(), verdictSection(), gravityModelSection(),
+    summarySection(), jointSection(), formulaSection(),
     steadyFrictionSection(), comparisonSection(), chartSection(),
     phaseSection(), rehearsalSection(), planSection(), fileSection(),
     glossarySection(),

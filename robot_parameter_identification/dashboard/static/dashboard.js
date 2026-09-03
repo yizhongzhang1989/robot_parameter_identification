@@ -11,7 +11,6 @@ const POLL_MS = 400;
 // A directory scan does not belong on the fast path; saved runs change once
 // per campaign, not four times a second.
 const RUNS_EVERY = 25;
-const PHASES = ['A_gravity', 'B_friction', 'C_inertia', 'D_validation'];
 
 const $ = (id) => document.getElementById(id);
 const state = { snapshot: null, selected: null, frames: [], unit: 'A',
@@ -27,7 +26,9 @@ const state = { snapshot: null, selected: null, frames: [], unit: 'A',
                 plannedPoses: [], poseAt: 0, previewToken: -1,
                 // Set when the operator stops the flight by hand, so the run
                 // does not immediately start it again on the next poll.
-                flyOptOut: false, wasRunning: false, flyAuto: false,
+                flyOptOut: false, flyAuto: false, sceneActivityId: '',
+                localEvents: [], gravityStatus: null, gravityStatusKey: '',
+                polling: false,
                 // The envelope the server last confirmed, so a value being
                 // typed is not overwritten by the next poll.
                 spaceApplied: '' };
@@ -64,8 +65,19 @@ function toast(message, kind) {
   const node = $('toast');
   node.textContent = message;
   node.className = kind || '';
+  publishLocalEvent(message, kind === 'err' ? 'error' : 'info');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => node.classList.add('hidden'), 4000);
+}
+
+function publishLocalEvent(message, level = 'info', source = 'dashboard') {
+  state.localEvents = [{
+    sequence: `local-${Date.now()}-${state.localEvents.length}`,
+    time: new Date().toLocaleTimeString([], { hour12: false }),
+    stamp_s: Date.now() / 1000,
+    level, source, message: String(message),
+  }];
+  if (state.snapshot) renderActivity(state.snapshot);
 }
 
 /* ---------------- obstacles ---------------- */
@@ -80,6 +92,7 @@ window.__dash = {
       fillFrames();
     }
   },
+  onSceneActivity: (activity) => renderSceneActivity(activity || {}),
   // The flier reports which transit it is on; the reviewer follows it so the
   // numbers under the canvas belong to the arm being watched.
   onFlying: (at, total) => {
@@ -250,11 +263,17 @@ $('btn-grav-rehearse').addEventListener('click', async () => {
   const options = gravityOptions();
   const answer = await post('/api/campaign',
                             { mode: 'gravity_rehearsal', options });
-  if (answer.ok) state.gravityRehearsed = JSON.stringify(options);
+  if (answer.ok) {
+    state.gravityRehearsed = JSON.stringify(options);
+    state.gravityStatus = null;
+    publishLocalEvent(t('grav.rehearsal_started'), 'info', 'gravity_rehearsal');
+  }
 });
 $('btn-grav-run').addEventListener('click', () => post('/api/campaign', {
   mode: 'gravity', options: gravityOptions(),
 }));
+$('btn-grav-pause').addEventListener('click', () => post('/api/pause', {}));
+$('btn-grav-resume').addEventListener('click', () => post('/api/resume', {}));
 
 $('btn-rescreen').addEventListener('click', () => post('/api/rescreen', {}));
 for (const id of GRAVITY_FIELDS) {
@@ -272,8 +291,43 @@ function gravityArmed(snapshot) {
   return state.gravityRehearsed === JSON.stringify(gravityOptions());
 }
 
+/** Every status that used to be written inside the gravity card. */
+function gravityStatus(snapshot) {
+  const armed = gravityArmed(snapshot);
+  const astray = snapshot.astray || [];
+  const planning = !!snapshot.planning;
+  let status;
+  if (planning) {
+    status = { message: t('grav.planning'), level: 'warning' };
+  } else if (astray.length) {
+    status = {
+      message: t('grav.astray', {
+        v: astray.slice(0, 4)
+          .map((j) => `${j.joint} ${j.moved_deg > 0 ? '+' : ''}${j.moved_deg}°`)
+          .join(', '),
+      }),
+      level: 'error',
+    };
+  } else if (armed) {
+    status = { message: t('grav.armed'), level: 'info', passive: true };
+  } else if (snapshot.gravity_armed) {
+    status = { message: t('grav.stale'), level: 'warning' };
+  } else {
+    status = { message: t('grav.locked'), level: 'info' };
+  }
+
+  const options = gravityOptions();
+  const least = snapshot.gravity_defaults?.minimum_poses || 0;
+  if (!planning && !astray.length && least
+      && options.static_poses < least) {
+    status = { message: t('grav.toofew', { v: least }), level: 'error' };
+  }
+  return { ...status, source: 'gravity' };
+}
+
 function renderGravity(snapshot) {
-  const busy = snapshot.state === 'running' || !!snapshot.jogging;
+  const busy = snapshot.state === 'running' || snapshot.state === 'paused'
+    || !!snapshot.jogging;
   const armed = gravityArmed(snapshot);
   // Everything the screen says is conditional on the joints this dashboard
   // cannot drive being where the screen puts them, which is neutral.
@@ -282,71 +336,40 @@ function renderGravity(snapshot) {
   $('btn-grav-rehearse').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-plan').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-run').disabled = busy || planning || !armed || astray.length > 0;
-  const note = $('grav-state');
-  if (planning) {
-    note.textContent = t('grav.planning');
-    note.style.color = 'var(--warn)';
-  } else if (astray.length) {
-    note.textContent = t('grav.astray', {
-      v: astray.slice(0, 4)
-        .map((j) => `${j.joint} ${j.moved_deg > 0 ? '+' : ''}${j.moved_deg}°`)
-        .join(', ') });
-    note.style.color = 'var(--bad)';
-  } else if (armed) {
-    note.textContent = t('grav.armed');
-    note.style.color = 'var(--ok)';
-  } else if (snapshot.gravity_armed) {
-    note.textContent = t('grav.stale');
-    note.style.color = 'var(--warn)';
-  } else {
-    note.textContent = t('grav.locked');
-    note.style.color = 'var(--muted)';
+  const gravityHardware = snapshot.activity === 'gravity';
+  const pausePending = !!snapshot.progress?.pause_pending;
+  $('btn-grav-pause').disabled = snapshot.state !== 'running'
+    || !gravityHardware || pausePending;
+  $('btn-grav-resume').disabled = !gravityHardware
+    || !(snapshot.state === 'paused' || pausePending) || astray.length > 0;
+  const status = gravityStatus(snapshot);
+  const statusKey = `${status.level}:${status.message}`;
+  state.gravityStatus = status;
+  if (statusKey !== state.gravityStatusKey) {
+    state.gravityStatusKey = statusKey;
+    if (!status.passive) {
+      publishLocalEvent(status.message, status.level, status.source);
+    }
   }
   $('btn-rescreen').classList.toggle('hidden', !astray.length);
   $('btn-rescreen').disabled = busy || planning;
 
   const options = gravityOptions();
   const speeds = options.gravity_probe_speeds_deg_s.filter((v) => v > 0);
-  const least = snapshot.gravity_defaults?.minimum_poses || 0;
-  if (!planning && !astray.length && least
-      && options.static_poses < least) {
-    note.textContent = t('grav.toofew', { v: least });
-    note.style.color = 'var(--bad)';
+  const report = snapshot.reports?.gravity;
+  $('grav-report').classList.toggle('hidden', !report);
+  if (report) {
+    $('grav-report').href = report.report;
+    $('grav-report').title = report.name;
   }
-  // A rehearsal moves nothing, so say which pose it is on: without it the
-  // only sign a dry run is happening is that the buttons went grey.
-  const at = snapshot.progress || {};
-  if (busy && String(at.mode || '').startsWith('gravity') && at.poses) {
-    note.textContent = t('grav.visiting',
-                         { v: `${at.pose || 0} / ${at.poses}` });
-    note.style.color = 'var(--warn)';
-  }
-  // A rehearsal moves nothing on the bench, so the tour is flown in the
-  // canvas instead of watched. A run designs its own poses and only publishes
-  // them once the design is screened, so this has to keep trying rather than
-  // fire on the instant the run began -- there was nothing to fly yet.
-  const running = String(at.mode || '').startsWith('gravity') && busy;
-  if (running && !state.wasRunning) state.flyOptOut = false;
-  state.wasRunning = running;
-  if (running && !state.flyOptOut && !window.__viewer?.flying?.()) {
-    state.flyAuto = true;
-    window.__viewer?.fly?.();
-  }
-  // A flight the run started ends with it. One started by hand does not.
-  if (!running && state.flyAuto) {
-    state.flyAuto = false;
-    window.__viewer?.stopFlying?.();
-  }
-  // Read back rather than remembered: the flight also ends on its own, and a
-  // button captioned "stop" beside an arm that is not moving is a lie.
-  $('pose-fly').textContent = window.__viewer?.flying?.()
-    ? t('inspect.land') : t('inspect.fly');
   const rows = [[t('grav.passes'),
                  (options.static_poses + options.gravity_validation_poses)
                    * speeds.length * 2]];
   const result = snapshot.result;
   if (result && String(result.mode || '').startsWith('gravity')) {
-    const errors = result.validation_rms_a || [];
+    const direct = result.gravity_compensation || {};
+    const errors = direct.available
+      ? (direct.validation_rms || []) : (result.validation_rms_a || []);
     if (errors.length) {
       const unit = state.unit;
       const mean = errors.reduce((a, b) => a + b, 0) / errors.length;
@@ -549,7 +572,7 @@ async function refreshPlannedPoses(token) {
 
 /* ---------------- collapsible panel groups ---------------- */
 
-for (const group of document.querySelectorAll('#panel details.group')) {
+for (const group of document.querySelectorAll('#panel details.group, #edit-box')) {
   const key = `rpi-${group.id}`;
   try {
     const stored = localStorage.getItem(key);
@@ -641,6 +664,127 @@ function phaseLabel(name) {
   return text === key ? name : text;
 }
 
+/** One description for every progress shape published by the service. */
+function progressText(progress) {
+  const bits = [];
+  const updated = Array.isArray(progress.updated_fields)
+    ? new Set(progress.updated_fields) : null;
+  const wasUpdated = (...fields) => !updated
+    || fields.some((field) => updated.has(field));
+  if (progress.phase) bits.push(phaseLabel(progress.phase));
+  if (progress.elapsed_s != null) bits.push(`${Math.round(progress.elapsed_s)}s`);
+  if (progress.pause_pending) bits.push(t('grav.pause_pending'));
+  if (progress.paused) {
+    bits.push(t('grav.paused_pose', {
+      v: progress.target_pose ?? '?', n: progress.poses ?? '?',
+    }));
+  } else if (wasUpdated('resumed') && progress.resumed) {
+    bits.push(t('grav.resuming_pose', {
+      v: progress.target_pose ?? '?', n: progress.poses ?? '?',
+    }));
+  } else if (wasUpdated('target_pose') && !wasUpdated('pose')
+      && progress.target_pose != null) {
+    bits.push(t('grav.target_pose', {
+      v: progress.target_pose, n: progress.poses ?? '?',
+    }));
+  }
+  if (wasUpdated('designed') && progress.designed_poses != null) {
+    bits.push(t('run.designed', { v: progress.designed_poses }));
+  }
+  if (wasUpdated('observations') && progress.observations != null) {
+    bits.push(`${progress.observations} ${t('run.samples')}`);
+  }
+  if (wasUpdated('pose') && progress.pose != null) {
+    bits.push(`${t('run.pose')} ${progress.pose}/${progress.poses ?? '?'}`);
+  }
+  if (wasUpdated('trajectory', 'trajectories') && progress.trajectory != null) {
+    bits.push(`${t('optimal.trajectory')} ${progress.trajectory}/${progress.trajectories ?? '?'}`);
+  }
+  if (wasUpdated('joint_name', 'joint')
+      && (progress.joint_name || progress.joint != null)) {
+    bits.push(String(progress.joint_name || progress.joint));
+  }
+  if (wasUpdated('level', 'levels')
+      && progress.level != null && progress.levels != null) {
+    bits.push(`${progress.level}/${progress.levels}`);
+  }
+  if (wasUpdated('speed_deg_s') && progress.speed_deg_s != null) {
+    bits.push(`${progress.speed_deg_s}°/s`);
+  }
+  if (wasUpdated('driven', 'total')
+      && progress.driven != null && progress.total != null) {
+    bits.push(`${progress.driven}/${progress.total}`);
+  }
+  if (wasUpdated('worst_deg') && progress.worst_deg != null) {
+    bits.push(t('run.worst', { v: progress.worst_deg }));
+  }
+  if (progress.error) {
+    return `${progress.phase === 'failed' ? t('run.failed') : t('run.stopped')}: ${progress.error}`;
+  }
+  return bits.join(' · ') || t('run.notstarted');
+}
+
+function renderActivity(snapshot) {
+  const feed = snapshot.activity_feed || {
+    state: snapshot.state, activity: snapshot.activity,
+    progress: snapshot.progress || {}, events: [], sequence: 0,
+  };
+  const progress = feed.progress || {};
+  const events = [...(feed.events || []), ...state.localEvents];
+  const latest = events.reduce((newest, event) =>
+    !newest || (event.stamp_s || 0) >= (newest.stamp_s || 0) ? event : newest,
+  null);
+  const active = snapshot.planning || feed.state === 'running'
+    || feed.state === 'paused' || feed.state === 'jogging';
+  const mode = feed.activity || progress.mode || '';
+  const gravityActive = snapshot.planning || String(mode).startsWith('gravity');
+  const gravityCurrent = gravityActive ? state.gravityStatus : null;
+    const current = gravityCurrent && (snapshot.planning
+      || gravityCurrent.level === 'error'
+      || (!active && !gravityCurrent.passive))
+    ? gravityCurrent : null;
+  const message = current?.message || (active ? progressText(progress)
+    : (latest?.message || gravityCurrent?.message || progressText(progress)));
+  $('activity-mode').textContent = current ? current.source : active
+    ? (mode || feed.state || '')
+    : (latest?.source || gravityCurrent?.source
+      || feed.activity || progress.mode || feed.state || '');
+  $('progress-line').textContent = message;
+  $('progress-line').title = message;
+  const level = current?.level || (progress.error
+    ? (progress.phase === 'failed' ? 'error' : 'warning')
+    : (progress.pause_pending || progress.paused ? 'warning'
+      : (!active ? (latest?.level || gravityCurrent?.level) : 'info')));
+  $('progress-line').style.color = level === 'error' ? 'var(--bad)'
+    : level === 'warning' ? 'var(--warn)' : '';
+}
+
+/** Apply the mode-neutral activity contract beside the 3D canvas. */
+function renderSceneActivity(activity) {
+  const progress = activity.progress || {};
+  const active = !!activity.id;
+  $('scene-status').classList.toggle('hidden', !active);
+  $('scene-status').textContent = active
+    ? `${activity.mode || t('state.running')} · ${progressText(progress)}` : '';
+
+  if (activity.id !== state.sceneActivityId) {
+    state.sceneActivityId = activity.id;
+    if (activity.id) state.flyOptOut = false;
+  }
+  const autoplay = !!activity.tour?.autoplay;
+  if (autoplay && activity.tour?.available && !state.flyOptOut
+      && !window.__viewer?.flying?.()) {
+    state.flyAuto = true;
+    window.__viewer?.fly?.();
+  }
+  if (!autoplay && state.flyAuto) {
+    state.flyAuto = false;
+    window.__viewer?.stopFlying?.();
+  }
+  $('pose-fly').textContent = window.__viewer?.flying?.()
+    ? t('inspect.land') : t('inspect.fly');
+}
+
 /** The sweep has its own progress shape: it reports a joint and a level rather
  * than one of the campaign's phases, so it gets its own line instead of being
  * forced through a phase bar that has no box for it. */
@@ -687,18 +831,20 @@ function seedGravityFields(snapshot) {
 
 function renderRun(snapshot) {
   const running = snapshot.state === 'running';
+  const paused = snapshot.state === 'paused';
+  const campaignBusy = running || paused;
   // Jogging holds the trajectory action open, so a campaign cannot have it.
-  const busy = running || !!snapshot.jogging;
-  $('run-state').textContent = running
+  const busy = campaignBusy || !!snapshot.jogging;
+  $('run-state').textContent = paused ? t('state.paused') : running
     ? (snapshot.activity || t('state.running')) : t('state.idle');
-  $('run-state').className = 'state' + (running ? ' running' : '');
+  $('run-state').className = 'state' + (campaignBusy ? ' running' : '');
   $('btn-rehearse').disabled = busy || !snapshot.have_model;
   $('btn-hardware').disabled = busy || !snapshot.rehearsal_passed;
   $('btn-optimal').disabled = busy || !snapshot.rehearsal_passed;
   // Homing runs no identification, so the rehearsal gate does not apply; it
   // would only block recovering an arm the plant already refuses to arm.
   $('btn-home').disabled = busy || !snapshot.have_model;
-  $('btn-stop').disabled = !running && !snapshot.jogging;
+  $('btn-stop').disabled = !campaignBusy && !snapshot.jogging;
   // The sweep fits nothing, so the rehearsal gate does not apply to it either.
   // What it does need is a collision screen with the arm actually in it, which
   // it proves for itself before planning any motion.
@@ -711,45 +857,6 @@ function renderRun(snapshot) {
   $('ack-hint').textContent = snapshot.rehearsal_passed
     ? t('run.armed') : t('run.locked');
 
-  const progress = snapshot.progress || {};
-  const current = progress.phase || '';
-  const done = current === 'finished';
-  $('phasebar').innerHTML = PHASES.map((name) => {
-    const at = PHASES.indexOf(current);
-    const index = PHASES.indexOf(name);
-    const cls = current === name ? 'now' : (at > index || done) ? 'done' : '';
-    return `<div class="ph ${cls}">${phaseLabel(name)}</div>`;
-  }).join('');
-
-  const bits = [];
-  if (progress.phase) bits.push(phaseLabel(progress.phase));
-  if (progress.elapsed_s != null) bits.push(`${Math.round(progress.elapsed_s)}s`);
-  if (progress.observations != null) {
-    bits.push(`${progress.observations} ${t('run.samples')}`);
-  }
-  if (progress.pose != null) {
-    bits.push(`${t('run.pose')} ${progress.pose}/${progress.poses ?? '?'}`);
-  }
-  if (progress.trajectory != null) {
-    bits.push(`${t('optimal.trajectory')} ${progress.trajectory}/${progress.trajectories ?? '?'}`);
-  }
-  if (progress.worst_deg != null) {
-    bits.push(t('run.worst', { v: progress.worst_deg }));
-  }
-  $('progress-line').textContent = bits.join(' · ') || t('run.notstarted');
-  // Draw the pose being visited solid among the planned skeletons, so the plan
-  // and the arm can be compared while the run is going.
-  if (progress.pose != null && progress.phase) {
-    window.__viewer?.highlight?.(progress.phase, progress.pose);
-  }
-  const failed = progress.phase === 'failed';
-  if (progress.error) {
-    $('progress-line').textContent =
-      `${failed ? t('run.failed') : t('run.stopped')}: ${progress.error}`;
-    $('progress-line').style.color = failed ? 'var(--bad)' : 'var(--warn)';
-  } else {
-    $('progress-line').style.color = '';
-  }
 }
 
 /* ---------------- live signals over the 3D view ----------------
@@ -990,7 +1097,8 @@ function renderJog(snapshot) {
   button.textContent = t(jogging ? 'jog.disable' : 'jog.enable');
   button.classList.toggle('danger', !jogging);
   button.classList.toggle('stop', jogging);
-  button.disabled = snapshot.state === 'running' || !ready;
+  button.disabled = snapshot.state === 'running'
+    || snapshot.state === 'paused' || !ready;
   $('btn-jog-zero').disabled = !jogging;
 
   const key = `${names.join()}|${limits.join()}|${getLang()}`;
@@ -1316,12 +1424,12 @@ function renderAll(snapshot) {
   renderRun(snapshot);
   renderJog(snapshot);
   renderObstacleList();
+  renderActivity(snapshot);
   if (state.selected) fillForm();
   renderResult(snapshot);
   // Redrawn from the cache: the listing is polled rarely, and a language
   // change must not leave it in the old one until the next scan.
   renderRuns(state.runs);
-  $('notes').textContent = (snapshot.notes || []).join('\n');
 }
 
 async function pollRuns() {
@@ -1333,12 +1441,16 @@ async function pollRuns() {
 }
 
 async function poll() {
+  if (state.polling) return;
+  state.polling = true;
   try {
     const snapshot = await (await fetch('/api/state', { cache: 'no-store' })).json();
     state.snapshot = snapshot;
     renderAll(snapshot);
   } catch (error) {
     pill('pill-desc', false, t('pill.offline'));
+  } finally {
+    state.polling = false;
   }
   if (state.ticks % RUNS_EVERY === 0) pollRuns();
   state.ticks += 1;

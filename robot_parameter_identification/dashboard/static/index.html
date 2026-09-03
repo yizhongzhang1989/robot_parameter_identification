@@ -34,6 +34,7 @@
     <div id="viewer"></div>
     <div id="gravity-labels" class="hidden"></div>
     <div id="loading"><div class="spinner"></div><span>loading model…</span></div>
+    <div id="scene-status" class="overlay hidden" aria-live="polite"></div>
 
     <div class="overlay" id="view-opts">
       <label><input type="checkbox" id="show-mesh" checked/>
@@ -50,11 +51,12 @@
         <span data-i18n="view.gravity">mass and centre of mass</span></label>
     </div>
 
-    <div class="overlay" id="edit-box">
-      <div class="row title">
+    <details class="overlay" id="edit-box" open>
+      <summary>
         <strong data-i18n="obst.title">Obstacles</strong>
         <span id="obst-count" class="muted">0</span>
-      </div>
+      </summary>
+      <div class="obstacle-body">
       <div class="row">
         <button id="obst-add" class="small" data-i18n="obst.add">+ box</button>
         <button id="obst-del" class="small danger" disabled
@@ -94,7 +96,8 @@
           on a link travels with the arm.</p>
       </div>
       <ul id="obst-list"></ul>
-    </div>
+      </div>
+    </details>
 
     <div class="overlay" id="jointbars">
       <div class="row title">
@@ -127,14 +130,12 @@
 
   <!-- ---------------- right panel ---------------- -->
   <aside id="panel">
+  <div id="panel-scroll">
 
   <details class="group" id="group-control" open>
     <summary data-i18n="group.control">Overall control</summary>
 
     <div class="card">
-      <h2 data-i18n="run.activity">Activity</h2>
-      <div id="phasebar" class="phases"></div>
-      <div id="progress-line" class="muted">not started</div>
       <div class="row">
         <button id="btn-home" class="danger" disabled
                 data-i18n="run.home">Home</button>
@@ -228,11 +229,16 @@
         <button id="btn-grav-rehearse" data-i18n="grav.rehearse">Rehearse</button>
         <button id="btn-grav-run" class="danger" disabled
                 data-i18n="grav.run">Run on hardware</button>
+        <a id="grav-report" class="button-link hidden" target="_blank"
+           rel="noopener" data-i18n="grav.report">Open latest report</a>
       </div>
-      <p class="hint" id="grav-state"></p>
       <div class="row">
         <button id="btn-rescreen" class="small hidden"
                 data-i18n="grav.rescreen">Rebuild the screen</button>
+        <button id="btn-grav-pause" class="stop" disabled
+          data-i18n="grav.pause">Pause</button>
+        <button id="btn-grav-resume" disabled
+          data-i18n="grav.resume">Resume</button>
       </div>
 
       <h3 data-i18n="inspect.title">Review the planned poses</h3>
@@ -373,12 +379,15 @@
       <ul id="runs" class="runs"></ul>
     </div>
 
-    <div class="card">
-      <h2 data-i18n="log.title">Log</h2>
-      <pre id="notes"></pre>
-    </div>
-
   </details>
+  </div>
+
+  <section id="activity-strip" aria-live="polite">
+    <strong data-i18n="activity.title">Current</strong>
+    <span id="activity-mode" class="muted"></span>
+    <span id="progress-line" class="activity-current muted"
+          data-i18n="run.notstarted">not started</span>
+  </section>
   </aside>
 </main>
 

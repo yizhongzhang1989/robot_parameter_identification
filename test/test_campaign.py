@@ -1034,6 +1034,69 @@ class GravityCampaignTest(unittest.TestCase):
         self.assertTrue(any(record.phase == campaign.PHASE_VALIDATION
                             for record in run.observations))
 
+    def test_gravity_compensation_uses_complete_pair_averaged_poses(self):
+        run, _plant = self.build(static_poses=6, gravity_validation_poses=3)
+        result = run.run()
+        gravity = result.gravity_compensation
+        self.assertTrue(gravity["available"], gravity)
+        self.assertEqual(gravity["training_poses"], 6)
+        self.assertEqual(gravity["validation_poses"], 3)
+        self.assertEqual(gravity["probe_speeds_deg_s"], [1.0, 3.0])
+        self.assertEqual(gravity["incomplete_training_poses"], [])
+        self.assertEqual(gravity["incomplete_validation_poses"], [])
+        self.assertTrue(all(
+            not joint["components"]["friction"]
+            and joint["components"]["offset"]
+            for joint in gravity["joints"]))
+        self.assertLess(max(gravity["validation_rms"]), 1e-9)
+        self.assertEqual(gravity["verdict"]["state"], "pass")
+        self.assertEqual(result.verdict(), gravity["verdict"])
+
+    def test_an_incomplete_direction_pair_never_enters_the_gravity_fit(self):
+        run, _plant = self.build(static_poses=2, gravity_validation_poses=2)
+        run.run()
+        removed = next(record for record in run.observations
+                       if record.phase == campaign.PHASE_GRAVITY
+                       and record.motion.endswith(":-"))
+        run.observations.remove(removed)
+
+        gravity = run._fit_gravity_compensation()
+
+        self.assertFalse(gravity["available"])
+        self.assertIn("pairing audit failed", gravity["reason"])
+        self.assertEqual(len(
+            gravity["pairing_audit"]["incomplete_training_poses"]), 1)
+
+    def test_bad_or_unexpected_probe_speeds_fail_the_pairing_audit(self):
+        run, _plant = self.build(static_poses=2, gravity_validation_poses=2)
+        run.run()
+        first = next(record for record in run.observations
+                     if record.phase == campaign.PHASE_GRAVITY)
+        bad = campaign.Observation(
+            phase=first.phase, time_s=first.time_s,
+            position_deg=list(first.position_deg),
+            velocity_deg_s=list(first.velocity_deg_s),
+            acceleration_deg_s2=list(first.acceleration_deg_s2),
+            current_a=list(first.current_a),
+            temperature_c=list(first.temperature_c),
+            motion="gravity:p1:not-a-speed:+")
+        extra = campaign.Observation(
+            phase=first.phase, time_s=first.time_s,
+            position_deg=list(first.position_deg),
+            velocity_deg_s=list(first.velocity_deg_s),
+            acceleration_deg_s2=list(first.acceleration_deg_s2),
+            current_a=list(first.current_a),
+            temperature_c=list(first.temperature_c),
+            motion="gravity:p1:9:+")
+        run.observations.extend((bad, extra))
+
+        gravity = run._fit_gravity_compensation()
+
+        self.assertFalse(gravity["available"])
+        audit = gravity["pairing_audit"]
+        self.assertEqual(len(audit["malformed_training_tags"]), 1)
+        self.assertEqual(len(audit["unexpected_training_observations"]), 1)
+
     def test_the_validation_poses_are_not_the_training_poses(self):
         run, _plant = self.build()
         run.run()
@@ -1054,6 +1117,80 @@ class GravityCampaignTest(unittest.TestCase):
         run = campaign.GravityCampaign(arm_model(), Older(), self.plan())
         run.run_gravity()
         self.assertTrue(run.observations)
+
+    def test_the_raw_probe_receives_the_actual_training_or_validation_phase(self):
+        class PhaseAware(self.TaggingPlant):
+            def __init__(self):
+                super().__init__()
+                self.phases = []
+
+            def probe_pose(self, pose_deg, delta_deg, speed_deg_s, tag="",
+                           phase=""):
+                self.phases.append((tag, phase))
+                return super().probe_pose(
+                    pose_deg, delta_deg, speed_deg_s, tag)
+
+        plant = PhaseAware()
+        run = campaign.GravityCampaign(
+            arm_model(), plant,
+            self.plan(static_poses=1, gravity_validation_poses=1))
+        run.run()
+
+        self.assertTrue(any(tag.startswith("gravity:p1")
+                            and phase == campaign.PHASE_GRAVITY
+                            for tag, phase in plant.phases))
+        self.assertTrue(any(tag.startswith("gravity_check:p1")
+                            and phase == campaign.PHASE_VALIDATION
+                            for tag, phase in plant.phases))
+
+    def test_a_paused_pose_discards_every_sample_and_restarts_the_same_index(self):
+        class PausingPlant(self.TaggingPlant):
+            def __init__(self):
+                super().__init__()
+                self.raw_frames = []
+                self.interrupted = False
+
+            def raw_frame_checkpoint(self):
+                return len(self.raw_frames)
+
+            def rollback_raw_frames(self, checkpoint):
+                del self.raw_frames[checkpoint:]
+
+            def probe_pose(self, pose_deg, delta_deg, speed_deg_s, tag=""):
+                self.probes.append((tag, speed_deg_s))
+                self.raw_frames.append({"motion": f"{tag}:{speed_deg_s:g}"})
+                if not self.interrupted:
+                    self.interrupted = True
+                    raise campaign.MotionPaused("safe trajectory boundary")
+                return [
+                    self._frame(pose_deg,
+                                np.full(self.joints, sign * speed_deg_s))
+                    for sign in (1.0, -1.0)
+                ]
+
+        plant = PausingPlant()
+        updates = []
+        waits = []
+        run = campaign.GravityCampaign(
+            arm_model(), plant, self.plan(static_poses=1),
+            progress=lambda phase, detail: updates.append(
+                (phase, dict(detail))),
+            wait_if_paused=lambda phase, pose, poses: waits.append(
+                (phase, pose, poses)) or True)
+
+        report = run.run_gravity()
+
+        self.assertIsNone(report.aborted)
+        self.assertEqual([tag for tag, _speed in plant.probes],
+                         ["gravity:p1", "gravity:p1", "gravity:p1"])
+        self.assertEqual(len(run.observations), 4)
+        self.assertEqual(report.observations, 4)
+        self.assertEqual(len(plant.raw_frames), 2)
+        self.assertGreaterEqual(waits.count((campaign.PHASE_GRAVITY, 1, 1)), 2)
+        completed = [detail for _phase, detail in updates
+                     if detail.get("completed_pose") == 1]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["completed_pose_indices"], [1])
 
 
 class StictionCancellingProbeTest(unittest.TestCase):

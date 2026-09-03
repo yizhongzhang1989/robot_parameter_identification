@@ -71,10 +71,17 @@ html, body {
 #viewer { position: absolute; inset: 0; }
 
 #panel {
-  overflow-y: auto;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  overflow: hidden;
   background: var(--panel);
   border-left: 1px solid var(--line);
+}
+#panel-scroll {
+  min-height: 0;
+  overflow-y: auto;
   padding: 12px;
+  scrollbar-gutter: stable;
 }
 
 /* ---------------- overlays ---------------- */
@@ -98,7 +105,19 @@ html, body {
            /* Above the signal panel: this one is edited, that one is watched,
               and on a narrow stage they want the same pixels. */
            z-index: 3; }
-#edit-box .title { justify-content: space-between; margin-bottom: 6px; }
+#edit-box > summary {
+  cursor: pointer; display: flex; align-items: center; gap: 7px;
+  list-style: none; user-select: none;
+}
+#edit-box > summary::-webkit-details-marker { display: none; }
+#edit-box > summary::before {
+  content: '\25B8'; color: var(--muted); font-size: 10px;
+  transition: transform .12s ease;
+}
+#edit-box[open] > summary::before { transform: rotate(90deg); }
+#edit-box > summary #obst-count { margin-left: auto; }
+#edit-box .obstacle-body { margin-top: 7px; }
+#edit-box:not([open]) { width: auto; overflow: hidden; scrollbar-gutter: auto; }
 
 #jointbars { bottom: 12px; left: 12px; width: 820px; padding: 8px 10px;
              z-index: 2;
@@ -155,6 +174,13 @@ html, body {
   color: var(--muted); background: #0b0d11; z-index: 5;
 }
 #loading.hidden { display: none; }
+#scene-status {
+  top: 12px; left: 50%; transform: translateX(-50%);
+  max-width: min(520px, calc(100% - 590px));
+  padding: 5px 10px; z-index: 4;
+  color: var(--accent); font-size: 11px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+}
 .spinner {
   width: 16px; height: 16px; border-radius: 50%;
   border: 2px solid #2a3140; border-top-color: var(--accent);
@@ -215,6 +241,13 @@ button.small { padding: 3px 8px; font-size: 11px; }
 button.sel { background: rgba(77,163,255,.22); border-color: var(--accent); color: var(--accent); }
 button.danger { background: rgba(226,86,90,.16); border-color: rgba(226,86,90,.45); color: #ff9b9e; }
 button.stop { background: rgba(224,179,65,.16); border-color: rgba(224,179,65,.45); color: var(--warn); }
+.button-link {
+  display: inline-flex; align-items: center;
+  background: rgba(53,192,138,.12); color: var(--ok);
+  border: 1px solid rgba(53,192,138,.4); border-radius: 5px;
+  padding: 6px 12px; font-size: 12px; text-decoration: none;
+}
+.button-link:hover { background: rgba(53,192,138,.2); }
 
 .field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); margin: 6px 0; }
 .field input, .field select {
@@ -287,16 +320,6 @@ td.ok { color: var(--ok); } td.bad { color: var(--bad); } td.warn { color: var(-
 #edit-box .row.save { margin-top: 6px; gap: 4px; }
 #edit-box .row.save input { flex: 1 1 auto; min-width: 0; }
 #obst-where { margin-top: 4px; }
-
-/* ---------------- phases ---------------- */
-
-.phases { display: flex; gap: 4px; margin: 8px 0 6px; }
-.phases .ph {
-  flex: 1; text-align: center; font-size: 10px; padding: 4px 2px;
-  border-radius: 4px; background: #222836; color: var(--muted);
-}
-.phases .ph.done { background: rgba(53,192,138,.16); color: var(--ok); }
-.phases .ph.now  { background: rgba(77,163,255,.2); color: var(--accent); }
 
 /* ---------------- joint bars ---------------- */
 
@@ -401,9 +424,34 @@ canvas { width: 100%; display: block; }
 .badge.ok { background: rgba(53,192,138,.16); color: var(--ok); }
 .badge.bad { background: rgba(226,86,90,.16); color: var(--bad); }
 
-#notes {
-  margin: 0; max-height: 150px; overflow-y: auto;
-  font: 11px/1.5 ui-monospace, monospace; color: var(--muted); white-space: pre-wrap;
+/* ---------------- panel activity strip ---------------- */
+
+#activity-strip {
+  min-height: 160px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: max-content max-content;
+  align-content: start;
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 12px;
+  padding: 14px 16px 16px;
+  background: #11151c;
+  border-top: 1px solid #384253;
+  font-size: 13px;
+}
+#activity-strip > strong {
+  color: var(--muted); font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .5px; white-space: nowrap;
+}
+#activity-mode {
+  max-width: 140px; color: var(--accent); justify-self: end;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.activity-current {
+  grid-column: 1 / -1;
+  min-width: 0; color: var(--ink); line-height: 1.6;
+  white-space: normal; overflow-wrap: anywhere;
 }
 
 #toast {
@@ -413,3 +461,7 @@ canvas { width: 100%; display: block; }
 }
 #toast.err { background: rgba(226,86,90,.2); border-color: var(--bad); color: #ff9b9e; }
 #toast.ok  { background: rgba(53,192,138,.2); border-color: var(--ok); color: #7fe3bb; }
+
+@media (max-width: 900px) {
+  #scene-status { max-width: calc(100% - 24px); top: 54px; }
+}

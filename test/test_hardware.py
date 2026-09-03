@@ -288,6 +288,51 @@ class MotionTest(unittest.TestCase):
         self.assertEqual(point.time_from_start.nanosec, 500000000)
         self.assertEqual(goal.trajectory.joint_names[0], "right_arm_joint1")
 
+    def test_pause_before_a_goal_prevents_it_from_being_sent(self):
+        self.plant.set_pause_requested(lambda: True)
+        points = [(np.zeros(JOINTS), np.zeros(JOINTS), 1.0)]
+
+        with self.assertRaises(hardware.MotionPaused):
+            self.plant._attempt(points)
+
+        self.assertEqual(self.plant._client.goals, [])
+
+    def test_pause_during_a_goal_waits_for_its_successful_result(self):
+        checks = iter((False, True))
+        self.plant.set_pause_requested(lambda: next(checks))
+        points = [(np.zeros(JOINTS), np.zeros(JOINTS), 1.0)]
+
+        with self.assertRaises(hardware.MotionPaused):
+            self.plant._attempt(points)
+
+        self.assertEqual(len(self.plant._client.goals), 1)
+
+    def test_raw_frame_rollback_discards_only_the_unfinished_pose(self):
+        self.plant.raw_frames = [{"frame": 0}, {"frame": 1}]
+        checkpoint = self.plant.raw_frame_checkpoint()
+        self.plant.raw_frames.extend(({"frame": 2}, {"frame": 3}))
+
+        self.plant.rollback_raw_frames(checkpoint)
+
+        self.assertEqual(self.plant.raw_frames, [{"frame": 0}, {"frame": 1}])
+
+    def test_validation_probe_labels_its_settle_and_sweep_raw_frames_validation(self):
+        phases = []
+        self.plant.hold_pose = lambda _pose, phase="": phases.append(
+            ("hold", phase)) or frame()
+        self.plant._sweep = lambda _start, _end, _speed, _tag, phase="": (
+            phases.append(("sweep", phase)) or [])
+
+        self.plant.probe_pose(
+            np.zeros(JOINTS), 5.0, 1.0,
+            tag="gravity_check:p1", phase="D_validation")
+
+        self.assertEqual(phases, [
+            ("hold", "D_validation"),
+            ("sweep", "D_validation"),
+            ("sweep", "D_validation"),
+        ])
+
     def test_traverse_cruises_at_constant_speed(self):
         list(self.plant.traverse(2, np.zeros(JOINTS), 20.0, 5.0))
         goal = self.plant._client.goals[-1]
@@ -334,7 +379,7 @@ class MotionTest(unittest.TestCase):
             position[0] = speed_deg_s * index * period_s
             return frame(position=position, speed=np.full(JOINTS, 8.0))
 
-        self.plant.hold_pose = lambda _pose: frame()
+        self.plant.hold_pose = lambda _pose, phase="": frame()
         self.plant._client = FakeClient(self.result, spins_until_done=1000)
         self.plant._rclpy = FakeRclpy(
             self.plant, crawl, period_s=period_s)

@@ -114,6 +114,21 @@ class RunFolderTest(unittest.TestCase):
                      report.REPORT_NAME):
             self.assertTrue((self.folder / name).is_file(), name)
 
+    def test_a_gravity_run_writes_a_dedicated_model_artifact(self):
+        payload = sample_payload()
+        payload["mode"] = "gravity"
+        payload["gravity_model"] = {
+            "available": True, "model_type": "pair-averaged"}
+        folder = report.write_run(
+            self.temp.name, payload, observations(2), stamp="gravity-model",
+            model_urdf='<robot name="captured"/>')
+        saved = json.loads(
+            (folder / report.GRAVITY_MODEL_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(saved["model_type"], "pair-averaged")
+        self.assertEqual(
+            (folder / report.MODEL_URDF_NAME).read_text(encoding="utf-8"),
+            '<robot name="captured"/>')
+
     def test_the_result_json_round_trips(self):
         loaded = json.loads(
             (self.folder / report.RESULT_NAME).read_text(encoding="utf-8"))
@@ -139,6 +154,40 @@ class RunFolderTest(unittest.TestCase):
             rows = list(csv.DictReader(f))
         self.assertEqual(rows[2]["right_arm_joint1.position_deg"], "2.0")
         self.assertEqual(rows[0]["phase"], "A_gravity")
+
+    def test_raw_csv_preserves_safety_and_alternate_effort_when_published(self):
+        path = Path(self.temp.name) / "complete-raw.csv"
+        frames = [{
+            "phase": "D_validation", "motion": "gravity_check:p1:1:+",
+            "frame": 0, "stamp_s": 10.0,
+            "position_deg": [1.0, 2.0], "speed_deg_s": [0.1, 0.2],
+            "current_a": [0.5, 0.6], "temperature_c": [30.0, 31.0],
+            "voltage_v": [24.1, 24.2], "enabled": [True, False],
+            "fault_code": [0, 7], "drive_current_a": [0.5, 0.6],
+            "joint_torque_nm": [1.5, 1.6],
+        }]
+        report.write_raw_frames(
+            path, frames, ["right_arm_joint1", "right_arm_joint2"])
+        with path.open(encoding="utf-8") as handle:
+            [row] = list(csv.DictReader(handle))
+        self.assertEqual(row["phase"], "D_validation")
+        self.assertEqual(row["right_arm_joint1.voltage_v"], "24.1")
+        self.assertEqual(row["right_arm_joint1.enabled"], "1")
+        self.assertEqual(row["right_arm_joint2.enabled"], "0")
+        self.assertEqual(row["right_arm_joint2.fault_code"], "7")
+        self.assertEqual(row["right_arm_joint1.drive_current_a"], "0.5")
+        self.assertEqual(row["right_arm_joint2.joint_torque_nm"], "1.6")
+
+    def test_raw_csv_omits_optional_channels_that_were_not_published(self):
+        path = Path(self.temp.name) / "minimal-raw.csv"
+        report.write_raw_frames(path, [{
+            "position_deg": [0.0], "speed_deg_s": [0.0],
+            "current_a": [0.0], "temperature_c": [30.0],
+        }], ["joint1"])
+        with path.open(encoding="utf-8") as handle:
+            header = next(csv.reader(handle))
+        self.assertNotIn("joint1.voltage_v", header)
+        self.assertNotIn("joint1.fault_code", header)
 
     def test_combined_report_names_external_raw_sources(self):
         self.assertIn("raw_frame_sources.json", report._TEMPLATE)
@@ -192,6 +241,40 @@ class ReportPageTest(unittest.TestCase):
         self.assertIn("Optimal excitation vs load sweep", self.html)
         self.assertIn("最优激励与负载扫掠对比", self.html)
         self.assertIn("comparisonSection()", self.html)
+
+    def test_gravity_report_leads_with_provenance_and_deployment_limits(self):
+        payload = sample_payload()
+        payload.update({
+            "mode": "gravity",
+            "provenance": {
+                "source": "real_hardware", "hardware_evidence": True,
+                "raw_frame_count": 198081, "fitted_observation_count": 128,
+            },
+            "gravity_model": {
+                "available": True,
+                "model_type": "pair_averaged_empirical_gravity_effort_regressor",
+                "joints": [], "pairing_audit": {},
+                "physical_link_parameters": {"available": False},
+                "runtime": {"integrated_controller_loader": False},
+            },
+        })
+        page = report.render_report(payload)
+        self.assertIn("function provenanceSection()", page)
+        self.assertIn("function gravityModelSection()", page)
+        self.assertLess(page.index("provenanceSection(), verdictSection()"),
+                        page.index("summarySection(), jointSection()"))
+        self.assertIn("verdict.gravity.pass.say", page)
+        self.assertIn("gravity.physical.missing", page)
+        self.assertIn("gravity.runtime.missing", page)
+        self.assertIn("files.result.gravity", page)
+        self.assertIn("files.gravity_model", page)
+        self.assertIn("files.model_urdf", page)
+        self.assertIn("joints.head.gravity", page)
+        self.assertIn("formula.head.gravity", page)
+        self.assertIn("margin:0 0 18px;overflow-x:auto", page)
+        self.assertIn('href="${esc(name)}"', page)
+        self.assertIn("provenance.phasecheck", page)
+        self.assertIn("software.pinocchio_version", page)
 
 
 class ServedRunsTest(unittest.TestCase):
@@ -456,6 +539,96 @@ class ChartLegendTest(unittest.TestCase):
         self.assertIn("charts.residual.caveat", report.TEXT)
         self.assertIn("validation", report.TEXT["charts.residual.caveat"]["en"])
         self.assertIn("验证", report.TEXT["charts.residual.caveat"]["zh"])
+
+
+class DashboardShellTest(unittest.TestCase):
+    """The always-visible shell must not drift back into a folded panel."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.markup = (STATIC / "index.html").read_text(encoding="utf-8")
+        cls.styles = (STATIC / "dashboard.css").read_text(encoding="utf-8")
+        cls.panel = (STATIC / "dashboard.js").read_text(encoding="utf-8")
+        cls.translations = (STATIC / "i18n.js").read_text(encoding="utf-8")
+        cls.viewer = (STATIC / "viewer.js").read_text(encoding="utf-8")
+
+    def test_the_obstacle_editor_is_a_persistent_details_element(self):
+        self.assertIn('<details class="overlay" id="edit-box" open>',
+                      self.markup)
+        self.assertIn("#panel details.group, #edit-box", self.panel)
+
+    def test_the_information_strip_is_the_panel_s_unfoldable_bottom_row(self):
+        panel = self.markup.index('<aside id="panel">')
+        scroll = self.markup.index('id="panel-scroll"')
+        strip = self.markup.index('id="activity-strip"')
+        end = self.markup.index("</aside>", panel)
+        self.assertLess(panel, scroll)
+        self.assertLess(scroll, strip)
+        self.assertLess(strip, end)
+        self.assertIn("#panel {\n  display: grid;", self.styles)
+        self.assertIn("grid-template-rows: minmax(0, 1fr) auto", self.styles)
+        self.assertNotIn("#activity-strip {\n  position: fixed", self.styles)
+        self.assertEqual(self.markup.count('id="progress-line"'), 1)
+
+    def test_the_information_strip_is_current_state_not_a_log(self):
+        self.assertNotIn('id="activity-events"', self.markup)
+        self.assertNotIn('id="activity-time"', self.markup)
+        self.assertNotIn("events.slice(-80)", self.panel)
+
+    def test_the_information_strip_gives_the_current_message_room(self):
+        self.assertIn("min-height: 160px", self.styles)
+        self.assertIn("grid-template-columns: minmax(0, 1fr) auto", self.styles)
+        self.assertIn("align-content: start", self.styles)
+        self.assertIn("font-size: 13px", self.styles)
+        self.assertIn("grid-column: 1 / -1", self.styles)
+        self.assertIn("overflow-wrap: anywhere", self.styles)
+        self.assertNotIn("-webkit-line-clamp", self.styles)
+
+    def test_canvas_activity_is_mode_neutral(self):
+        self.assertIn("onSceneActivity", self.panel)
+        self.assertIn("data.scene_activity", self.viewer)
+        self.assertNotIn("startsWith('gravity') && busy", self.panel)
+
+    def test_canvas_distinguishes_target_completed_and_pending_poses(self):
+        self.assertIn("const GHOST_ACTIVE = 0xffc857", self.viewer)
+        self.assertIn("const GHOST_COMPLETED = 0x8fa3ad", self.viewer)
+        self.assertIn("activity.completed || {}", self.viewer)
+        self.assertIn("complete ? GHOST_COMPLETED : node.color", self.viewer)
+        self.assertIn("focus.phase, focus.index", self.viewer)
+
+    def test_gravity_has_a_direct_safe_report_link(self):
+        self.assertIn('id="grav-report"', self.markup)
+        self.assertIn("snapshot.reports?.gravity", self.panel)
+        self.assertIn('target="_blank"', self.markup)
+        self.assertIn('rel="noopener"', self.markup)
+
+    def test_gravity_hardware_run_has_pause_and_resume_controls(self):
+        self.assertEqual(self.markup.count('id="btn-grav-pause"'), 1)
+        self.assertEqual(self.markup.count('id="btn-grav-resume"'), 1)
+        self.assertIn("post('/api/pause', {})", self.panel)
+        self.assertIn("post('/api/resume', {})", self.panel)
+        self.assertIn("snapshot.state === 'paused'", self.panel)
+        self.assertIn("'grav.paused_pose'", self.translations)
+
+    def test_gravity_status_exists_only_in_the_information_strip(self):
+        self.assertNotIn('id="grav-state"', self.markup)
+        self.assertIn("function gravityStatus(snapshot)", self.panel)
+        self.assertIn("passive: true", self.panel)
+        self.assertIn("if (!status.passive)", self.panel)
+        self.assertIn("(!active && !gravityCurrent.passive)", self.panel)
+        self.assertIn("latest?.message || gravityCurrent?.message", self.panel)
+
+    def test_activity_follows_the_latest_progress_callback(self):
+        self.assertIn("progress.updated_fields", self.panel)
+        self.assertIn("wasUpdated('designed')", self.panel)
+        self.assertIn("wasUpdated('observations')", self.panel)
+        self.assertIn("wasUpdated('pose')", self.panel)
+        self.assertNotIn("&& progress.poses", self.panel)
+        self.assertIn("'run.designed'", self.translations)
+        self.assertIn("if (state.polling) return", self.panel)
+        self.assertIn("publishLocalEvent(t('grav.rehearsal_started')", self.panel)
+        self.assertIn("'phase.starting'", self.translations)
+        self.assertIn("'phase.finished'", self.translations)
 
 
 class TranslationTest(unittest.TestCase):

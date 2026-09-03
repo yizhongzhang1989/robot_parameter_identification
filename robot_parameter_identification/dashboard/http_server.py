@@ -17,10 +17,12 @@ def build_routes(service, node=None) -> dict:
     """path -> (method, handler). Handlers take the decoded JSON body."""
     return {
         "/api/state": ("GET", lambda _body: service.snapshot()),
+        "/api/activity": ("GET", lambda _body: service.activity_payload()),
         "/api/telemetry": ("GET",
                            lambda query: service.telemetry_since(
                                query.get("since", 0))),
         "/api/runs": ("GET", lambda _body: {"runs": service.runs()}),
+        "/api/reports": ("GET", lambda _body: service.reports_payload()),
         "/api/viewer": ("GET", lambda _body: _viewer(service, node)),
         "/api/preview": ("GET", lambda _body: service.preview_payload()),
         "/api/workspace": ("GET", lambda _body: service.workspace_payload()),
@@ -57,6 +59,8 @@ def build_routes(service, node=None) -> dict:
                               body.get("options") or {})),
         "/api/home": ("POST", lambda _body: service.home()),
         "/api/jog": ("POST", lambda body: service.jog(body)),
+        "/api/pause": ("POST", lambda _body: service.pause()),
+        "/api/resume": ("POST", lambda _body: service.resume()),
         "/api/stop": ("POST", lambda _body: service.stop()),
     }
 

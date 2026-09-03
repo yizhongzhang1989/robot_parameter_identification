@@ -46,6 +46,15 @@ class MotionFailed(RuntimeError):
     """
 
 
+class MotionPaused(RuntimeError):
+    """A pause was requested and the current controller goal has stopped.
+
+    This is control flow rather than a failed motion.  Campaigns use it to
+    discard the unfinished measurement transaction, wait, and retry the same
+    target after resume.
+    """
+
+
 class DriveLimitExceeded(MotionFailed):
     """One motion exceeded a drive limit that a smaller motion may satisfy."""
 

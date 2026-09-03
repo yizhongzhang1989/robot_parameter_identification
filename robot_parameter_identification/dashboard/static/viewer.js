@@ -74,6 +74,8 @@ const state = {
   flight: 0,             // which flight is current; older loops stand down
   flyFrom: 0,
   previewToken: -1,
+  completedPoses: {},
+  serverFocus: false,
   obstacles: [],
   selected: null,
   showMesh: true,
@@ -426,6 +428,8 @@ const GHOST_COLORS = {
 };
 const GHOST_FALLBACK = 0x8b93a5;
 const GHOST_DIM = 0.22;
+const GHOST_ACTIVE = 0xffc857;
+const GHOST_COMPLETED = 0x8fa3ad;
 
 async function loadPreview() {
   const response = await fetch('/api/preview', { cache: 'no-store' });
@@ -451,7 +455,7 @@ async function loadPreview() {
       tip.scale.setScalar(0.012);
       ghostGroup.add(line, tip);
       state.ghostNodes.push({ phase: group.phase, index: pose.index,
-                              pose: pose.pose_deg, line, tip });
+              pose: pose.pose_deg, color, line, tip });
     }
   }
   state.flyFrom = 0;
@@ -460,13 +464,19 @@ async function loadPreview() {
   if (wasFlying && state.ghostNodes.length > 1) flyTour();
 }
 
-/** Draw the pose being executed solid, so the plan and the arm can be compared. */
-function highlightPose(phase, index) {
+/** Distinguish the target, completed poses, and work still waiting. */
+function highlightPose(phase, index, completed = state.completedPoses) {
+  const done = new Map(Object.entries(completed || {}).map(
+    ([name, values]) => [name, new Set(values || [])]));
   for (const node of state.ghostNodes) {
     const on = node.phase === phase && node.index === index;
-    node.line.material.opacity = on ? 1.0 : GHOST_DIM;
-    node.tip.material.opacity = on ? 1.0 : GHOST_DIM + 0.2;
-    node.tip.scale.setScalar(on ? 0.022 : 0.012);
+    const complete = done.get(node.phase)?.has(node.index) || false;
+    const color = on ? GHOST_ACTIVE : complete ? GHOST_COMPLETED : node.color;
+    node.line.material.color.setHex(color);
+    node.tip.material.color.setHex(color);
+    node.line.material.opacity = on ? 1.0 : complete ? 0.68 : GHOST_DIM;
+    node.tip.material.opacity = on ? 1.0 : complete ? 0.84 : GHOST_DIM + 0.2;
+    node.tip.scale.setScalar(on ? 0.024 : complete ? 0.016 : 0.012);
   }
 }
 
@@ -626,7 +636,17 @@ async function poll() {
     }
     state.obstacles = data.obstacles || [];
     syncObstacles(state.obstacles);
-    if (data.moving) highlightPose(data.moving.phase, data.moving.index);
+    const activity = data.scene_activity || {};
+    const focus = activity.focus || data.moving;
+    state.completedPoses = activity.completed || {};
+    if (focus) {
+      state.serverFocus = true;
+      highlightPose(focus.phase, focus.index);
+    } else if (state.serverFocus) {
+      state.serverFocus = false;
+      highlightPose('', 0);
+    }
+    window.__dash?.onSceneActivity?.(activity);
     window.__dash?.onViewer?.(data);
   } catch (error) {
     /* the panel already reports connection health */

@@ -4,6 +4,8 @@ from pathlib import Path
 import json
 import math
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -17,9 +19,11 @@ try:
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
         DashboardConfig, IdentificationService, _comparison, _swept_here,
-        parse_gravity_terms, GRAVITY_MODE, GRAVITY_REHEARSAL)
+        parse_gravity_terms, GRAVITY_MODE, GRAVITY_REHEARSAL,
+        RUNNING, PAUSED)
     from robot_parameter_identification.interfaces import (
         SignalMap, TelemetrySpec)
+    from robot_parameter_identification.model import ModelComponents
     from robot_parameter_identification.obstacles import SCHEMA_VERSION
     from fixtures import synthetic_urdf, test_profile, PREFIX
 except ImportError as error:
@@ -240,6 +244,101 @@ class ResultProvenanceTest(unittest.TestCase):
         made._finish("rehearsal", {"complete": True, "joints": []}, [])
         self.assertEqual(made.snapshot()["result"]["effort_unit"],
                          "newton_metre")
+
+    def test_hardware_and_rehearsal_provenance_cannot_be_confused(self):
+        made = service()
+        raw = [{"stamp_s": 10.0, "motion": "first"},
+               {"stamp_s": 10.005, "motion": "first"},
+               {"stamp_s": 20.0, "motion": "second"},
+               {"stamp_s": 20.005, "motion": "second"}]
+        hardware = made._provenance_payload(GRAVITY_MODE, [object()], raw)
+        rehearsal = made._provenance_payload(GRAVITY_REHEARSAL, [object()], [])
+        self.assertEqual(hardware["source"], "real_hardware")
+        self.assertTrue(hardware["hardware_evidence"])
+        self.assertEqual(hardware["raw_frame_count"], 4)
+        self.assertAlmostEqual(hardware["approximate_raw_rate_hz"], 200.0)
+        self.assertEqual(hardware["raw_motion_groups"], 2)
+        self.assertEqual(hardware["raw_phase_counts"], {"": 4})
+        self.assertEqual(hardware["raw_phase_tag_mismatches"], 0)
+        self.assertIn("software", hardware)
+        self.assertIn("configuration", hardware)
+        self.assertEqual(rehearsal["source"], "analytic_rehearsal")
+        self.assertFalse(rehearsal["hardware_evidence"])
+        self.assertEqual(rehearsal["raw_frame_count"], 0)
+
+    def test_gravity_model_names_every_retained_column_and_its_limits(self):
+        made = service()
+        width = made.arm.parameter_count
+        payload = {
+            "joint_names": [f"{PREFIX}joint1"],
+            "effort_source": "current",
+            "effort_unit": "ampere",
+            "validation_samples": 8,
+            "gravity_compensation": {
+                "available": True,
+                "friction_cancellation": "pair mean",
+                "training_poses": 4,
+                "validation_poses": 2,
+                "validation_rms": [0.05],
+                "probe_speeds_deg_s": [1.0, 3.0],
+                "incomplete_training_poses": [],
+                "incomplete_validation_poses": [],
+                "malformed_training_tags": [],
+                "malformed_validation_tags": [],
+                "joints": [{
+                    "columns": [0, width],
+                    "parameters": [1.25, -0.01],
+                    "components": ModelComponents(
+                        friction=False, offset=True).as_dict(),
+                    "residual_rms_a": 0.03,
+                    "holdout_rms_a": 0.04,
+                    "external_validation_rms": 0.05,
+                    "speed_pair_consistency_rms": 0.01,
+                }],
+            },
+            "joints": [{
+                "columns": [0, width, width + 2],
+                "parameters": [1.25, 0.2, -0.01],
+                "components": ModelComponents().as_dict(),
+                "residual_rms_a": 0.03,
+                "holdout_rms_a": 0.04,
+                "validation_rms_a": 0.05,
+            }],
+        }
+        model = made._gravity_model_payload(payload)
+        columns = model["joints"][0]["retained_columns"]
+        self.assertEqual(columns[0]["term"], "mass")
+        self.assertEqual(columns[0]["kind"], "rigid_body")
+        self.assertEqual(columns[1]["term"], "offset")
+        self.assertEqual(model["training_poses"], 4)
+        self.assertEqual(model["external_validation_poses"], 2)
+        self.assertEqual(model["pairing_audit"]["probe_speeds_deg_s"],
+                 [1.0, 3.0])
+        self.assertEqual(len(model["urdf_sha256"]), 64)
+        self.assertEqual(model["driven_joint_names"], [f"{PREFIX}joint1"])
+        self.assertEqual(model["urdf_artifact"], "robot_description.urdf")
+        self.assertIsInstance(model["locked_joint_positions_rad"], dict)
+        self.assertEqual(model["external_validation_phase"], "D_validation")
+        self.assertFalse(model["physical_link_parameters"]["available"])
+        self.assertFalse(model["runtime"]["integrated_controller_loader"])
+
+    def test_mixed_fit_never_masquerades_as_a_missing_pair_averaged_model(self):
+        made = service()
+        model = made._gravity_model_payload({
+            "gravity_compensation": {
+                "available": False, "reason": "one direction missing"},
+            "joints": [{"columns": [0], "parameters": [99.0]}],
+        })
+        self.assertFalse(model["available"])
+        self.assertEqual(model["reason"], "one direction missing")
+        self.assertNotIn("joints", model)
+
+    def test_dashboard_prefers_direct_gravity_validation(self):
+        panel = (Path(__file__).resolve().parents[1]
+                 / "robot_parameter_identification" / "dashboard" / "static"
+                 / "dashboard.js").read_text(encoding="utf-8")
+        self.assertIn("result.gravity_compensation || {}", panel)
+        self.assertIn("direct.validation_rms || []", panel)
 
 
 class PlotDataQualityTest(unittest.TestCase):
@@ -1088,6 +1187,25 @@ class PlanOnlyTest(unittest.TestCase):
     def test_only_the_gravity_mode_can_be_previewed(self):
         self.assertFalse(service().plan_preview("optimal_excitation")["ok"])
 
+    def test_planning_uses_the_project_wide_activity_feed(self):
+        made = service()
+        seen = {}
+        original = made._plan_gravity
+
+        def inspect(options):
+            seen.update(made.activity_payload())
+            return original(options)
+
+        made._plan_gravity = inspect
+        answer = made.plan_preview(
+            GRAVITY_MODE, {"static_poses": 5,
+                           "gravity_validation_poses": 2})
+        self.assertTrue(answer["ok"])
+        self.assertEqual(seen["progress"]["phase"], "designing")
+        self.assertEqual(made.progress, {"phase": "idle"})
+        self.assertEqual(made.events[-1]["source"], "planner")
+        self.assertIn("planned", made.events[-1]["message"])
+
     def test_planning_says_when_the_screen_has_stopped_matching(self):
         """The poses are screened against where the rest of the robot was.
 
@@ -1684,6 +1802,7 @@ class ProgressTest(unittest.TestCase):
         made._on_progress("A_gravity", {"pose": 3, "poses": 24})
         self.assertEqual(made.progress["observations"], 42)
         self.assertEqual(made.progress["pose"], 3)
+        self.assertEqual(made.progress["updated_fields"], ["pose", "poses"])
 
     def test_a_sample_update_keeps_the_pose_index(self):
         made = self.service()
@@ -1691,6 +1810,14 @@ class ProgressTest(unittest.TestCase):
         made._on_progress("A_gravity", {"observations": 99})
         self.assertEqual(made.progress["pose"], 3)
         self.assertEqual(made.progress["observations"], 99)
+        self.assertEqual(made.progress["updated_fields"], ["observations"])
+
+    def test_a_design_update_reports_its_pose_count_without_the_pose_payload(self):
+        made = self.service()
+        made._on_progress("A_gravity", {"designed": [[0.0] * 7] * 4})
+        self.assertEqual(made.progress["updated_fields"], ["designed"])
+        self.assertEqual(made.progress["designed_poses"], 4)
+        self.assertNotIn("designed", made.progress)
 
     def test_elapsed_time_is_always_refreshed(self):
         made = self.service()
@@ -1704,6 +1831,209 @@ class ProgressTest(unittest.TestCase):
         made._on_progress("B_friction", {"observations": 5})
         self.assertNotIn("pose", made.progress)
         self.assertEqual(made.progress["observations"], 5)
+
+
+class ActivityFeedTest(unittest.TestCase):
+    """Every mode reports through one operator-facing activity contract."""
+
+    def test_notes_are_structured_without_breaking_the_old_log(self):
+        made = IdentificationService(DashboardConfig())
+        event = made.publish_event(
+            "screen rebuilt", level="warning", source="collision")
+        feed = made.activity_payload()
+        self.assertEqual(feed["events"][-1], event)
+        self.assertEqual(event["level"], "warning")
+        self.assertEqual(event["source"], "collision")
+        self.assertTrue(made.notes[-1].endswith("screen rebuilt"))
+
+    def test_progress_and_events_share_the_same_payload(self):
+        made = IdentificationService(DashboardConfig())
+        made._activity = "optimal_excitation"
+        made._on_progress("C_inertia", {"trajectory": 2, "trajectories": 8})
+        made.note("trajectory accepted")
+        feed = made.activity_payload()
+        self.assertEqual(feed["activity"], "optimal_excitation")
+        self.assertEqual(feed["progress"]["trajectory"], 2)
+        self.assertEqual(feed["events"][-1]["source"], "optimal_excitation")
+
+    def test_the_feed_is_reachable_over_the_common_http_api(self):
+        made = IdentificationService(DashboardConfig())
+        made.note("ready")
+        answer = build_routes(made, None)["/api/activity"][1]({})
+        self.assertEqual(answer["events"][-1]["message"], "ready")
+
+
+class SceneActivityTest(unittest.TestCase):
+    """The canvas consumes one status contract, independent of campaign mode."""
+
+    def test_any_mode_can_focus_a_joint_pose(self):
+        made = service()
+        made._activity = "optimal_excitation"
+        made._state = "running"
+        made._started_at = 12.5
+        pose = [float(index) for index in range(made.arm.joint_count)]
+        made.progress = {"mode": "optimal_excitation", "phase": "C_inertia",
+                         "trajectory": 2, "pose_deg": pose}
+        scene = made.scene_activity_payload()
+        self.assertEqual(scene["mode"], "optimal_excitation")
+        self.assertEqual(scene["focus"]["pose_deg"], pose)
+        self.assertEqual(scene["tour"]["kind"], "joint_pose_tour")
+        self.assertFalse(scene["tour"]["autoplay"])
+
+    def test_any_rehearsal_mode_can_request_fast_canvas_playback(self):
+        made = service()
+        made._activity = "campaign_rehearsal"
+        made._state = "running"
+        made.preview = {"available": True}
+        scene = made.viewer_state()["scene_activity"]
+        self.assertTrue(scene["tour"]["available"])
+        self.assertTrue(scene["tour"]["autoplay"])
+
+    def test_canvas_focuses_the_current_target_and_marks_completed_poses(self):
+        made = service()
+        made._activity = GRAVITY_MODE
+        made._state = RUNNING
+        target = [float(index) for index in range(made.arm.joint_count)]
+        made.progress = {
+            "mode": GRAVITY_MODE,
+            "phase": campaign_module.PHASE_GRAVITY,
+            "pose": 2,
+            "target_pose": 3,
+            "pose_deg": target,
+        }
+        made._completed_poses = {campaign_module.PHASE_GRAVITY: [1, 2]}
+
+        scene = made.scene_activity_payload()
+
+        self.assertEqual(scene["focus"]["index"], 3)
+        self.assertEqual(scene["focus"]["pose_deg"], target)
+        self.assertEqual(scene["completed"],
+                         {campaign_module.PHASE_GRAVITY: [1, 2]})
+
+    def test_a_committed_target_immediately_loses_the_active_highlight(self):
+        made = service()
+        made._activity = GRAVITY_MODE
+        made._state = RUNNING
+        made.progress = {
+            "mode": GRAVITY_MODE,
+            "phase": campaign_module.PHASE_GRAVITY,
+            "target_pose": 3,
+            "completed_pose": 3,
+            "pose_deg": [0.0] * made.arm.joint_count,
+        }
+        made._completed_poses = {campaign_module.PHASE_GRAVITY: [1, 2, 3]}
+
+        scene = made.scene_activity_payload()
+
+        self.assertIsNone(scene["focus"])
+        self.assertNotIn("moving", made.viewer_state())
+
+
+class PauseResumeTest(unittest.TestCase):
+    """A hardware pause settles between goals and remains stoppable."""
+
+    def running_gravity(self):
+        made = IdentificationService(DashboardConfig())
+        made._state = RUNNING
+        made._activity = GRAVITY_MODE
+        made.progress = {"mode": GRAVITY_MODE,
+                         "phase": campaign_module.PHASE_GRAVITY,
+                         "target_pose": 4, "poses": 24}
+        return made
+
+    def test_pause_blocks_at_the_boundary_until_resume(self):
+        made = self.running_gravity()
+        self.assertTrue(made.pause()["ok"])
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(made._wait_if_paused(
+                campaign_module.PHASE_GRAVITY, 4, 24)))
+        worker.start()
+        deadline = time.monotonic() + 1.0
+        while made._state != PAUSED and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        self.assertEqual(made._state, PAUSED)
+        self.assertTrue(worker.is_alive())
+        self.assertTrue(made.progress["paused"])
+        self.assertTrue(made.resume()["ok"])
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [True])
+        self.assertEqual(made._state, RUNNING)
+        self.assertTrue(made.progress["resumed"])
+
+    def test_stop_wakes_a_paused_campaign(self):
+        made = self.running_gravity()
+        made.pause()
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(made._wait_if_paused(
+                campaign_module.PHASE_GRAVITY, 4, 24)))
+        worker.start()
+        deadline = time.monotonic() + 1.0
+        while made._state != PAUSED and time.monotonic() < deadline:
+            time.sleep(0.005)
+        made.stop()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [False])
+
+    def test_resume_refuses_other_arm_drift_and_stays_paused(self):
+        made = self.running_gravity()
+        made._state = PAUSED
+        made._run_gate.clear()
+        made.screen_drift = lambda: [{
+            "joint": "left_arm_joint2", "moved_deg": 8.0,
+        }]
+
+        answer = made.resume()
+
+        self.assertFalse(answer["ok"])
+        self.assertIn("collision screen", answer["message"])
+        self.assertEqual(made._state, PAUSED)
+        self.assertFalse(made._run_gate.is_set())
+
+    def test_pause_endpoints_share_the_common_http_api(self):
+        routes = build_routes(self.running_gravity(), None)
+        self.assertIn("/api/pause", routes)
+        self.assertIn("/api/resume", routes)
+
+
+class LatestReportTest(unittest.TestCase):
+    """Each panel can link to its latest report without inventing a path."""
+
+    def test_reports_are_discovered_by_mode_after_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("gravity-20260903-094817",
+                         "gravity_rehearsal-20260903-091411",
+                         "optimal_excitation-20260901-120000"):
+                folder = Path(directory) / name
+                folder.mkdir()
+                (folder / "report.html").write_text(name)
+            made = IdentificationService(
+                DashboardConfig(output_directory=directory))
+            reports = made.reports_payload()
+            self.assertEqual(reports["gravity"]["name"],
+                             "gravity-20260903-094817")
+            self.assertEqual(reports["gravity_rehearsal"]["name"],
+                             "gravity_rehearsal-20260903-091411")
+            self.assertEqual(
+                made.snapshot()["reports"]["gravity"]["report"],
+                "/runs/gravity-20260903-094817/report.html")
+
+    def test_reports_are_reachable_over_the_common_http_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "gravity-20260903-094817"
+            folder.mkdir()
+            (folder / "report.html").write_text("gravity")
+            made = IdentificationService(
+                DashboardConfig(output_directory=directory))
+            reports = build_routes(made, None)["/api/reports"][1]({})
+            self.assertEqual(reports["gravity"]["report"],
+                             "/runs/gravity-20260903-094817/report.html")
 
 
 class SpeedRequestTest(unittest.TestCase):

@@ -24,6 +24,8 @@ const DICT = {
   'pill.offline': { en: 'offline', zh: '离线' },
   'state.idle': { en: 'idle', zh: '空闲' },
   'state.running': { en: 'running', zh: '运行中' },
+  'state.paused': { en: 'paused', zh: '已暂停' },
+  'activity.title': { en: 'Current', zh: '当前动态' },
 
   /* ---- 3D overlays ---- */
   'view.meshes': { en: 'meshes', zh: '网格模型' },
@@ -129,6 +131,10 @@ const DICT = {
   'grav.slow': { en: 'slow probe (°/s)', zh: '慢速探针（°/s）' },
   'grav.fast': { en: 'fast probe (°/s)', zh: '快速探针（°/s）' },
   'grav.rehearse': { en: 'Rehearse gravity', zh: '重力预演' },
+  'grav.rehearsal_started': {
+    en: 'Gravity rehearsal started.',
+    zh: '重力预演已启动。',
+  },
   'grav.plan': { en: 'Plan poses', zh: '只规划' },
 
   /* ---- planner envelope + pose review ---- */
@@ -181,6 +187,25 @@ const DICT = {
   'inspect.land': { en: 'stop', zh: '停下' },
   'inspect.none': { en: 'nothing planned yet', zh: '尚未规划' },
   'grav.run': { en: 'Run on hardware', zh: '真机标定' },
+  'grav.pause': { en: 'Pause', zh: '暂停' },
+  'grav.resume': { en: 'Resume', zh: '恢复' },
+  'grav.pause_pending': {
+    en: 'Pause requested. Waiting for the current controller trajectory to finish.',
+    zh: '已请求暂停，正在等待当前控制器轨迹结束。',
+  },
+  'grav.paused_pose': {
+    en: 'Paused before pose {v}/{n}. This incomplete pose was discarded and will restart on resume.',
+    zh: '已在位姿 {v}/{n} 前暂停。该点未完成的数据已丢弃，恢复后将从头重测此点。',
+  },
+  'grav.resuming_pose': {
+    en: 'Resumed. Restarting pose {v}/{n} from the beginning.',
+    zh: '已恢复，正在从头重新测试位姿 {v}/{n}。',
+  },
+  'grav.target_pose': {
+    en: 'Target pose {v}/{n}',
+    zh: '当前目标位姿 {v}/{n}',
+  },
+  'grav.report': { en: 'Open latest report', zh: '打开最新报告' },
   'grav.planning': {
     en: 'Designing poses and screening every one of them against the scene. '
       + 'This takes a few seconds and moves nothing.',
@@ -243,6 +268,7 @@ const DICT = {
     zh: '必须先通过预演，标定流程才能驱动手臂。回零位不受此限制。',
   },
   'run.notstarted': { en: 'not started', zh: '未开始' },
+  'run.designed': { en: '{v} poses designed', zh: '已设计 {v} 个位姿' },
   'run.samples': { en: 'samples', zh: '样本' },
   'run.pose': { en: 'pose', zh: '位姿' },
   'run.worst': { en: 'worst {v}° from zero', zh: '距零位最大 {v}°' },
@@ -300,6 +326,8 @@ const DICT = {
   'phase.B_friction': { en: 'friction', zh: '摩擦' },
   'phase.C_inertia': { en: 'inertia', zh: '惯性' },
   'phase.D_validation': { en: 'validation', zh: '验证' },
+  'phase.starting': { en: 'starting', zh: '正在启动' },
+  'phase.finished': { en: 'saving results', zh: '正在保存结果' },
 
   /* ---- connection ---- */
   'conn.title': { en: 'Connection', zh: '连接' },

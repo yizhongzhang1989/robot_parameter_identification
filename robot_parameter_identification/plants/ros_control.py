@@ -19,7 +19,7 @@ import time
 import numpy as np
 
 from ..interfaces import (DriveLimitExceeded, EFFORT_SOURCES, MotionFailed,
-                          SignalMap)
+                          MotionPaused, SignalMap)
 from ..profile import RobotProfile
 
 # A quintic zero-velocity endpoint trajectory peaks near 1.875x its average
@@ -234,12 +234,25 @@ class HardwarePlant:
         self.monitor = monitor
         self._monitor_trip: str | None = None
         self._monitor_trip_detail: dict = {}
+        self._pause_requested = lambda: False
 
     def set_monitor(self, monitor) -> None:
         """Watch every raw frame and latch the first safety violation."""
         self.monitor = monitor
         self._monitor_trip = None
         self._monitor_trip_detail = {}
+
+    def set_pause_requested(self, requested) -> None:
+        """Check for a cooperative pause only between controller goals."""
+        self._pause_requested = requested or (lambda: False)
+
+    def raw_frame_checkpoint(self) -> int:
+        """Mark the raw stream before one all-or-nothing pose measurement."""
+        return len(self.raw_frames)
+
+    def rollback_raw_frames(self, checkpoint: int) -> None:
+        """Discard raw frames belonging to an unfinished pose."""
+        del self.raw_frames[max(0, int(checkpoint)):]
 
     def _check_monitor(self, sample: dict, now: float | None = None) -> None:
         if self.monitor is None or self._monitor_trip is not None:
@@ -609,6 +622,8 @@ class HardwarePlant:
 
     def _attempt(self, points, on_frame=None):
         """Send one trajectory and pump telemetry until the controller is done."""
+        if self._pause_requested():
+            raise MotionPaused("pause requested before the next trajectory")
         self._raise_if_monitor_tripped()
         goal = self._goal(points)
         duration = points[-1][2]
@@ -658,6 +673,8 @@ class HardwarePlant:
                 wrapped.result.error_code
                 != self._action_type.Result.SUCCESSFUL):
             raise MotionFailed("the trajectory did not complete successfully")
+        if self._pause_requested():
+            raise MotionPaused("pause requested after the current trajectory")
 
     def move_to(self, pose_deg) -> None:
         """Drive there and stop. Nothing is collected, so a jog costs nothing."""
@@ -665,13 +682,13 @@ class HardwarePlant:
         duration = self._duration_for(target, self.config.maximum_speed_deg_s)
         self._execute([(target, np.zeros(self.joint_count), duration)])
 
-    def hold_pose(self, pose_deg) -> dict:
+    def hold_pose(self, pose_deg, phase: str = "A_gravity") -> dict:
         """Move there, let the servo settle, and average a few frames at rest."""
         self.move_to(pose_deg)
         self._spin_for(self.config.settle_s)
-        return self.dwell()
+        return self.dwell(phase=phase)
 
-    def dwell(self, pose_deg=None) -> dict:
+    def dwell(self, pose_deg=None, phase: str = "A_gravity") -> dict:
         """Fit a burst of frames where the arm already stands.
 
         Fitting rather than averaging because the slope is worth having: it
@@ -680,7 +697,7 @@ class HardwarePlant:
         """
         self._capture()
         self._spin_for(max(self.config.window_span_s * 3.0, 0.15))
-        frames = self._harvest("dwell", "A_gravity")
+        frames = self._harvest("dwell", phase)
         fitted = fit_window(frames, self.joint_count) if frames else None
         if fitted is not None:
             return fitted
@@ -697,7 +714,7 @@ class HardwarePlant:
                  speed_deg_s: float):
         """Constant-speed pass so friction separates from acceleration."""
         start = np.asarray(start_deg, dtype=float)
-        self.hold_pose(start)
+        self.hold_pose(start, phase="B_friction")
 
         end = start.copy()
         end[joint] += distance_deg
@@ -734,7 +751,7 @@ class HardwarePlant:
             yield observation
 
     def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float,
-                   tag: str = ""):
+                   tag: str = "", phase: str = "A_gravity"):
         """Cross the pose slowly both ways instead of holding still on it.
 
         Standing still leaves static friction free to take any value inside its
@@ -752,14 +769,14 @@ class HardwarePlant:
         start = np.clip(pose - step, low, high)
         end = np.clip(pose + step, low, high)
         prefix = tag or "gravity"
-        self.hold_pose(start)
+        self.hold_pose(start, phase=phase)
         return (self._sweep(start, end, speed_deg_s,
-                            f"{prefix}:{speed_deg_s:g}:+")
-                + self._sweep(end, start, speed_deg_s,
-                              f"{prefix}:{speed_deg_s:g}:-"))
+                    f"{prefix}:{speed_deg_s:g}:+", phase)
+            + self._sweep(end, start, speed_deg_s,
+                      f"{prefix}:{speed_deg_s:g}:-", phase))
 
     def _sweep(self, start_deg, end_deg, speed_deg_s: float,
-               tag: str = "") -> list[dict]:
+               tag: str = "", phase: str = "A_gravity") -> list[dict]:
         """One constant-speed straight line in joint space, frames collected."""
         start = np.asarray(start_deg, dtype=float)
         end = np.asarray(end_deg, dtype=float)
@@ -788,7 +805,7 @@ class HardwarePlant:
         try:
             self._execute(points, lambda _t, frame: collected.append(frame))
         finally:
-            frames = self._harvest(tag, "A_gravity")
+            frames = self._harvest(tag, phase)
         return self._observations(frames, tag, speed)
 
     def track(self, trajectory, rate_hz: float):
@@ -800,7 +817,7 @@ class HardwarePlant:
         measure.
         """
         start, _velocity, _acceleration = trajectory.sample(0.0)
-        self.hold_pose(start)
+        self.hold_pose(start, phase="C_inertia")
 
         steps = max(2, int(trajectory.duration_s * max(rate_hz, 1.0)))
         points = []

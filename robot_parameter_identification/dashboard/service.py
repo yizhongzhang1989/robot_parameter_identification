@@ -9,8 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import csv
+import hashlib
+from importlib import metadata
 import json
 import math
+import platform
 import re
 import threading
 import time
@@ -24,6 +27,7 @@ from .. import campaign as campaign_module
 from .. import excitation, identification as ident
 from .. import loadsweep as loadsweep_module
 from .. import loadsweep_report
+from .. import model as model_module
 from .. import report as report_module
 from ..interfaces import CommandSpec, TelemetrySpec
 from ..loadsweep_run import LoadSweepRun
@@ -32,7 +36,7 @@ from .. import obstacles as obstacles_module
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
 
-IDLE, RUNNING, JOGGING = "idle", "running", "jogging"
+IDLE, RUNNING, PAUSED, JOGGING = "idle", "running", "paused", "jogging"
 # An envelope typed into the panel is an operator's envelope, so it is labelled
 # and guarded exactly as a hand-written file is.
 EDITED_SOURCE = "<edited in the dashboard>"
@@ -51,6 +55,11 @@ STANDING_QUANTUM_DEG = 0.5
 MAXIMUM_ANIMATION_STEPS = 60
 # A ceiling nobody supplied is infinite, and JSON has no way to say so.
 UNBOUNDED_LIMITS = ("continuous_current_a", "peak_current_a")
+PINOCCHIO_INERTIAL_TERMS = (
+    "mass", "first_moment_x", "first_moment_y", "first_moment_z",
+    "inertia_xx", "inertia_xy", "inertia_yy", "inertia_xz",
+    "inertia_yz", "inertia_zz",
+)
 
 
 def _without_infinities(value):
@@ -301,6 +310,10 @@ class IdentificationService:
         self.result: dict | None = None
         self.progress: dict = {"phase": "idle"}
         self.notes: list[str] = []
+        self.events: list[dict] = []
+        self._event_sequence = 0
+        self._reports: dict[str, dict] = {}
+        self._reports_scanned = False
         self.rehearsal_passed = False
         # What a passing gravity dry run actually validated. Re-tuning the card
         # changes the experiment, so the arming does not carry over.
@@ -314,6 +327,7 @@ class IdentificationService:
         self.preview_token = 0
         # Poses the phases of a running campaign have designed so far.
         self._designed: dict = {}
+        self._completed_poses: dict[str, list[int]] = {}
         # Designing takes about as long as a short move and moves nothing, so
         # nothing else reports it; without this the panel looks dead.
         self.planning = False
@@ -322,6 +336,8 @@ class IdentificationService:
         self._activity = ""
         self._worker: threading.Thread | None = None
         self._abort = threading.Event()
+        self._run_gate = threading.Event()
+        self._run_gate.set()
         self._lock = threading.RLock()
         self._started_at = 0.0
         self._samples: list[dict] = []
@@ -332,10 +348,44 @@ class IdentificationService:
 
     # -- model -----------------------------------------------------------
 
-    def note(self, message: str) -> None:
+    def publish_event(self, message: str, level: str = "info",
+                      source: str = "") -> dict:
+        """Publish one operator-facing event through the dashboard-wide API."""
+        text = str(message)
+        severity = str(level or "info").lower()
+        if severity not in ("info", "warning", "error"):
+            severity = "info"
+        clock = time.strftime("%H:%M:%S")
         with self._lock:
-            self.notes.append(f"{time.strftime('%H:%M:%S')} {message}")
+            self._event_sequence += 1
+            event = {
+                "sequence": self._event_sequence,
+                "time": clock,
+                "stamp_s": time.time(),
+                "level": severity,
+                "source": str(source or self._activity or "system"),
+                "message": text,
+            }
+            self.events.append(event)
+            del self.events[:-200]
+            self.notes.append(f"{clock} {text}")
             del self.notes[:-200]
+            return dict(event)
+
+    def note(self, message: str) -> None:
+        """Compatibility name for the one project-wide event publisher."""
+        self.publish_event(message)
+
+    def activity_payload(self) -> dict:
+        """Current progress and durable recent events for every dashboard mode."""
+        with self._lock:
+            return {
+                "sequence": self._event_sequence,
+                "state": self._state,
+                "activity": self._activity,
+                "progress": dict(self.progress),
+                "events": [dict(event) for event in self.events[-80:]],
+            }
 
     def adopt_description(self, urdf_text: str) -> bool:
         """Build the model from a freshly received /robot_description."""
@@ -622,9 +672,23 @@ class IdentificationService:
         with self._lock:
             if self.planning:
                 return {"ok": False, "message": "already planning"}
+            previous_progress = dict(self.progress)
             self.planning = True
+            self.progress = {"mode": "planning", "phase": "designing",
+                             "target": mode}
+        self.publish_event("designing and screening poses", source="planner")
         try:
-            return self._plan_gravity(dict(options or {}))
+            answer = self._plan_gravity(dict(options or {}))
+            with self._lock:
+                self.progress = previous_progress
+            return answer
+        except Exception as error:
+            with self._lock:
+                self.progress = {"mode": "planning", "phase": "failed",
+                                 "target": mode, "error": str(error)}
+            self.publish_event(f"planning failed: {error}", level="error",
+                               source="planner")
+            raise
         finally:
             with self._lock:
                 self.planning = False
@@ -658,9 +722,12 @@ class IdentificationService:
         if astray:
             where = ", ".join(f"{item['joint']} moved {item['moved_deg']:+g} deg"
                               for item in astray[:4])
-            self.note(f"these {drawn} poses were screened against a placement "
-                      f"the rest of the robot has since left: {where}")
-        self.note(f"planned {drawn} poses for review; nothing has moved")
+            self.publish_event(
+                f"these {drawn} poses were screened against a placement the "
+                f"rest of the robot has since left: {where}",
+                level="warning", source="planner")
+        self.publish_event(f"planned {drawn} poses for review; nothing has moved",
+                           source="planner")
         return {"ok": True, "preview": self.preview_payload(),
                 "astray": astray}
 
@@ -1100,6 +1167,7 @@ class IdentificationService:
             "obstacles": self.scene.placements(pose) if self.scene else [],
             "frames": self.frame_names(),
             "gravity": self.gravity_payload(),
+            "scene_activity": self.scene_activity_payload(),
             # Bumped when a run designs new poses, so the canvas fetches the
             # skeletons once instead of on every poll.
             "preview_token": self.preview_token,
@@ -1107,15 +1175,60 @@ class IdentificationService:
         # Which planned pose the run is on, so the canvas can pick it out of
         # the tour it is already drawing.
         visiting = self.progress.get("pose_deg")
-        if visiting is not None:
+        target_index = int(self.progress.get("target_pose")
+                   or self.progress.get("pose") or 0)
+        target_complete = (self.progress.get("target_pose") is not None
+                   and self.progress.get("completed_pose")
+                   == self.progress.get("target_pose"))
+        if visiting is not None and not target_complete:
             payload["moving"] = {
                 "pose_deg": list(visiting),
                 "phase": str(self.progress.get("phase") or ""),
-                "index": int(self.progress.get("pose") or 0),
+            "index": target_index,
             }
         if self.plan is not None and getattr(self.plan, "workspace_limit_deg", None):
             payload["workspace_limit_deg"] = list(self.plan.workspace_limit_deg)
         return payload
+
+    def scene_activity_payload(self) -> dict:
+        """One mode-neutral contract for activity drawn in the 3D canvas."""
+        with self._lock:
+            progress = dict(self.progress)
+            mode = str(progress.get("mode") or self._activity or "")
+            phase = str(progress.get("phase") or "")
+            active = self._state in (RUNNING, PAUSED, JOGGING) or self.planning
+            focus = None
+            target_index = int(progress.get("target_pose")
+                               or progress.get("pose") or 0)
+            target_complete = (progress.get("target_pose") is not None
+                               and progress.get("completed_pose")
+                               == progress.get("target_pose"))
+            if progress.get("pose_deg") is not None and not target_complete:
+                focus = {
+                    "kind": "joint_pose",
+                    "pose_deg": list(progress["pose_deg"]),
+                    "phase": phase,
+                    "index": target_index,
+                }
+            return {
+                "id": (f"{mode}:{self._started_at:.6f}"
+                       if active and mode else ""),
+                "state": self._state,
+                "mode": mode,
+                "phase": phase,
+                "progress": progress,
+                "focus": focus,
+                "completed": {
+                    name: list(indices)
+                    for name, indices in self._completed_poses.items()
+                },
+                "tour": {
+                    "kind": "joint_pose_tour",
+                    "token": self.preview_token,
+                    "available": bool(self.preview.get("available")),
+                    "autoplay": active and "rehearsal" in mode,
+                },
+            }
 
     # -- campaign --------------------------------------------------------
 
@@ -1215,10 +1328,12 @@ class IdentificationService:
                                  GRAVITY_REHEARSAL)
                 else f"campaign_{mode}")
             self._abort.clear()
+            self._run_gate.set()
             self._started_at = time.monotonic()
             self._samples = []
             self._options = options
             self._designed = {}
+            self._completed_poses = {}
             # The previous run's verdict is not this run's; leaving it up reads
             # as though the campaign now moving has already passed.
             self.result = None
@@ -1231,7 +1346,104 @@ class IdentificationService:
 
     def stop(self) -> dict:
         self._abort.set()
+        self._run_gate.set()
         return {"ok": True, "message": "stop requested"}
+
+    def pause(self) -> dict:
+        """Request a gravity hardware pause at the next safe JTC boundary."""
+        with self._lock:
+            if self._state != RUNNING or self._activity != GRAVITY_MODE:
+                return {"ok": False,
+                        "message": "only a running gravity hardware campaign "
+                                   "can be paused"}
+            if not self._run_gate.is_set():
+                return {"ok": True, "message": "pause already requested"}
+            self._run_gate.clear()
+            carried = dict(self.progress)
+            carried.update({"pause_pending": True,
+                            "updated_fields": ["pause_pending"]})
+            self.progress = carried
+        self.publish_event(
+            "pause requested; waiting for the current trajectory to finish",
+            level="warning", source=GRAVITY_MODE)
+        return {"ok": True, "message": "pause requested"}
+
+    def resume(self) -> dict:
+        """Release a pending or settled gravity pause."""
+        with self._lock:
+            if (self._activity != GRAVITY_MODE
+                    or self._state not in (RUNNING, PAUSED)
+                    or self._run_gate.is_set()):
+                return {"ok": False,
+                        "message": "no paused gravity campaign to resume"}
+        drifted = self.screen_drift()
+        if drifted:
+            where = ", ".join(
+                f"{item['joint']} moved {item['moved_deg']:+g} deg"
+                for item in drifted[:4])
+            return {"ok": False,
+                    "message": "resume refused: the collision screen no "
+                               f"longer matches the other arm; {where}"}
+        with self._lock:
+            if (self._activity != GRAVITY_MODE
+                    or self._state not in (RUNNING, PAUSED)
+                    or self._run_gate.is_set()):
+                return {"ok": False,
+                        "message": "no paused gravity campaign to resume"}
+            self._run_gate.set()
+        self.publish_event("resume requested", source=GRAVITY_MODE)
+        return {"ok": True, "message": "resume requested"}
+
+    def _wait_if_paused(self, phase: str, pose: int, poses: int) -> bool:
+        """Block the worker between goals, leaving stop able to wake it."""
+        if self._run_gate.is_set():
+            return not self._abort.is_set()
+        with self._lock:
+            if self._run_gate.is_set():
+                return not self._abort.is_set()
+            carried = dict(self.progress)
+            carried.update({
+                "mode": self._activity,
+                "phase": phase,
+                "paused": True,
+                "pause_pending": False,
+                "target_pose": pose,
+                "poses": poses,
+                "updated_fields": ["paused", "target_pose", "poses"],
+            })
+            self.progress = carried
+            self._state = PAUSED
+        self.publish_event(
+            f"paused before pose {pose}/{poses}; that pose will restart on resume",
+            level="warning", source=GRAVITY_MODE)
+        while not self._abort.is_set():
+            if not self._run_gate.wait(timeout=0.2):
+                continue
+            drifted = self.screen_drift()
+            if not drifted:
+                break
+            self._run_gate.clear()
+            where = ", ".join(
+                f"{item['joint']} moved {item['moved_deg']:+g} deg"
+                for item in drifted[:4])
+            self.publish_event(
+                "resume blocked: the collision screen no longer matches the "
+                f"other arm; {where}", level="error", source=GRAVITY_MODE)
+        if self._abort.is_set():
+            return False
+        with self._lock:
+            carried = dict(self.progress)
+            carried.update({
+                "paused": False,
+                "pause_pending": False,
+                "resumed": True,
+                "updated_fields": ["resumed", "target_pose", "poses"],
+            })
+            self.progress = carried
+            self._state = RUNNING
+        self.publish_event(
+            f"resumed; restarting pose {pose}/{poses}", source=GRAVITY_MODE)
+        return True
 
     def home(self) -> dict:
         """Drive every joint back to neutral.
@@ -1468,6 +1680,9 @@ class IdentificationService:
                         "no compatible completed optimal low-speed phase found")
                 reused = self._read_optimal_friction(folder)
             plant = self._build_plant(mode, plan)
+            pause_setter = getattr(plant, "set_pause_requested", None)
+            if pause_setter is not None and mode == GRAVITY_MODE:
+                pause_setter(lambda: not self._run_gate.is_set())
             setter = getattr(plant, "set_monitor", None)
             if setter is not None and monitor is not None:
                 setter(monitor)
@@ -1484,6 +1699,7 @@ class IdentificationService:
                 self.arm, plant, plan,
                 progress=self._on_progress,
                 should_stop=self._abort.is_set,
+                wait_if_paused=self._wait_if_paused,
                 monitor=monitor)
             if reused is not None:
                 records, folder, phase = reused
@@ -1505,6 +1721,7 @@ class IdentificationService:
             self._salvage(mode, run, plant, error)
         finally:
             self._release(plant)
+            self._run_gate.set()
             with self._lock:
                 self._state = IDLE
                 self._activity = ""
@@ -2046,13 +2263,23 @@ class IdentificationService:
         # Within a phase, updates report different things -- pose index here,
         # sample count there -- so they merge. Across a phase boundary they
         # do not, or the old phase's pose index would haunt the new one.
-        designed = (detail or {}).pop("designed", None)
+        update = dict(detail or {})
+        designed = update.pop("designed", None)
+        updated_fields = list(update)
+        if designed is not None:
+            updated_fields.insert(0, "designed")
+            update["designed_poses"] = len(designed)
+        completed = update.get("completed_pose_indices")
+        if completed is not None:
+            with self._lock:
+                self._completed_poses[phase] = [int(value) for value in completed]
         with self._lock:
             carried = (dict(self.progress)
                        if self.progress.get("phase") == phase else {})
             carried.update({"mode": self._activity, "phase": phase,
                             "elapsed_s": time.monotonic() - self._started_at})
-            carried.update(detail or {})
+            carried.update(update)
+            carried["updated_fields"] = updated_fields
             self.progress = carried
         if designed is not None:
             self._publish_designed(phase, designed)
@@ -2098,6 +2325,10 @@ class IdentificationService:
         payload["joint_names"] = list(self.driven_joints) or (
             list(self.profile.joint_names) if self.profile else [])
         payload["action"] = self.config.commands.follow_joint_trajectory_action
+        payload["provenance"] = self._provenance_payload(
+            mode, observations, raw_frames)
+        if mode in (GRAVITY_MODE, GRAVITY_REHEARSAL):
+            payload["gravity_model"] = self._gravity_model_payload(payload)
         payload.update(self._plot_data(payload, observations,
                                        getattr(result, "fits", None)))
         aborted = payload.get("aborted")
@@ -2135,6 +2366,237 @@ class IdentificationService:
                       f"{recovery['tolerance']}")
         else:
             self.note(f"{mode} run complete")
+
+    def _provenance_payload(self, mode: str, observations,
+                            raw_frames) -> dict:
+        """Evidence that distinguishes hardware data from an analytic run."""
+        source = ("real_hardware" if mode in HARDWARE_MODES
+                  else "analytic_rehearsal" if "rehearsal" in mode
+                  else "offline_or_simulated")
+        raw_count = len(raw_frames) if raw_frames is not None else 0
+        observation_count = len(observations) if observations is not None else 0
+        stamps = []
+        motion_stamps: dict[tuple[str, str], list[float]] = {}
+        raw_phase_counts: dict[str, int] = {}
+        raw_phase_tag_mismatches = 0
+        for frame in raw_frames or ():
+            phase = str(frame.get("phase") or "")
+            motion = str(frame.get("motion") or "")
+            raw_phase_counts[phase] = raw_phase_counts.get(phase, 0) + 1
+            expected_phase = (
+                campaign_module.PHASE_VALIDATION
+                if motion.startswith("gravity_check:") else
+                campaign_module.PHASE_GRAVITY
+                if motion.startswith("gravity:") else None)
+            if expected_phase is not None and phase != expected_phase:
+                raw_phase_tag_mismatches += 1
+            try:
+                stamp = float(frame.get("stamp_s"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(stamp):
+                stamps.append(stamp)
+                key = (phase, motion)
+                motion_stamps.setdefault(key, []).append(stamp)
+        first = min(stamps) if stamps else None
+        last = max(stamps) if stamps else None
+        duration = (last - first if first is not None and last is not None
+                    else None)
+        motion_rates = []
+        for values in motion_stamps.values():
+            if len(values) < 2:
+                continue
+            span = max(values) - min(values)
+            if span > 0.0:
+                motion_rates.append((len(values) - 1) / span)
+        implementation = {}
+        for name, module in (("campaign", campaign_module),
+                             ("identification", ident),
+                             ("model", model_module)):
+            try:
+                implementation[name] = hashlib.sha256(
+                    Path(module.__file__).read_bytes()).hexdigest()
+            except (AttributeError, OSError, TypeError):
+                implementation[name] = None
+        try:
+            package_version = metadata.version("robot_parameter_identification")
+        except metadata.PackageNotFoundError:
+            package_version = "source-tree"
+        return {
+            "schema_version": 1,
+            "source": source,
+            "hardware_evidence": source == "real_hardware" and raw_count > 0,
+            "raw_frame_count": raw_count,
+            "fitted_observation_count": observation_count,
+            "publisher_stamp_start_s": first,
+            "publisher_stamp_end_s": last,
+            "publisher_duration_s": duration,
+            "approximate_raw_rate_hz": (
+                float(np.median(motion_rates)) if motion_rates else None),
+            "raw_motion_groups": len(motion_stamps),
+            "raw_phase_counts": raw_phase_counts,
+            "raw_phase_tag_mismatches": raw_phase_tag_mismatches,
+            "telemetry_transport": self.config.telemetry.transport(),
+            "telemetry_topic": self.config.telemetry.topic(),
+            "trajectory_action": self.config.commands.follow_joint_trajectory_action,
+            "effort_source": self.config.telemetry.signals.effort_source,
+            "effort_unit": self.config.telemetry.signals.effort_unit,
+            "profile_source": self.profile_source,
+            "software": {
+                "package_version": package_version,
+                "python_version": platform.python_version(),
+                "numpy_version": np.__version__,
+                "pinocchio_version": str(
+                    getattr(getattr(ident, "pin", None), "__version__", "unknown")),
+                "implementation_sha256": implementation,
+            },
+            "configuration": {
+                "profile": (_without_infinities(self.profile.as_dict())
+                            if self.profile is not None else None),
+                "collision_safety_margin_m": self.config.safety_margin_m,
+                "obstacles": self.obstacles(),
+                "locked_joint_positions_rad": {
+                    str(name): float(value)
+                    for name, value in self.screen_reference.items()
+                },
+            },
+        }
+
+    def _gravity_model_payload(self, payload: dict) -> dict:
+        """A self-describing empirical predictor, not physical link inertias."""
+        if self.arm is None:
+            return {"available": False, "reason": "robot model unavailable"}
+        direct = dict(payload.get("gravity_compensation") or {})
+        if not direct.get("available"):
+            return {
+                "schema_version": 1,
+                "available": False,
+                "reason": direct.get(
+                    "reason", "pair-averaged gravity model unavailable"),
+                "pairing_audit": dict(direct.get("pairing_audit") or {}),
+            }
+        fit_entries = direct.get("joints") or []
+        rigid_width = self.arm.parameter_count
+        body_joints = [str(name) for name in self.arm.model.names[1:]]
+        output_names = list(payload.get("joint_names") or [])
+        joints = []
+        for output, entry in enumerate(fit_entries):
+            components = ModelComponents.from_dict(entry.get("components") or {})
+            extra_names = components.column_names()
+            retained = []
+            for column, coefficient in zip(
+                    entry.get("columns") or (), entry.get("parameters") or ()):
+                index = int(column)
+                if 0 <= index < rigid_width:
+                    body = index // len(PINOCCHIO_INERTIAL_TERMS)
+                    slot = index % len(PINOCCHIO_INERTIAL_TERMS)
+                    body_name = (body_joints[body]
+                                 if body < len(body_joints) else f"body_{body + 1}")
+                    retained.append({
+                        "index": index,
+                        "kind": "rigid_body",
+                        "body_joint": body_name,
+                        "term": PINOCCHIO_INERTIAL_TERMS[slot],
+                        "feature": f"{body_name}.{PINOCCHIO_INERTIAL_TERMS[slot]}",
+                        "coefficient": float(coefficient),
+                    })
+                else:
+                    extra = index - rigid_width
+                    name = (extra_names[extra]
+                            if 0 <= extra < len(extra_names)
+                            else f"unknown_extra_{extra}")
+                    retained.append({
+                        "index": index,
+                        "kind": "empirical_extra",
+                        "term": name,
+                        "feature": name,
+                        "coefficient": float(coefficient),
+                    })
+            joints.append({
+                "output_joint": (output_names[output]
+                                 if output < len(output_names)
+                                 else f"joint_{output + 1}"),
+                "output_index": output,
+                "retained_columns": retained,
+                "components": components.as_dict(),
+                "training_rms": entry.get("residual_rms_a"),
+                "internal_holdout_rms": entry.get("holdout_rms_a"),
+                "external_validation_rms": entry.get(
+                    "external_validation_rms", entry.get("validation_rms_a")),
+                "speed_pair_consistency_rms": entry.get(
+                    "speed_pair_consistency_rms"),
+            })
+        gravity = getattr(getattr(self.arm.model, "gravity", None), "linear", ())
+        return {
+            "schema_version": 1,
+            "available": bool(joints),
+            "model_type": "pair_averaged_empirical_gravity_effort_regressor",
+            "predictor_equation": (
+                "gravity_effort_j = Y_j(q, 0, 0)[rigid_columns] * "
+                "coefficients + offset_j"),
+            "measurement_reduction": direct.get("friction_cancellation"),
+            "fit_scope": "independent_per_output_joint",
+            "effort_source": payload.get("effort_source"),
+            "effort_unit": payload.get("effort_unit"),
+            "position_unit": "degree",
+            "velocity_unit": "degree_per_second",
+            "training_phase": campaign_module.PHASE_GRAVITY,
+            "external_validation_phase": campaign_module.PHASE_VALIDATION,
+            "training_poses": direct.get("training_poses", 0),
+            "external_validation_poses": direct.get("validation_poses", 0),
+            "external_validation_rms": list(direct.get("validation_rms") or []),
+            "validation_verdict": dict(direct.get("verdict") or {}),
+            "pairing_audit": {
+                "probe_speeds_deg_s": direct.get("probe_speeds_deg_s", []),
+                "incomplete_training_poses": direct.get(
+                    "incomplete_training_poses", []),
+                "incomplete_validation_poses": direct.get(
+                    "incomplete_validation_poses", []),
+                "malformed_training_tags": direct.get(
+                    "malformed_training_tags", []),
+                "malformed_validation_tags": direct.get(
+                    "malformed_validation_tags", []),
+                "unexpected_training_observations": direct.get(
+                    "unexpected_training_observations", []),
+                "unexpected_validation_observations": direct.get(
+                    "unexpected_validation_observations", []),
+                "configuration_errors": direct.get("configuration_errors", []),
+            },
+            "urdf_sha256": hashlib.sha256(
+                self.urdf_text.encode("utf-8")).hexdigest(),
+            "urdf_artifact": report_module.MODEL_URDF_NAME,
+            "driven_joint_names": output_names,
+            "locked_joint_positions_rad": {
+                str(name): float(value)
+                for name, value in self.screen_reference.items()
+            },
+            "model_joint_names": body_joints,
+            "gravity_vector_m_s2": [float(value) for value in gravity],
+            "rigid_parameter_order": list(PINOCCHIO_INERTIAL_TERMS),
+            "rigid_parameter_count": rigid_width,
+            "joints": joints,
+            "separate_friction_model": {
+                "available": bool(payload.get("joints")),
+                "source": "directional observations before pair averaging",
+                "warning": (
+                    "friction is an empirical nuisance model; two probe speed "
+                    "magnitudes do not establish a physical Stribeck/load law"),
+            },
+            "physical_link_parameters": {
+                "available": False,
+                "mass": False,
+                "center_of_mass": False,
+                "rotational_inertia": False,
+                "reason": (
+                    "gravity-only current-domain fits are independent per "
+                    "output joint and cannot recover one shared SI link model"),
+            },
+            "runtime": {
+                "integrated_controller_loader": False,
+                "reference_evaluator": "tools/identified_zero_force_drag.py",
+                "requires_matching_urdf_sha256": True,
+            },
+        }
 
     def _plot_data(self, payload: dict, observations, fits=None) -> dict:
         """Scatter data for the charts, thinned to something a browser can draw.
@@ -2298,12 +2760,41 @@ class IdentificationService:
         try:
             folder = report_module.write_run(
                 self.config.output_directory, payload, observations,
-                raw_frames=raw_frames)
+                raw_frames=raw_frames,
+                model_urdf=(self.urdf_text if payload.get("gravity_model") else ""))
+            self._remember_report(mode, folder)
             self.note(f"written to {folder}")
         except OSError as error:
             self.note(f"could not write result: {error}")
 
-    def runs(self, limit: int = 12) -> list[dict]:
+    def _remember_report(self, mode: str, folder: Path) -> dict:
+        directory = Path(self.config.output_directory)
+        entry = {
+            "mode": str(mode),
+            "name": str(Path(folder).relative_to(directory)),
+            "report": (f"/runs/{Path(folder).relative_to(directory)}/"
+                       f"{report_module.REPORT_NAME}"),
+            "modified": Path(folder).stat().st_mtime,
+        }
+        with self._lock:
+            current = self._reports.get(str(mode))
+            if current is None or entry["modified"] >= current["modified"]:
+                self._reports[str(mode)] = entry
+        return entry
+
+    @staticmethod
+    def _run_mode(name: str) -> str:
+        match = re.match(r"^(.+)-\d{8}-\d{6}(?:-.+)?$", Path(name).name)
+        return match.group(1) if match else ""
+
+    def reports_payload(self) -> dict:
+        """Latest safely served report per mode, including after a restart."""
+        if not self._reports_scanned:
+            self.runs(limit=None)
+        with self._lock:
+            return {mode: dict(entry) for mode, entry in self._reports.items()}
+
+    def runs(self, limit: int | None = 12) -> list[dict]:
         """Result folders that hold a readable report, newest first.
 
         One level deep as well as at the top, because a load sweep files
@@ -2332,13 +2823,21 @@ class IdentificationService:
                     continue
             for folder in nested:
                 name = str(folder.relative_to(directory))
+                mode = self._run_mode(name)
                 found.append({
+                    "mode": mode,
                     "name": name,
                     "report": f"/runs/{name}/{report_module.REPORT_NAME}",
                     "modified": folder.stat().st_mtime,
                 })
         found.sort(key=lambda item: item["modified"], reverse=True)
-        return found[:limit]
+        with self._lock:
+            for entry in reversed(found):
+                mode = entry.get("mode")
+                if mode:
+                    self._reports[mode] = dict(entry)
+            self._reports_scanned = True
+        return found if limit is None else found[:limit]
 
     # -- snapshot --------------------------------------------------------
 
@@ -2382,6 +2881,8 @@ class IdentificationService:
                 "frames": self.frame_names(),
                 "collision": self.collision_report(),
                 "progress": dict(self.progress),
+                "activity_feed": self.activity_payload(),
+                "reports": self.reports_payload(),
                 "result": self.result,
                 "notes": list(self.notes[-40:]),
                 "sample": self.latest_sample(),

@@ -23,13 +23,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Iterable, Iterator, Protocol
 import inspect
+import math
 import re
 import time
 
 import numpy as np
 
 from . import excitation, identification as ident
-from .interfaces import DriveLimitExceeded, MotionFailed
+from .interfaces import DriveLimitExceeded, MotionFailed, MotionPaused
 from .model import ModelComponents
 from .profile import RobotProfile
 
@@ -474,6 +475,7 @@ class CampaignResult:
     comparison: dict = field(default_factory=dict)
     data_quality: dict = field(default_factory=dict)
     steady_friction_audit: dict = field(default_factory=dict)
+    gravity_compensation: dict = field(default_factory=dict)
     # Motions the arm refused. A run with gaps in it is still a run, but the
     # report must not present it as one that measured everything it planned to.
     skipped: list = field(default_factory=list)
@@ -487,6 +489,9 @@ class CampaignResult:
 
     def verdict(self) -> dict:
         """Whether this run may be used, and which joint decided that."""
+        gravity_verdict = self.gravity_compensation.get("verdict")
+        if self.gravity_compensation.get("available") and gravity_verdict:
+            return dict(gravity_verdict)
         signal = max(
             (float(phase.get("peak_current_a") or 0.0) for phase in self.phases),
             default=0.0)
@@ -517,6 +522,7 @@ class CampaignResult:
             "comparison": dict(self.comparison),
             "data_quality": dict(self.data_quality),
             "steady_friction_audit": dict(self.steady_friction_audit),
+            "gravity_compensation": dict(self.gravity_compensation),
             "skipped": self.skipped,
             "complete": self.complete,
             "verdict": self.verdict(),
@@ -641,14 +647,18 @@ def coerce_plan_value(name: str, value: float):
     return int(round(value)) if name in _INTEGER_FIELDS else float(value)
 
 
-def _takes_tag(probe) -> bool:
+def _takes_keyword(probe, name: str) -> bool:
     try:
         parameters = inspect.signature(probe).parameters
     except (TypeError, ValueError):
         return False
-    return "tag" in parameters or any(
+    return name in parameters or any(
         entry.kind is inspect.Parameter.VAR_KEYWORD
         for entry in parameters.values())
+
+
+def _takes_tag(probe) -> bool:
+    return _takes_keyword(probe, "tag")
 
 
 def sweep_speeds(maximum_speed_deg_s: float, fractions) -> tuple[float, ...]:
@@ -896,12 +906,15 @@ class Campaign:
                  should_stop: Callable[[], bool] | None = None,
                  monitor: EnvelopeMonitor | None = None,
                  pose_admissible: Callable[[np.ndarray], bool] | None = None,
-                 clock: Callable[[], float] | None = None) -> None:
+                 clock: Callable[[], float] | None = None,
+                 wait_if_paused: Callable[[str, int, int], bool] | None = None) -> None:
         self.arm = arm
         self.plant = plant
         self.plan = plan or CampaignPlan()
         self.progress = progress or (lambda phase, detail: None)
         self.should_stop = should_stop or (lambda: False)
+        self.wait_if_paused = wait_if_paused or (
+            lambda _phase, _pose, _poses: True)
         self.monitor = monitor
         self.pose_admissible = pose_admissible
         self.clock = clock or time.monotonic
@@ -1104,7 +1117,8 @@ class Campaign:
         return (np.asarray(self.plan.start_deg, dtype=float)
                 if self.plan.start_deg else None)
 
-    def _probe(self, pose_deg, tag: str = "") -> list:
+    def _probe(self, pose_deg, tag: str = "",
+               phase: str = PHASE_GRAVITY) -> list:
         """Gravity samples at a pose, with friction forced to a known sign.
 
         A joint held still balances gravity with any value inside its stiction
@@ -1126,6 +1140,8 @@ class Campaign:
         # ``probe_pose`` is an optional capability found by name, so a plant
         # written before the pair tag existed must still be callable.
         extra = {"tag": tag} if _takes_tag(probe) else {}
+        if _takes_keyword(probe, "phase"):
+            extra["phase"] = phase
         collected: list = []
         for speed in speeds:
             frames = probe(pose_deg, self.plan.gravity_probe_deg, speed,
@@ -1143,6 +1159,88 @@ class Campaign:
         """Take another reading at rest, re-commanding only if the plant needs it."""
         dwell = getattr(self.plant, "dwell", None)
         return self.plant.hold_pose(pose_deg) if dwell is None else dwell(pose_deg)
+
+    def _raw_frame_checkpoint(self):
+        checkpoint = getattr(self.plant, "raw_frame_checkpoint", None)
+        return checkpoint() if checkpoint is not None else None
+
+    def _rollback_pose(self, report: PhaseReport, observations: int,
+                       report_state: tuple, raw_checkpoint) -> None:
+        """Remove every fitted and raw sample from an unfinished pose."""
+        del self.observations[observations:]
+        (report.observations, report.peak_temperature_c,
+         report.peak_speed_deg_s, report.peak_current_a) = report_state
+        rollback = getattr(self.plant, "rollback_raw_frames", None)
+        if rollback is not None and raw_checkpoint is not None:
+            rollback(raw_checkpoint)
+
+    def _measure_gravity_poses(self, report: PhaseReport, phase: str,
+                               poses, tag_prefix: str, label: str) -> None:
+        """Measure complete poses transactionally, retrying one after pause."""
+        total = len(poses)
+        completed: list[int] = []
+        index = 0
+        while index < total:
+            target = np.asarray(poses[index], dtype=float)
+            pose_deg = [round(float(value), 3) for value in target]
+            target_detail = {
+                "target_pose": index + 1,
+                "poses": total,
+                "pose_deg": pose_deg,
+                "completed_pose_indices": list(completed),
+            }
+            self.progress(phase, target_detail)
+            if not self.wait_if_paused(phase, index + 1, total):
+                raise Abort("operator stop")
+
+            observation_count = len(self.observations)
+            report_state = (report.observations, report.peak_temperature_c,
+                            report.peak_speed_deg_s, report.peak_current_a)
+            raw_checkpoint = self._raw_frame_checkpoint()
+            try:
+                accepted = self._attempt(
+                    report, f"{label} {index + 1}",
+                    lambda target=target, index=index: [
+                        self._record(phase, sample, report)
+                        for sample in self._probe(
+                            target, f"{tag_prefix}:p{index + 1}", phase)])
+            except MotionPaused:
+                self._rollback_pose(report, observation_count, report_state,
+                                    raw_checkpoint)
+                self.progress(phase, {
+                    **target_detail,
+                    "interrupted_pose": index + 1,
+                    "observations": len(self.observations),
+                })
+                if not self.wait_if_paused(phase, index + 1, total):
+                    raise Abort("operator stop")
+                continue
+            except BaseException:
+                self._rollback_pose(report, observation_count, report_state,
+                                    raw_checkpoint)
+                raise
+
+            if not accepted:
+                self._rollback_pose(report, observation_count, report_state,
+                                    raw_checkpoint)
+                self.progress(phase, {
+                    **target_detail,
+                    "skipped_pose": index + 1,
+                    "observations": len(self.observations),
+                })
+                index += 1
+                continue
+
+            completed.append(index + 1)
+            self.progress(phase, {
+                "pose": index + 1,
+                "completed_pose": index + 1,
+                "completed_pose_indices": list(completed),
+                "target_pose": index + 1,
+                "poses": total,
+                "pose_deg": pose_deg,
+            })
+            index += 1
 
     def _execution_trajectory(self, trajectory):
         return excitation.ramp_fourier_trajectory(
@@ -1163,17 +1261,8 @@ class Campaign:
             # Published before the first move so a viewer has the whole tour
             # rather than one pose at a time.
             self.progress(PHASE_GRAVITY, {"designed": design.poses_deg})
-            for index, pose in enumerate(design.poses_deg):
-                target = np.asarray(pose, dtype=float)
-                self._attempt(
-                    report, f"pose {index + 1}",
-                    lambda target=target, index=index: [
-                        self._record(PHASE_GRAVITY, sample, report)
-                        for sample in self._probe(target,
-                                                  f"gravity:p{index + 1}")])
-                self.progress(PHASE_GRAVITY, {
-                    "pose": index + 1, "poses": len(design.poses_deg),
-                    "pose_deg": [round(float(v), 3) for v in target]})
+            self._measure_gravity_poses(
+                report, PHASE_GRAVITY, design.poses_deg, "gravity", "pose")
         finally:
             report.duration_s = self.clock() - start
         return report
@@ -1495,6 +1584,211 @@ class GravityCampaign(Campaign):
     def _main_training_observations(self, usable):
         return [record for record in usable if record.phase == PHASE_GRAVITY]
 
+    def _pair_averaged_gravity_rows(self, phase: str):
+        """One static regressor/current row per complete bidirectional pose."""
+        prefix = "gravity" if phase == PHASE_GRAVITY else "gravity_check"
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}:p(?P<pose>\d+):"
+            r"(?P<speed>[^:]+):(?P<direction>[+-])$")
+        grouped: dict[tuple[int, float, str], list[Observation]] = {}
+        malformed = []
+        for record in self.observations:
+            if record.phase != phase:
+                continue
+            match = pattern.match(record.motion or "")
+            if match is None:
+                malformed.append({"motion": record.motion,
+                                  "reason": "tag does not match the gravity schema"})
+                continue
+            try:
+                speed = float(match.group("speed"))
+            except (TypeError, ValueError):
+                malformed.append({"motion": record.motion,
+                                  "reason": "probe speed is not numeric"})
+                continue
+            if not math.isfinite(speed) or speed <= 0.0:
+                malformed.append({"motion": record.motion,
+                                  "reason": "probe speed is not finite and positive"})
+                continue
+            key = (int(match.group("pose")), round(speed, 6),
+                   match.group("direction"))
+            grouped.setdefault(key, []).append(record)
+
+        configured = tuple(round(float(speed), 6) for speed in (
+            self.plan.gravity_probe_speeds_deg_s
+            or (self.plan.gravity_probe_speed_deg_s,)))
+        expected = tuple(dict.fromkeys(configured))
+        configuration_errors = ([] if len(expected) == len(configured) else [{
+            "reason": "configured probe speeds contain duplicates",
+            "configured": list(configured),
+        }])
+        report = next((entry for entry in self.reports if entry.phase == phase),
+                      None)
+        designed = int((report.detail if report else {}).get("poses") or 0)
+        if not designed:
+            designed = (self.plan.static_poses if phase == PHASE_GRAVITY
+                        else self.plan.gravity_validation_poses)
+        poses = list(range(1, designed + 1))
+        unexpected = [{
+            "pose": pose, "speed_deg_s": speed, "direction": direction,
+            "observations": len(records),
+        } for (pose, speed, direction), records in sorted(grouped.items())
+            if speed not in expected or pose not in poses]
+        regressors, currents, accepted, incomplete = [], [], [], []
+        consistency = [[] for _ in range(self.arm.joint_count)]
+        for pose in poses:
+            pair_regressors, pair_currents = [], []
+            errors = []
+            for speed in expected:
+                positive = grouped.get((pose, speed, "+"), [])
+                negative = grouped.get((pose, speed, "-"), [])
+                if len(positive) != 1 or len(negative) != 1:
+                    errors.append({"speed_deg_s": speed,
+                                   "positive": len(positive),
+                                   "negative": len(negative)})
+                    continue
+                pair = (positive[0], negative[0])
+                pair_regressors.append(np.mean([
+                    self.arm.static_regressor(record.position_deg)
+                    for record in pair], axis=0))
+                pair_currents.append(np.mean([
+                    record.current_a for record in pair], axis=0))
+            if errors or len(pair_currents) != len(expected):
+                incomplete.append({"pose": pose, "missing_or_duplicate": errors})
+                continue
+            pair_currents_array = np.asarray(pair_currents, dtype=float)
+            if pair_currents_array.shape[0] > 1:
+                spread = np.ptp(pair_currents_array, axis=0)
+                for joint, value in enumerate(spread):
+                    consistency[joint].append(float(value))
+            regressors.append(np.mean(pair_regressors, axis=0))
+            currents.append(np.mean(pair_currents_array, axis=0))
+            accepted.append(pose)
+        return {
+            "regressors": regressors,
+            "currents": np.asarray(currents, dtype=float),
+            "poses": accepted,
+            "incomplete": incomplete,
+            "malformed": malformed,
+            "unexpected": unexpected,
+            "configuration_errors": configuration_errors,
+            "speed_consistency": consistency,
+            "expected_speeds": list(expected),
+        }
+
+    def _fit_gravity_compensation(self) -> dict:
+        """Fit gravity+offset after cancelling odd friction by direction."""
+        training = self._pair_averaged_gravity_rows(PHASE_GRAVITY)
+        validation = self._pair_averaged_gravity_rows(PHASE_VALIDATION)
+        audit_errors = [
+            *training["incomplete"], *validation["incomplete"],
+            *training["malformed"], *validation["malformed"],
+            *training["unexpected"], *validation["unexpected"],
+            *training["configuration_errors"],
+            *validation["configuration_errors"],
+        ]
+        if audit_errors:
+            return {
+                "available": False,
+                "reason": "gravity direction/speed pairing audit failed",
+                "pairing_audit": {
+                    "incomplete_training_poses": training["incomplete"],
+                    "incomplete_validation_poses": validation["incomplete"],
+                    "malformed_training_tags": training["malformed"],
+                    "malformed_validation_tags": validation["malformed"],
+                    "unexpected_training_observations": training["unexpected"],
+                    "unexpected_validation_observations": validation["unexpected"],
+                    "configuration_errors": [
+                        *training["configuration_errors"],
+                        *validation["configuration_errors"],
+                    ],
+                },
+            }
+        if not training["regressors"]:
+            return {"available": False,
+                    "reason": "no complete bidirectional training poses"}
+        if not validation["regressors"]:
+            return {"available": False,
+                    "reason": "no complete bidirectional validation poses"}
+
+        components = ModelComponents(friction=False, offset=True)
+        joints, validation_rms = [], []
+        peak_effort = float(max(
+            np.max(np.abs(training["currents"])),
+            np.max(np.abs(validation["currents"]))))
+        for joint in range(self.arm.joint_count):
+            try:
+                fit = ident.fit_joint(
+                    joint, training["regressors"],
+                    [0.0] * len(training["regressors"]),
+                    training["currents"][:, joint].tolist(),
+                    maximum_condition=MAXIMUM_CONDITION,
+                    components=components, seed=self.plan.seed)
+            except ValueError as error:
+                return {"available": False,
+                        "reason": f"joint {joint + 1}: {error}"}
+            predicted = np.asarray([
+                ident.predict_joint(fit, regressor, 0.0)
+                for regressor in validation["regressors"]])
+            truth = validation["currents"][:, joint]
+            error = float(np.sqrt(np.mean((predicted - truth) ** 2)))
+            entry = fit.as_dict()
+            entry["external_validation_rms"] = error
+            entry["validation_rms_a"] = error
+            entry["peak_measured_effort"] = float(max(
+                np.max(np.abs(training["currents"][:, joint])),
+                np.max(np.abs(validation["currents"][:, joint]))))
+            spread = training["speed_consistency"][joint]
+            entry["speed_pair_consistency_rms"] = (
+                float(np.sqrt(np.mean(np.square(spread)))) if spread else 0.0)
+            joints.append(entry)
+            validation_rms.append(error)
+        verdict_joints = []
+        for joint, entry in enumerate(joints):
+            state, reason = judge_joint(entry, peak_effort)
+            verdict_joints.append({"joint": joint + 1,
+                                   "state": state, "reason": reason})
+        states = {entry["state"] for entry in verdict_joints}
+        overall = ("fail" if "fail" in states else
+                   "warn" if states & {"warn", "unknown"} else "pass")
+        return {
+            "available": True,
+            "method": "bidirectional_pair_mean_static_regressor_plus_offset",
+            "friction_cancellation": (
+                "average positive and negative crossings at each speed, "
+                "then average speed pairs per pose"),
+            "training_phase": PHASE_GRAVITY,
+            "validation_phase": PHASE_VALIDATION,
+            "probe_speeds_deg_s": training["expected_speeds"],
+            "training_pose_ids": training["poses"],
+            "validation_pose_ids": validation["poses"],
+            "training_poses": len(training["poses"]),
+            "validation_poses": len(validation["poses"]),
+            "incomplete_training_poses": training["incomplete"],
+            "incomplete_validation_poses": validation["incomplete"],
+            "malformed_training_tags": training["malformed"],
+            "malformed_validation_tags": validation["malformed"],
+            "unexpected_training_observations": training["unexpected"],
+            "unexpected_validation_observations": validation["unexpected"],
+            "configuration_errors": [
+                *training["configuration_errors"],
+                *validation["configuration_errors"],
+            ],
+            "validation_rms": validation_rms,
+            "joints": joints,
+            "verdict": {
+                "state": overall,
+                "joints": verdict_joints,
+                "failed_joints": [entry["joint"] for entry in verdict_joints
+                                   if entry["state"] == "fail"],
+            },
+        }
+
+    def fit(self) -> CampaignResult:
+        result = super().fit()
+        result.gravity_compensation = self._fit_gravity_compensation()
+        return result
+
     def run_gravity_validation(self) -> PhaseReport:
         """Poses the fit never saw, crossed exactly the way training was.
 
@@ -1518,17 +1812,9 @@ class GravityCampaign(Campaign):
                 report.aborted = "no feasible validation pose"
                 return report
             self.progress(PHASE_VALIDATION, {"designed": design.poses_deg})
-            for index, pose in enumerate(design.poses_deg):
-                target = np.asarray(pose, dtype=float)
-                self._attempt(
-                    report, f"validation pose {index + 1}",
-                    lambda target=target, index=index: [
-                        self._record(PHASE_VALIDATION, sample, report)
-                        for sample in self._probe(
-                            target, f"gravity_check:p{index + 1}")])
-                self.progress(PHASE_VALIDATION, {
-                    "pose": index + 1, "poses": len(design.poses_deg),
-                    "pose_deg": [round(float(v), 3) for v in target]})
+            self._measure_gravity_poses(
+                report, PHASE_VALIDATION, design.poses_deg,
+                "gravity_check", "validation pose")
         finally:
             report.duration_s = self.clock() - start
         return report
