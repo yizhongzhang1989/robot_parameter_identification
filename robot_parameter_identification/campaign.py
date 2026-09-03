@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Iterable, Iterator, Protocol
+import inspect
 import re
 import time
 
@@ -332,8 +333,21 @@ class CampaignPlan:
     position_margin_deg: float = 5.0
     temperature_ceiling_c: float = 45.0
     workspace_limit_deg: tuple[float, ...] = ()
+    # Where each joint may go, low and high. A cell is not symmetric: an arm
+    # mounted at an angle meets the bench swinging one way and nothing the
+    # other, so one +/- number cannot describe it. Wins over the symmetric
+    # cap above when both are set.
+    workspace_range_deg: tuple[tuple[float, float], ...] = ()
     gravity_probe_deg: float = 5.0
     gravity_probe_speed_deg_s: float = 2.0
+    # Two speeds rather than one. The difference between the pair-averaged
+    # currents at two speeds IS the viscous term, so a gravity run measures it
+    # instead of assuming the probe was slow enough to ignore it. Empty falls
+    # back to the single speed above, which is what the four-phase campaign
+    # has always used.
+    gravity_probe_speeds_deg_s: tuple[float, ...] = ()
+    # Poses held back from a gravity run, crossed exactly the way training was.
+    gravity_validation_poses: int = 8
     # Width of the Coulomb reversal. Measured on run #5 data: sweeping this
     # from a hard sign() to 1.8 deg/s cuts worst-joint validation error 11%
     # and the gain survives the non-negativity constraint, unlike Stribeck.
@@ -360,6 +374,12 @@ class CampaignPlan:
     # ladder of thousands cost almost nothing; an arm refusing everything is
     # not producing a dataset and should not be left running for hours.
     skip_budget: int = 40
+    # Where the arm is standing when the run begins. The first transit of a
+    # tour is screened from here and it is the longest one, so a design that
+    # assumes neutral and an arm that is not there is an unscreened swing.
+    # Empty means neutral, which is what every campaign but gravity designs
+    # from.
+    start_deg: tuple = ()
     seed: int = 0
 
     def design_limits(self, arm: ident.ArmModel,
@@ -370,7 +390,11 @@ class CampaignPlan:
         if plant_limits is not None:
             low = np.maximum(low, plant_limits[0])
             high = np.minimum(high, plant_limits[1])
-        if self.workspace_limit_deg:
+        if self.workspace_range_deg:
+            bounds = np.asarray(self.workspace_range_deg, dtype=float)
+            low, high = (np.maximum(low, bounds[:, 0]),
+                         np.minimum(high, bounds[:, 1]))
+        elif self.workspace_limit_deg:
             cap = np.abs(np.asarray(self.workspace_limit_deg, dtype=float))
             low, high = np.maximum(low, -cap), np.minimum(high, cap)
         return excitation.DesignLimits(
@@ -386,7 +410,12 @@ class CampaignPlan:
         payload["validation_speeds_deg_s"] = list(self.validation_speeds_deg_s)
         payload["optimal_friction_speeds_deg_s"] = list(
             self.optimal_friction_speeds_deg_s)
+        payload["gravity_probe_speeds_deg_s"] = list(
+            self.gravity_probe_speeds_deg_s)
+        payload["start_deg"] = list(self.start_deg)
         payload["workspace_limit_deg"] = list(self.workspace_limit_deg)
+        payload["workspace_range_deg"] = [list(pair)
+                                          for pair in self.workspace_range_deg]
         payload["coulomb_transition_search"] = list(
             self.coulomb_transition_search)
         payload["stribeck_speed_search"] = list(self.stribeck_speed_search)
@@ -582,6 +611,8 @@ _STATIC_BOUNDS = {
     "validation_poses": (3, 40),
     "validation_trajectory_s": (4.0, 60.0),
     "position_margin_deg": (3.0, 30.0),
+    "gravity_probe_deg": (1.0, 20.0),
+    "gravity_validation_poses": (2, 30),
 }
 
 
@@ -600,8 +631,24 @@ _INTEGER_FIELDS = frozenset({
     "static_poses", "static_candidates", "settle_samples", "fourier_harmonics",
     "fourier_attempts", "optimal_training_trajectories",
     "optimal_validation_trajectories", "optimal_friction_repeats",
-    "optimal_friction_postures", "validation_poses", "seed",
+    "optimal_friction_postures", "validation_poses",
+    "gravity_validation_poses", "seed",
 })
+
+
+def coerce_plan_value(name: str, value: float):
+    """A plan field's own type, so a panel's number lands as one."""
+    return int(round(value)) if name in _INTEGER_FIELDS else float(value)
+
+
+def _takes_tag(probe) -> bool:
+    try:
+        parameters = inspect.signature(probe).parameters
+    except (TypeError, ValueError):
+        return False
+    return "tag" in parameters or any(
+        entry.kind is inspect.Parameter.VAR_KEYWORD
+        for entry in parameters.values())
 
 
 def sweep_speeds(maximum_speed_deg_s: float, fractions) -> tuple[float, ...]:
@@ -862,6 +909,9 @@ class Campaign:
         self.observations: list[Observation] = []
         self.reports: list[PhaseReport] = []
         self.skipped: list[dict] = []
+        # Where the last tour left the arm, so the next one screens its first
+        # transit from there rather than from wherever the run began.
+        self._left_at: list[float] | None = None
         # Shrunk for a joint that drew more than its drive would give, so the
         # next design asks that joint for less instead of tripping again.
         self.joint_amplitude_scale = np.ones(arm.joint_count)
@@ -1037,13 +1087,33 @@ class Campaign:
                 f"{len(self.skipped)} motions failed, over the budget of "
                 f"{self.plan.skip_budget}: {reason}")
 
-    def _probe(self, pose_deg) -> list:
+    def _crossing_deg(self) -> float:
+        """How far the gravity probe swings each joint either side of a pose.
+
+        Zero when the plant cannot probe, because then the arm only ever stands
+        on the pose and there is no sweep to screen.
+        """
+        if getattr(self.plant, "probe_pose", None) is None:
+            return 0.0
+        return float(self.plan.gravity_probe_deg)
+
+    def _standing(self):
+        """Where the arm is before the next tour, or None for neutral."""
+        if self._left_at is not None:
+            return np.asarray(self._left_at, dtype=float)
+        return (np.asarray(self.plan.start_deg, dtype=float)
+                if self.plan.start_deg else None)
+
+    def _probe(self, pose_deg, tag: str = "") -> list:
         """Gravity samples at a pose, with friction forced to a known sign.
 
         A joint held still balances gravity with any value inside its stiction
         band, so a standstill reading is gravity plus an unknowable offset.
         Crossing the pose in both directions costs a few seconds and makes the
         friction contribution cancel between the pair.
+
+        Crossed at every configured speed, because the pair mean still carries
+        the viscous term and only a second speed can say how much.
         """
         probe = getattr(self.plant, "probe_pose", None)
         if probe is None:
@@ -1051,14 +1121,23 @@ class Campaign:
             samples += [self._dwell(pose_deg)
                         for _ in range(max(1, self.plan.settle_samples) - 1)]
             return samples
-        speed = self.plan.gravity_probe_speed_deg_s
-        frames = probe(pose_deg, self.plan.gravity_probe_deg, speed)
-        # Ramp-in and ramp-out pass through near-zero speed, where friction has
-        # no determined sign again; keeping those frames would put the very
-        # contamination this probe removes straight back into the fit.
-        floor = PROBE_SPEED_FRACTION * speed
-        return [frame for frame in frames
-                if max(abs(v) for v in frame["speed_deg_s"]) >= floor]
+        speeds = (tuple(self.plan.gravity_probe_speeds_deg_s)
+                  or (self.plan.gravity_probe_speed_deg_s,))
+        # ``probe_pose`` is an optional capability found by name, so a plant
+        # written before the pair tag existed must still be callable.
+        extra = {"tag": tag} if _takes_tag(probe) else {}
+        collected: list = []
+        for speed in speeds:
+            frames = probe(pose_deg, self.plan.gravity_probe_deg, speed,
+                           **extra)
+            # Ramp-in and ramp-out pass through near-zero speed, where friction
+            # has no determined sign again; keeping those frames would put the
+            # very contamination this probe removes straight back into the fit.
+            floor = PROBE_SPEED_FRACTION * speed
+            collected.extend(
+                frame for frame in frames
+                if max(abs(v) for v in frame["speed_deg_s"]) >= floor)
+        return collected
 
     def _dwell(self, pose_deg) -> dict:
         """Take another reading at rest, re-commanding only if the plant needs it."""
@@ -1075,19 +1154,26 @@ class Campaign:
             design = excitation.design_static_poses(
                 self.arm, self.limits, count=self.plan.static_poses,
                 candidates=self.plan.static_candidates, seed=self.plan.seed,
-                collision_free=self._collision_free())
+                collision_free=self._collision_free(),
+                start_deg=self._standing(),
+                crossing_deg=self._crossing_deg())
             report.detail = design.as_dict()
-            report.detail.pop("poses_deg", None)
             report.detail["poses"] = len(design.poses_deg)
+            self._left_at = design.final_deg or self._left_at
+            # Published before the first move so a viewer has the whole tour
+            # rather than one pose at a time.
+            self.progress(PHASE_GRAVITY, {"designed": design.poses_deg})
             for index, pose in enumerate(design.poses_deg):
                 target = np.asarray(pose, dtype=float)
                 self._attempt(
                     report, f"pose {index + 1}",
-                    lambda target=target: [
+                    lambda target=target, index=index: [
                         self._record(PHASE_GRAVITY, sample, report)
-                        for sample in self._probe(target)])
+                        for sample in self._probe(target,
+                                                  f"gravity:p{index + 1}")])
                 self.progress(PHASE_GRAVITY, {
-                    "pose": index + 1, "poses": len(design.poses_deg)})
+                    "pose": index + 1, "poses": len(design.poses_deg),
+                    "pose_deg": [round(float(v), 3) for v in target]})
         finally:
             report.duration_s = self.clock() - start
         return report
@@ -1358,22 +1444,22 @@ class Campaign:
             result.joints.append(entry)
         return result
 
-    def run(self) -> CampaignResult:
-        """All four phases; anything that stops one keeps what it measured."""
+    def _run_phases(self, phases) -> CampaignResult:
+        """Run each phase in turn and fit whatever was measured.
+
+        Hours of measurement are not worth less because the last minute of it
+        failed, so a phase that raises stops the run but never discards the
+        data already taken.
+        """
         self.aborted = None
-        for phase in (self.run_gravity, self.run_friction,
-                      self.run_inertia, self.run_validation):
+        for phase in phases:
             try:
                 report = phase()
             except Abort as stop:
                 self.aborted = str(stop)
                 self.reports[-1].aborted = self.aborted
                 break
-            except Exception as error:  # noqa: BLE001 - see below
-                # Hours of measurement are not worth less because the last
-                # minute of it failed. Whatever went wrong is recorded and the
-                # data already taken goes on to be fitted and written, rather
-                # than being discarded on the way out.
+            except Exception as error:  # noqa: BLE001 - see the docstring
                 self.aborted = f"{self.reports[-1].phase}: {error}"
                 self.reports[-1].aborted = str(error)
                 break
@@ -1385,6 +1471,70 @@ class Campaign:
             result.aborted = self.aborted
         result.skipped = list(self.skipped)
         return result
+
+    def run(self) -> CampaignResult:
+        """All four phases; anything that stops one keeps what it measured."""
+        return self._run_phases((self.run_gravity, self.run_friction,
+                                 self.run_inertia, self.run_validation))
+
+
+class GravityCampaign(Campaign):
+    """Gravity terms only, from bidirectional passes through chosen poses.
+
+    Standing still on a pose leaves static friction free to take any value
+    inside its band, so every pose is crossed both ways, at every configured
+    speed. The mean of a pair is gravity plus the drive's own offset, the half
+    difference is Coulomb friction at that pose, and the change between two
+    speeds is the viscous term.
+
+    These passes carry no acceleration, so the inertia tensor columns are
+    identically zero and the base-parameter reduction drops them. What this
+    yields holds the arm up; it does not move it fast.
+    """
+
+    def _main_training_observations(self, usable):
+        return [record for record in usable if record.phase == PHASE_GRAVITY]
+
+    def run_gravity_validation(self) -> PhaseReport:
+        """Poses the fit never saw, crossed exactly the way training was.
+
+        Scored the same way it was trained, because a gravity model that is
+        only checked where it was fitted has not been checked.
+        """
+        report, start = self._open(PHASE_VALIDATION)
+        try:
+            design = excitation.design_static_poses(
+                self.arm, self.limits,
+                count=self.plan.gravity_validation_poses,
+                candidates=self.plan.static_candidates,
+                seed=self.plan.seed + 7717,
+                collision_free=self._collision_free(),
+                start_deg=self._standing(),
+                crossing_deg=self._crossing_deg())
+            report.detail = design.as_dict()
+            report.detail["poses"] = len(design.poses_deg)
+            self._left_at = design.final_deg or self._left_at
+            if not design.poses_deg:
+                report.aborted = "no feasible validation pose"
+                return report
+            self.progress(PHASE_VALIDATION, {"designed": design.poses_deg})
+            for index, pose in enumerate(design.poses_deg):
+                target = np.asarray(pose, dtype=float)
+                self._attempt(
+                    report, f"validation pose {index + 1}",
+                    lambda target=target, index=index: [
+                        self._record(PHASE_VALIDATION, sample, report)
+                        for sample in self._probe(
+                            target, f"gravity_check:p{index + 1}")])
+                self.progress(PHASE_VALIDATION, {
+                    "pose": index + 1, "poses": len(design.poses_deg),
+                    "pose_deg": [round(float(v), 3) for v in target]})
+        finally:
+            report.duration_s = self.clock() - start
+        return report
+
+    def run(self) -> CampaignResult:
+        return self._run_phases((self.run_gravity, self.run_gravity_validation))
 
 
 class OptimalExcitationCampaign(Campaign):
@@ -1704,26 +1854,7 @@ class OptimalExcitationCampaign(Campaign):
 
     def run(self) -> CampaignResult:
         """Low-speed and Fourier training, then independent Fourier validation."""
-        self.aborted = None
         phases = ([self.run_low_speed_friction]
                   if not self.reports else [])
         phases.extend((self.run_training, self.run_optimal_validation))
-        for phase in phases:
-            try:
-                report = phase()
-            except Abort as stop:
-                self.aborted = str(stop)
-                self.reports[-1].aborted = self.aborted
-                break
-            except Exception as error:  # noqa: BLE001
-                self.aborted = f"{self.reports[-1].phase}: {error}"
-                self.reports[-1].aborted = str(error)
-                break
-            if report.aborted:
-                self.aborted = f"{report.phase}: {report.aborted}"
-                break
-        result = self.fit()
-        if self.aborted:
-            result.aborted = self.aborted
-        result.skipped = list(self.skipped)
-        return result
+        return self._run_phases(phases)

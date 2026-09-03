@@ -1,6 +1,7 @@
 """Obstacles: binding, collision, and the honesty of the geometry report."""
 
 from pathlib import Path
+import json
 import unittest
 
 import numpy as np
@@ -8,8 +9,9 @@ import numpy as np
 try:
     import pinocchio as pin
     from robot_parameter_identification import identification as ident
+    from robot_parameter_identification import obstacles
     from robot_parameter_identification.obstacles import (
-        Obstacle, ObstacleScene, SCHEMA_VERSION)
+        Obstacle, ObstacleScene, SAFETY_MARGIN_M, SCHEMA_VERSION)
     from fixtures import synthetic_urdf, PREFIX
 except ImportError as error:
     raise unittest.SkipTest(f"needs pinocchio: {error}") from error
@@ -153,6 +155,101 @@ class ObstacleSceneTest(unittest.TestCase):
             self.scene().collision_free(np.zeros(3))
 
 
+class ClearanceMarginTest(unittest.TestCase):
+    """"Clear" has to mean clear by something, not merely not yet touching."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.arm, cls.urdf = arm()
+        cls.zero = np.zeros(cls.arm.joint_count)
+
+    def scene(self, margin):
+        made = ObstacleScene(self.arm.model, urdf_text=self.urdf,
+                             safety_margin_m=margin)
+        made.add(Obstacle(parent_frame=f"{PREFIX}base_link",
+                          size_m=(0.2, 0.2, 0.2), xyz_m=(0.0, 0.0, 0.6)))
+        return made
+
+    def gap_where_it_just_clears(self, margin):
+        """Slide the box away until the pose is accepted."""
+        made = self.scene(margin)
+        box = made.as_list()[0]
+        for millimetres in range(0, 400, 2):
+            made.update(box["id"], xyz_m=[millimetres / 1000.0, 0.0, 0.6])
+            if made.collision_free(self.zero):
+                return millimetres
+        return None
+
+    def test_the_margin_is_reported(self):
+        self.assertEqual(self.scene(0.03).geometry_report()["safety_margin_m"],
+                         0.03)
+        self.assertEqual(SAFETY_MARGIN_M, 0.02)
+
+    def test_a_margin_pushes_the_accepted_distance_out(self):
+        without = self.gap_where_it_just_clears(0.0)
+        with_margin = self.gap_where_it_just_clears(0.05)
+        self.assertIsNotNone(without)
+        self.assertIsNotNone(with_margin)
+        # 50 mm of margin has to buy roughly 50 mm of extra clearance.
+        self.assertGreaterEqual(with_margin - without, 40)
+
+    def test_zero_margin_is_still_available_for_a_bare_bench(self):
+        self.assertEqual(
+            ObstacleScene(self.arm.model, urdf_text=self.urdf,
+                          safety_margin_m=0.0).safety_margin_m, 0.0)
+
+
+class ConcurrentQueryTest(unittest.TestCase):
+    """The web surface answers several requests at once, on one scene.
+
+    `clearance_rank` raises the margin while it probes, so without a lock a
+    pose being ranked briefly decides the verdict for every other thread.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.arm, cls.urdf = arm()
+
+    def test_ranking_one_pose_does_not_change_another_thread_s_verdict(self):
+        import threading
+
+        made = ObstacleScene(self.arm.model, urdf_text=self.urdf,
+                             safety_margin_m=0.0)
+        made.add(Obstacle(parent_frame=f"{PREFIX}base_link",
+                          size_m=(0.2, 0.2, 0.2), xyz_m=(0.6, 0.0, 0.6)))
+        zero = np.zeros(self.arm.joint_count)
+        self.assertTrue(made.collision_free(zero))
+
+        verdicts = []
+        stop = threading.Event()
+
+        def keep_asking():
+            while not stop.is_set():
+                verdicts.append(made.collision_free(zero))
+
+        watcher = threading.Thread(target=keep_asking, daemon=True)
+        watcher.start()
+        try:
+            for _ in range(40):
+                made.clearance_rank(zero)
+        finally:
+            stop.set()
+            watcher.join(timeout=5)
+
+        self.assertTrue(verdicts)
+        self.assertTrue(all(verdicts),
+                        "a concurrent ranking changed the collision verdict")
+
+    def test_the_margin_is_left_as_it_was_found(self):
+        made = ObstacleScene(self.arm.model, urdf_text=self.urdf,
+                             safety_margin_m=0.03)
+        made._build()
+        made.clearance_rank(np.zeros(self.arm.joint_count))
+        self.assertTrue(all(request.security_margin == 0.03
+                            for request in
+                            made._geometry_data.collisionRequests))
+
+
 class PersistenceTest(ObstacleSceneTest):
     """A scene the operator drew must survive a restart."""
 
@@ -170,10 +267,10 @@ class PersistenceTest(ObstacleSceneTest):
         scene.add(Obstacle(parent_frame=self.base(scene), name="bench",
                            size_m=(0.4, 0.3, 0.2), xyz_m=(0.2, 0.0, -0.1)))
         path = self.temp_path()
-        scene.save(path)
+        obstacles.write_document(path, scene.as_document())
 
         restored = self.scene()
-        restored.load(path)
+        restored.load_document(json.loads(path.read_text()))
         self.assertEqual(scene.as_list(), restored.as_list())
 
     def test_the_document_is_versioned_and_names_the_shape(self):
@@ -209,7 +306,7 @@ class PersistenceTest(ObstacleSceneTest):
         scene = self.scene()
         scene.add(Obstacle(parent_frame=self.base(scene)))
         path = self.temp_path()
-        scene.save(path)
+        obstacles.write_document(path, scene.as_document())
         self.assertFalse(path.with_suffix(path.suffix + ".partial").exists())
 
 

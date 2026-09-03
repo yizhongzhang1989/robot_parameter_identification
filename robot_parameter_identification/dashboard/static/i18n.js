@@ -30,6 +30,24 @@ const DICT = {
   'view.frames': { en: 'frames', zh: '坐标系' },
   'view.labels': { en: 'labels', zh: '标签' },
   'view.ghost': { en: 'planned pose', zh: '规划位姿' },
+  'view.ghost_hint': {
+    en: 'The poses the last run designed, as skeletons: blue for training, '
+      + 'green for the held-out check, amber for friction sweep postures. The '
+      + 'pose being executed is drawn solid.',
+    zh: '上一次运行设计出的位形骨架：蓝色为训练位形，'
+      + '绿色为留出验证，橙色为摩擦扫掠位形。正在执行的位形以实线突出。',
+  },
+  'view.gravity': { en: 'mass and centre of mass', zh: '质量与质心' },
+  'view.gravity_hint': {
+    en: 'The URDF\'s own gravity terms: one ball per link, sized by mass and '
+      + 'placed at the centre of mass it declares, with the lever back to the '
+      + 'link frame. The cyan ball is the whole robot\'s centre of mass and '
+      + 'the arrow drops from it to the floor.',
+    zh: '直接来自 URDF 的重力相关参数：每个连杆一个小球，大小按质量，'
+      + '位置在它声明的质心处，连线是相对连杆坐标系的力臂。'
+      + '青色球是整机质心，箭头从它垂直指向地面。',
+  },
+  'view.gravity_total': { en: 'whole robot', zh: '整机' },
 
   'signals.title': { en: 'Live signals', zh: '实时信号' },
   'signals.plot': { en: 'plot', zh: '曲线' },
@@ -70,24 +88,147 @@ const DICT = {
   },
   'obst.nomodel': { en: 'no model yet', zh: '尚未载入模型' },
   'obst.save': { en: 'save as', zh: '另存为' },
-  'obst.saved': { en: 'scene written to {v}', zh: '场景已写入 {v}' },
+  'obst.saved': { en: 'configuration written to {v}', zh: '配置已写入 {v}' },
   'obst.where': {
-    en: 'edits are kept in {v}; type a name to save a copy, then launch the '
-      + 'next arm with obstacle_file:= pointing at it',
-    zh: '编辑会自动保存到 {v}；填个名字可另存一份，'
-      + '下次启动另一台机器人时用 obstacle_file:= 指过去',
+    en: 'this scene, the planner envelope and the gravity settings are kept in '
+      + '{v}; type a name to save a copy, then launch the next arm with '
+      + 'config_file_path:= pointing at it',
+    zh: '障碍物场景、规划包络和重力标定参数都会自动保存到 {v}；'
+      + '填个名字可另存一份，下次启动另一台机器人时用 config_file_path:= 指过去',
   },
   'obst.nowhere': {
-    en: 'this dashboard was launched without obstacle_file:=, so nothing was '
-      + 'loaded and edits are lost on restart. Type a name and save, then '
-      + 'relaunch with obstacle_file:= pointing at it.',
-    zh: '本次启动没有指定 obstacle_file:=，所以没有载入任何障碍物，'
-      + '所做的编辑重启后会丢失。填个名字保存，'
-      + '下次启动时用 obstacle_file:= 指过去。',
+    en: 'this dashboard was launched without config_file_path:=, so nothing '
+      + 'was loaded and every edit -- obstacles, planner envelope, gravity '
+      + 'settings -- is lost on restart. Type a name and save, then relaunch '
+      + 'with config_file_path:= pointing at it.',
+    zh: '本次启动没有指定 config_file_path:=，所以没有载入任何配置，'
+      + '所做的编辑（障碍物、规划包络、重力标定参数）重启后都会丢失。'
+      + '填个名字保存，下次启动时用 config_file_path:= 指过去。',
   },
 
+  /* ---- panel groups ---- */
+  'group.control': { en: 'Overall control', zh: '总体控制' },
+  'group.gravity': { en: 'Gravity compensation', zh: '重力补偿标定' },
+  'group.rest': { en: 'Remaining calibration', zh: '其余标定' },
+  'group.space': { en: 'Planner envelope', zh: '规划包络' },
+
+  /* ---- gravity identification ---- */
+  'grav.title': { en: 'Gravity identification', zh: '重力参数辨识' },
+  'grav.hint': {
+    en: 'Every pose is crossed both ways at two speeds. Standing still leaves '
+      + 'static friction free to take any value in its band, so the pair mean '
+      + 'is gravity and the half difference is friction. No acceleration here, '
+      + 'so this model holds the arm up; it does not move it fast.',
+    zh: '每个位形都以两种速度双向穿越。静止时静摩擦可在摩擦带内取任意值，'
+      + '所以成对均值是重力，半差是摩擦。这里没有加速度，'
+      + '所以得到的模型只能把手臂托住，不能支持快速运动。',
+  },
+  'grav.poses': { en: 'training poses', zh: '训练位形数' },
+  'grav.check': { en: 'held-out poses', zh: '留出验证位形数' },
+  'grav.arc': { en: 'crossing arc (°)', zh: '穿越幅度（°）' },
+  'grav.slow': { en: 'slow probe (°/s)', zh: '慢速探针（°/s）' },
+  'grav.fast': { en: 'fast probe (°/s)', zh: '快速探针（°/s）' },
+  'grav.rehearse': { en: 'Rehearse gravity', zh: '重力预演' },
+  'grav.plan': { en: 'Plan poses', zh: '只规划' },
+
+  /* ---- planner envelope + pose review ---- */
+  'space.title': { en: 'Planner envelope', zh: '规划包络' },
+  'space.hint': {
+    en: 'Where the planner may take each joint. Left unset it uses the arm\'s '
+      + 'own range, which describes the arm and not the cell it stands in. A '
+      + 'cell is rarely symmetric: an arm mounted at an angle meets the bench '
+      + 'swinging one way and nothing the other. Changing this clears any '
+      + 'armed run, because the poses that were rehearsed are not the poses '
+      + 'this will design.',
+    zh: '规划器可以把每个关节带到哪里。不设时用机械臂自身的行程，'
+      + '而那描述的是手臂本身，不是它所在的工作单元。工作单元很少是对称的：'
+      + '斜装的手臂往一边摆会碰到台子，往另一边则什么都碰不到。'
+      + '改动后已解锁的运行会被清除，因为预演过的位形不是新包络会规划出的位形。',
+  },
+  'space.low': { en: 'low (°)', zh: '下限（°）' },
+  'space.high': { en: 'high (°)', zh: '上限（°）' },
+  'space.arm': { en: "arm's range", zh: '机械臂行程' },
+  'space.fill': { en: 'set all', zh: '全部填入' },
+  'space.apply': { en: 'Apply envelope', zh: '应用包络' },
+  'space.reset': { en: "Use the arm's range", zh: '恢复为机械臂行程' },
+  'space.applied': { en: 'envelope applied', zh: '包络已应用' },
+  'space.wasreset': { en: "envelope reset to the arm's range",
+                      zh: '包络已恢复为机械臂行程' },
+  'space.set': { en: 'Set here.', zh: '已在此设定。' },
+  'space.pending': {
+    en: 'Edited but not applied. The numbers in red are not what the planner '
+      + 'is using; press Apply envelope.',
+    zh: '已修改但尚未应用。红色的数字不是规划器正在用的值，请点“应用包络”。',
+  },
+  'space.unset': {
+    en: 'Not set, so the planner uses the whole arm, out to ±{v}°. On a '
+      + 'dual-arm robot that reaches the other arm.',
+    zh: '未设定，规划器使用整个行程，最远到 ±{v}°。'
+      + '双臂机器人上这个范围能够到另一条手臂。',
+  },
+  'inspect.title': { en: 'Review the planned poses', zh: '人工检查规划位形' },
+  'inspect.hint': {
+    en: 'Step through them in the 3D view before anything moves. The selected '
+      + 'pose is drawn solid; the margin is the widest clearance it was '
+      + 're-screened against and still passed, so the smallest number is the '
+      + 'pose to look at.',
+    zh: '在任何东西动起来之前，先在 3D 视图里逐个看。选中的位形以实线绘出；'
+      + '“余量”是该位形重新筛查仍能通过的最大间隙，所以数字最小的那个最值得看。',
+  },
+  'inspect.margin': { en: 'margin', zh: '余量' },
+  'inspect.worst': { en: 'tightest', zh: '最紧的' },
+  'inspect.fly': { en: 'fly the tour', zh: '虚拟走一遍' },
+  'inspect.land': { en: 'stop', zh: '停下' },
+  'inspect.none': { en: 'nothing planned yet', zh: '尚未规划' },
+  'grav.run': { en: 'Run on hardware', zh: '真机标定' },
+  'grav.planning': {
+    en: 'Designing poses and screening every one of them against the scene. '
+      + 'This takes a few seconds and moves nothing.',
+    zh: '正在设计位形，并逐个做碰撞筛查。需要几秒钟，不会有任何运动。',
+  },
+  'grav.visiting': {
+    en: 'Running: pose {v}. The orange arm is flying the same tour in the '
+      + 'view, far faster than the arm itself moves.',
+    zh: '进行中：第 {v} 个位形。左侧橙色的那条臂在虚拟走同一路径，'
+      + '速度远快于机械臂本身。',
+  },
+  'grav.astray': {
+    en: 'The collision screen holds every joint this dashboard does not drive '
+      + 'where it was when the screen was built, and these have moved since: '
+      + '{v}. Rebuild the screen and plan again, or put them back.',
+    zh: '碰撞筛查把本面板驱动不了的关节固定在建立筛查时的位置，而它们已经动了：{v}。'
+      + '重建筛查并重新规划，或者把它们摆回去。',
+  },
+  'grav.rescreen': { en: 'Rebuild the screen', zh: '重建碰撞筛查' },
+  'grav.armed': {
+    en: 'The dry run recovered what it planted. These numbers are armed.',
+    zh: '预演成功复现了预设摩擦，当前参数已解锁。',
+  },
+  'grav.locked': {
+    en: 'Rehearse first. The dry run must recover the friction it plants '
+      + 'before the arm is allowed to move.',
+    zh: '请先预演。预演必须复现它自己预设的摩擦，才能驱动手臂。',
+  },
+  'grav.stale': {
+    en: 'The settings changed since the dry run that passed. Rehearse again '
+      + 'with these numbers, then run.',
+    zh: '参数在通过的预演之后改动过。请用当前参数重新预演，再执行。',
+  },
+  'grav.passes': { en: 'crossings planned', zh: '计划穿越次数' },
+  'grav.toofew': {
+    en: 'Too few poses: joint 1 carries {v} gravity terms and each pose gives '
+      + 'one row, so the fit would be underdetermined rather than merely noisy.',
+    zh: '位形太少：关节 1 共有 {v} 个重力项，而每个位形只提供一行，'
+      + '拟合会欠定，而不只是噪声大。',
+  },
+  'grav.holdout': { en: 'held-out error', zh: '留出集误差' },
+  'grav.worst': { en: 'worst joint', zh: '最差关节' },
+  'grav.preview': { en: 'planned poses drawn', zh: '已绘制位形数' },
+
+  'run.activity': { en: 'Activity', zh: '当前任务' },
+
   /* ---- run ---- */
-  'run.title': { en: 'Run', zh: '运行' },
+  'run.title': { en: 'Full campaign', zh: '完整标定流程' },
   'run.rehearse': { en: 'Rehearse', zh: '预演' },
   'run.hardware': { en: 'Run on hardware', zh: '真机运行' },
   'run.home': { en: 'Home', zh: '回零位' },
@@ -171,6 +312,8 @@ const DICT = {
   'conn.driven': { en: 'joints driven', zh: '受控关节数' },
   'conn.profile': { en: 'profile', zh: '机器人档案' },
   'conn.shapes': { en: 'robot shapes', zh: '机器人碰撞体' },
+  'conn.margin': { en: 'clearance margin', zh: '安全间隙' },
+  'conn.envelope': { en: 'planner envelope', zh: '规划范围' },
   'conn.obstacles': { en: 'obstacles', zh: '障碍物' },
   'conn.guards_all': { en: 'All guards active.', zh: '全部保护均已生效。' },
   'conn.guards_off': {
@@ -336,6 +479,15 @@ const DICT = {
     en: 'Rehearsal ran but did NOT recover the planted friction: worst error '
       + '{v} exceeds {t}. The hardware button stays locked.',
     zh: '预演已运行，但未能复现预设摩擦：最大误差 {v} 超过 {t}。真机按钮保持锁定。',
+  },
+  'recovery.gravity_bad': {
+    en: 'The planted friction came back, but gravity did not: worst held-out '
+      + 'error {v} exceeds {t}. Friction and gravity are separated by the '
+      + 'crossing pair, so one can be exact while the other is '
+      + 'underdetermined. Add poses and rehearse again.',
+    zh: '预设摩擦复现了，但重力没有：留出集最大误差 {v} 超过 {t}。'
+      + '双向穿越把摩擦和重力分开了，所以一者准确不代表另一者可辨。'
+      + '请增加位形数重新预演。',
   },
 
   /* ---- results folder ---- */

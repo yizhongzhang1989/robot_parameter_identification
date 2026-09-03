@@ -183,6 +183,9 @@ class HardwareConfig:
     # Every raw frame behind those samples, kept for the run folder.
     keep_raw_frames: bool = True
     require_neutral_start: bool = True
+    # Where the design assumed the arm would be standing. Empty falls back to
+    # neutral, which is what every campaign but the gravity one designs from.
+    expected_start_deg: tuple = ()
     goal_timeout_margin_s: float = 8.0
     # Arms refuse or drop the odd goal for reasons that have cleared by the time
     # you ask again. Retrying costs seconds; treating it as fatal costs the
@@ -295,10 +298,17 @@ class HardwarePlant:
                 "for every joint")
         if self.config.require_neutral_start:
             position = np.asarray(self.sample()["position_deg"], dtype=float)
-            if np.max(np.abs(position)) > NEUTRAL_TOLERANCE_DEG:
+            expected = (np.asarray(self.config.expected_start_deg, dtype=float)
+                        if len(self.config.expected_start_deg) == len(position)
+                        else np.zeros_like(position))
+            # The first transit of a tour is screened from where the design
+            # believed the arm was standing, and it is the longest one. This
+            # is the check that makes that screen true.
+            if np.max(np.abs(position - expected)) > NEUTRAL_TOLERANCE_DEG:
                 raise TelemetryUnavailable(
                     "the arm must start within "
-                    f"{NEUTRAL_TOLERANCE_DEG:g} deg of neutral, it is at "
+                    f"{NEUTRAL_TOLERANCE_DEG:g} deg of "
+                    f"{[round(v, 2) for v in expected]}, it is at "
                     f"{[round(v, 2) for v in position]}")
 
     def close(self) -> None:
@@ -723,24 +733,33 @@ class HardwarePlant:
         for observation in self._observations(frames, tag, speed, cruise):
             yield observation
 
-    def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float):
+    def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float,
+                   tag: str = ""):
         """Cross the pose slowly both ways instead of holding still on it.
 
         Standing still leaves static friction free to take any value inside its
         band, so the current at rest is gravity plus an unknowable offset. Once
         the joint moves, friction has a determined sign, and the two passes
         bracket gravity between them.
+
+        Each half is tagged with its direction, so the pair a reading belongs
+        to is a property of the record rather than something reconstructed
+        later from the order the passes happened to arrive in.
         """
         pose = np.asarray(pose_deg, dtype=float)
         low, high = self.limits_deg()
         step = np.full(self.joint_count, abs(delta_deg))
         start = np.clip(pose - step, low, high)
         end = np.clip(pose + step, low, high)
+        prefix = tag or "gravity"
         self.hold_pose(start)
-        return self._sweep(start, end, speed_deg_s) + \
-            self._sweep(end, start, speed_deg_s)
+        return (self._sweep(start, end, speed_deg_s,
+                            f"{prefix}:{speed_deg_s:g}:+")
+                + self._sweep(end, start, speed_deg_s,
+                              f"{prefix}:{speed_deg_s:g}:-"))
 
-    def _sweep(self, start_deg, end_deg, speed_deg_s: float) -> list[dict]:
+    def _sweep(self, start_deg, end_deg, speed_deg_s: float,
+               tag: str = "") -> list[dict]:
         """One constant-speed straight line in joint space, frames collected."""
         start = np.asarray(start_deg, dtype=float)
         end = np.asarray(end_deg, dtype=float)
@@ -765,7 +784,7 @@ class HardwarePlant:
         collected: list[dict] = []
         self._capture()
         self._passes += 1
-        tag = f"sweep:{speed:g}:{self._passes}"
+        tag = tag or f"sweep:{speed:g}:{self._passes}"
         try:
             self._execute(points, lambda _t, frame: collected.append(frame))
         finally:

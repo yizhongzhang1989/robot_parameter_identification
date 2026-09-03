@@ -12,6 +12,67 @@ except ImportError as error:  # pinocchio ships with ROS, not with pip
 
 MODEL_CACHE = {}
 
+TWO_ARM_URDF = """<?xml version="1.0"?><robot name="pair">
+<link name="base"/>
+<link name="mine_link1"><inertial><origin xyz="0 0 0.1"/>
+  <mass value="1.0"/><inertia ixx="0.01" ixy="0" ixz="0"
+  iyy="0.01" iyz="0" izz="0.01"/></inertial></link>
+<joint name="mine_joint1" type="revolute"><parent link="base"/>
+  <child link="mine_link1"/><origin xyz="0 0.2 0"/><axis xyz="0 1 0"/>
+  <limit lower="-2.6" upper="2.6" effort="60" velocity="3"/></joint>
+<link name="theirs_link1"><inertial><origin xyz="0 0 0.1"/>
+  <mass value="1.0"/><inertia ixx="0.01" ixy="0" ixz="0"
+  iyy="0.01" iyz="0" izz="0.01"/></inertial></link>
+<joint name="theirs_joint1" type="revolute"><parent link="base"/>
+  <child link="theirs_link1"/><origin xyz="0 -0.2 0"/><axis xyz="0 1 0"/>
+  <limit lower="-2.6" upper="2.6" effort="60" velocity="3"/></joint>
+</robot>"""
+
+
+class LockedJointPlacementTest(unittest.TestCase):
+    """A locked joint is held somewhere, and that somewhere is a choice.
+
+    Reducing a dual-arm model keeps the other arm's links; they stop moving but
+    they do not stop existing, and a collision screen built on the reduced
+    model checks against them wherever they were pinned. Pinning them at
+    neutral is only right if the other arm is at neutral.
+    """
+
+    def reduced(self, elsewhere_rad):
+        return ident.ArmModel._reduced(
+            TWO_ARM_URDF, lambda name: name.startswith("mine_"),
+            "mine", elsewhere_rad)
+
+    def where(self, model, frame):
+        return np.asarray(
+            model.link_transforms([0.0])[frame], dtype=float).reshape(4, 4)[:3, 3]
+
+    def test_the_other_arm_is_still_in_the_model(self):
+        self.assertIn("theirs_link1", self.reduced(None).link_transforms([0.0]))
+
+    def test_no_reference_pins_it_at_neutral(self):
+        self.assertTrue(np.allclose(self.where(self.reduced(None),
+                                               "theirs_link1"),
+                                    [0.0, -0.2, 0.0]))
+
+    def test_a_reference_moves_it_to_where_it_is(self):
+        turned = self.reduced({"theirs_joint1": np.pi / 2})
+        # The link frame origin does not move with its own joint's rotation,
+        # but its inertial frame does, and so does everything downstream.
+        self.assertFalse(np.allclose(
+            np.asarray(turned.link_transforms([0.0])["theirs_link1"]),
+            np.asarray(self.reduced(None).link_transforms([0.0])["theirs_link1"])))
+
+    def test_the_driven_arm_is_unaffected_by_the_reference(self):
+        turned = self.reduced({"theirs_joint1": np.pi / 2})
+        self.assertTrue(np.allclose(self.where(turned, "mine_link1"),
+                                    self.where(self.reduced(None),
+                                               "mine_link1")))
+
+    def test_a_name_this_robot_lacks_is_skipped_not_fatal(self):
+        # The same reading is shared between arms and dashboards.
+        self.assertTrue(self.reduced({"no_such_joint": 1.0}).joint_count == 1)
+
 
 def arm_model():
     if "arm" not in MODEL_CACHE:

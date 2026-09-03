@@ -970,6 +970,92 @@ class WorkspaceCapTest(unittest.TestCase):
         self.assertEqual(plan.as_dict()["workspace_limit_deg"], [90.0] * 7)
 
 
+class GravityCampaignTest(unittest.TestCase):
+    """A run that only ever measures what holds the arm up."""
+
+    class TaggingPlant(ScriptedPlant):
+        """A probe that records what it was asked for, tag included."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.probes = []
+
+        def probe_pose(self, pose_deg, delta_deg, speed_deg_s, tag=""):
+            self.probes.append((tag, speed_deg_s))
+            frames = []
+            for sign, mark in ((1.0, "+"), (-1.0, "-")):
+                frame = self._frame(
+                    pose_deg, np.full(self.joints, sign * speed_deg_s))
+                frame["motion"] = f"{tag}:{speed_deg_s:g}:{mark}"
+                frames.append(frame)
+            return frames
+
+    def plan(self, **overrides):
+        values = dict(gravity_probe_speeds_deg_s=(1.0, 3.0),
+                      gravity_validation_poses=3)
+        values.update(overrides)
+        return small_plan(**values)
+
+    def build(self, **overrides):
+        plant = self.TaggingPlant()
+        run = campaign.GravityCampaign(arm_model(), plant, self.plan(**overrides))
+        return run, plant
+
+    def test_only_the_gravity_and_validation_phases_run(self):
+        run, plant = self.build()
+        run.run()
+        self.assertEqual([report.phase for report in run.reports],
+                         [campaign.PHASE_GRAVITY, campaign.PHASE_VALIDATION])
+        self.assertEqual(plant.calls.count("traverse"), 0)
+        self.assertEqual(plant.calls.count("track"), 0)
+
+    def test_every_pose_is_crossed_at_every_speed(self):
+        run, plant = self.build()
+        run.run_gravity()
+        poses = run.reports[0].detail["poses"]
+        self.assertEqual(len(plant.probes), poses * 2)
+        self.assertEqual({speed for _tag, speed in plant.probes}, {1.0, 3.0})
+
+    def test_the_tag_names_the_pose_the_speed_and_the_direction(self):
+        run, _plant = self.build()
+        run.run_gravity()
+        motions = {record.motion for record in run.observations}
+        self.assertIn("gravity:p1:1:+", motions)
+        self.assertIn("gravity:p1:1:-", motions)
+        self.assertIn("gravity:p1:3:+", motions)
+
+    def test_validation_poses_are_held_out_of_the_fit(self):
+        run, _plant = self.build()
+        run.run()
+        trained = run._main_training_observations(run.observations)
+        self.assertTrue(trained)
+        self.assertTrue(all(record.phase == campaign.PHASE_GRAVITY
+                            for record in trained))
+        self.assertTrue(any(record.phase == campaign.PHASE_VALIDATION
+                            for record in run.observations))
+
+    def test_the_validation_poses_are_not_the_training_poses(self):
+        run, _plant = self.build()
+        run.run()
+        trained = {tuple(pose) for pose
+                   in run.reports[0].detail["poses_deg"]}
+        checked = {tuple(pose) for pose
+                   in run.reports[1].detail["poses_deg"]}
+        self.assertTrue(checked)
+        self.assertFalse(trained & checked)
+
+    def test_a_plant_whose_probe_predates_the_tag_still_runs(self):
+        class Older(ScriptedPlant):
+            def probe_pose(self, pose_deg, delta_deg, speed_deg_s):
+                return [self._frame(pose_deg,
+                                    np.full(self.joints, sign * speed_deg_s))
+                        for sign in (1.0, -1.0)]
+
+        run = campaign.GravityCampaign(arm_model(), Older(), self.plan())
+        run.run_gravity()
+        self.assertTrue(run.observations)
+
+
 class StictionCancellingProbeTest(unittest.TestCase):
     """Standing still cannot separate gravity from stiction; crossing can.
 

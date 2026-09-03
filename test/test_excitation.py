@@ -41,6 +41,136 @@ class LimitTest(unittest.TestCase):
         self.assertTrue(np.all(self.limits.clip(np.full(7, -1e4)) >= low - 1e-9))
 
 
+class PathResolutionTest(unittest.TestCase):
+    """The gap between checks is what decides whether a thin thing is stepped
+    over. A fixed sample count makes that gap grow with the swing."""
+
+    def slab(self, low_deg, high_deg):
+        """A screen that refuses one narrow band of joint 1."""
+        def screen(pose):
+            return not (low_deg <= float(pose[0]) <= high_deg)
+        return screen
+
+    def test_a_thin_obstacle_is_not_stepped_over_on_a_long_swing(self):
+        start = np.zeros(7)
+        end = np.zeros(7)
+        end[0] = 300.0
+        # One degree wide, in the middle. Thirty-two samples over 300 deg land
+        # 9.4 deg apart and miss it; the resolution rule cannot.
+        screen = self.slab(149.6, 150.4)
+        self.assertFalse(excitation._path_free(start, end, screen))
+
+    def test_the_callers_step_count_is_only_a_floor(self):
+        start = np.zeros(7)
+        end = np.zeros(7)
+        end[0] = 300.0
+        screen = self.slab(149.6, 150.4)
+        self.assertFalse(excitation._path_free(start, end, screen, steps=4))
+
+    def test_a_clear_path_stays_clear(self):
+        start = np.zeros(7)
+        end = np.zeros(7)
+        end[0] = 300.0
+        self.assertTrue(excitation._path_free(start, end, CLEAR))
+
+    def test_the_check_count_is_bounded(self):
+        seen = []
+
+        def counting(pose):
+            seen.append(pose)
+            return True
+
+        start = np.zeros(7)
+        end = np.zeros(7)
+        end[0] = 1e5
+        excitation._path_free(start, end, counting)
+        self.assertLessEqual(len(seen), excitation.MAXIMUM_PATH_STEPS)
+
+
+class CrossingScreenTest(unittest.TestCase):
+    """The gravity probe drives +/-delta on every joint from each pose."""
+
+    def setUp(self):
+        self.arm = arm_model()
+        self.limits = design_limits(self.arm, margin_deg=5.0)
+
+    def test_a_pose_whose_crossing_is_blocked_is_not_selected(self):
+        # Everything within 8 deg of the origin on joint 1 is fine; beyond it
+        # the crossing would leave the allowed band.
+        def screen(pose):
+            return abs(float(pose[0])) <= 8.0
+
+        plan = excitation.design_static_poses(
+            self.arm, self.limits, count=4, candidates=200, seed=2,
+            collision_free=screen, crossing_deg=5.0)
+        for pose in plan.poses_deg:
+            self.assertLessEqual(abs(pose[0]) + 5.0, 8.0 + 1e-6)
+
+    def test_the_crossing_rejections_are_counted_separately(self):
+        def screen(pose):
+            return abs(float(pose[0])) <= 8.0
+
+        plan = excitation.design_static_poses(
+            self.arm, self.limits, count=4, candidates=60, seed=2,
+            collision_free=screen, crossing_deg=5.0)
+        self.assertGreater(plan.rejected_by_crossing, 0)
+        self.assertIn("rejected_by_crossing", plan.as_dict())
+
+    def test_without_a_crossing_the_design_is_unchanged(self):
+        plain = excitation.design_static_poses(
+            self.arm, self.limits, count=6, candidates=60, seed=3,
+            collision_free=CLEAR)
+        same = excitation.design_static_poses(
+            self.arm, self.limits, count=6, candidates=60, seed=3,
+            collision_free=CLEAR, crossing_deg=0.0)
+        self.assertEqual(plain.poses_deg, same.poses_deg)
+
+
+class StandingStartTest(unittest.TestCase):
+    """The tour is planned from where the arm is, not from where zero is."""
+
+    def setUp(self):
+        self.arm = arm_model()
+        self.limits = design_limits(self.arm, margin_deg=5.0)
+
+    def design(self, start_deg):
+        return excitation.design_static_poses(
+            self.arm, self.limits, count=6, candidates=60, seed=5,
+            collision_free=CLEAR, start_deg=start_deg)
+
+    def test_the_first_pose_is_the_one_nearest_the_start(self):
+        # The first transit is the longest and it is screened from here, so
+        # "here" has to be where the arm actually is.
+        start = np.full(self.arm.joint_count, -40.0)
+        plan = self.design(start)
+        away = [float(np.max(np.abs(np.asarray(pose) - start)))
+                for pose in plan.poses_deg]
+        self.assertEqual(away[0], min(away))
+
+    def test_a_different_start_reorders_the_same_poses(self):
+        far = self.design(np.full(self.arm.joint_count, -40.0))
+        home = self.design(None)
+        self.assertEqual(sorted(map(tuple, far.poses_deg)),
+                         sorted(map(tuple, home.poses_deg)))
+        self.assertNotEqual(far.poses_deg, home.poses_deg)
+
+    def test_the_design_says_where_it_leaves_the_arm(self):
+        plan = self.design(None)
+        self.assertEqual(plan.final_deg, plan.poses_deg[-1])
+        self.assertIn("final_deg", plan.as_dict())
+
+    def test_a_crossing_leaves_the_arm_at_the_sweep_start(self):
+        # The arm is left where the crossing began, not on the pose centre.
+        plan = excitation.design_static_poses(
+            self.arm, self.limits, count=4, candidates=60, seed=5,
+            collision_free=CLEAR, crossing_deg=5.0)
+        low, high = self.limits.usable()
+        self.assertTrue(np.allclose(
+            plan.final_deg,
+            np.clip(np.asarray(plan.poses_deg[-1]) - 5.0, low, high)))
+        self.assertFalse(np.allclose(plan.final_deg, plan.poses_deg[-1]))
+
+
 class StaticDesignTest(unittest.TestCase):
     def setUp(self):
         self.arm = arm_model()

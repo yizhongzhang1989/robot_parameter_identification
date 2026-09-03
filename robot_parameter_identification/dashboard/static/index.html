@@ -32,6 +32,7 @@
   <!-- ---------------- 3D ---------------- -->
   <section id="stage">
     <div id="viewer"></div>
+    <div id="gravity-labels" class="hidden"></div>
     <div id="loading"><div class="spinner"></div><span>loading model…</span></div>
 
     <div class="overlay" id="view-opts">
@@ -41,8 +42,12 @@
         <span data-i18n="view.frames">frames</span></label>
       <label><input type="checkbox" id="show-labels"/>
         <span data-i18n="view.labels">labels</span></label>
-      <label><input type="checkbox" id="show-ghost" checked/>
+      <label title="" data-i18n-title="view.ghost_hint">
+        <input type="checkbox" id="show-ghost" checked/>
         <span data-i18n="view.ghost">planned pose</span></label>
+      <label title="" data-i18n-title="view.gravity_hint">
+        <input type="checkbox" id="show-gravity"/>
+        <span data-i18n="view.gravity">mass and centre of mass</span></label>
     </div>
 
     <div class="overlay" id="edit-box">
@@ -123,20 +128,19 @@
   <!-- ---------------- right panel ---------------- -->
   <aside id="panel">
 
+  <details class="group" id="group-control" open>
+    <summary data-i18n="group.control">Overall control</summary>
+
     <div class="card">
-      <h2 data-i18n="run.title">Run</h2>
+      <h2 data-i18n="run.activity">Activity</h2>
+      <div id="phasebar" class="phases"></div>
+      <div id="progress-line" class="muted">not started</div>
       <div class="row">
-        <button id="btn-rehearse" data-i18n="run.rehearse">Rehearse</button>
-        <button id="btn-hardware" class="danger" disabled
-                data-i18n="run.hardware">Run on hardware</button>
         <button id="btn-home" class="danger" disabled
                 data-i18n="run.home">Home</button>
         <button id="btn-stop" class="stop" disabled
                 data-i18n="run.stop">Stop</button>
       </div>
-      <p class="hint" id="ack-hint"></p>
-      <div id="phasebar" class="phases"></div>
-      <div id="progress-line" class="muted">not started</div>
 
       <h3 data-i18n="jog.title">Jog</h3>
       <p class="hint" data-i18n="jog.hint">Drives the same trajectory
@@ -149,6 +153,119 @@
         <button id="btn-jog-zero" disabled data-i18n="jog.zero">All to zero</button>
       </div>
       <div id="jog-sliders" class="jog"></div>
+    </div>
+
+    <div class="card">
+      <h2 data-i18n="conn.title">Connection</h2>
+      <table class="kv" id="conn-table"></table>
+      <p class="hint" id="guards"></p>
+      <div class="row">
+        <button id="btn-profile" class="small"
+                data-i18n="profile.open">Edit envelope</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="group" id="group-space" open>
+    <summary data-i18n="group.space">Planner envelope</summary>
+
+    <div class="card">
+      <h2 data-i18n="space.title">Planner envelope</h2>
+      <p class="hint" data-i18n="space.hint">Where the planner may take each
+        joint. Left unset it uses the arm's own range, which describes the arm
+        and not the cell it stands in. A cell is rarely symmetric: an arm
+        mounted at an angle meets the bench swinging one way and nothing the
+        other. Changing this clears any armed run, because the poses that were
+        rehearsed are not the poses this will design.</p>
+      <div class="row">
+        <label class="field"><span data-i18n="space.low">low (°)</span>
+          <input id="space-all-low" type="number" step="5"/></label>
+        <label class="field"><span data-i18n="space.high">high (°)</span>
+          <input id="space-all-high" type="number" step="5"/></label>
+        <button id="space-fill" class="small" data-i18n="space.fill">set all</button>
+      </div>
+      <div class="scroll-x"><table class="live" id="space-joints"></table></div>
+      <div class="row">
+        <button id="space-apply" data-i18n="space.apply">Apply envelope</button>
+        <button id="space-reset" class="small"
+                data-i18n="space.reset">Use the arm's range</button>
+      </div>
+      <p class="hint" id="space-state"></p>
+    </div>
+  </details>
+
+  <details class="group" id="group-gravity" open>
+    <summary data-i18n="group.gravity">Gravity compensation</summary>
+
+    <div class="card">
+      <h2 data-i18n="grav.title">Gravity identification</h2>
+      <p class="hint" data-i18n="grav.hint">Every pose is crossed both ways at
+        two speeds. Standing still leaves static friction free to take any
+        value in its band, so the pair mean is gravity and the half difference
+        is friction. No acceleration here, so this model holds the arm up; it
+        does not move it fast.</p>
+      <div class="grid3">
+        <label class="field"><span data-i18n="grav.poses">training poses</span>
+          <input id="grav-poses" type="number" min="4" max="60" step="1" value="24"/>
+        </label>
+        <label class="field"><span data-i18n="grav.check">held-out poses</span>
+          <input id="grav-check" type="number" min="2" max="30" step="1" value="8"/>
+        </label>
+        <label class="field"><span data-i18n="grav.arc">crossing arc (°)</span>
+          <input id="grav-arc" type="number" min="1" max="20" step="0.5" value="5"/>
+        </label>
+      </div>
+      <div class="grid3">
+        <label class="field"><span data-i18n="grav.slow">slow probe (°/s)</span>
+          <input id="grav-slow" type="number" min="0.05" max="20" step="0.1" value="1"/>
+        </label>
+        <label class="field"><span data-i18n="grav.fast">fast probe (°/s)</span>
+          <input id="grav-fast" type="number" min="0.05" max="20" step="0.1" value="3"/>
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-grav-plan" data-i18n="grav.plan">Plan poses</button>
+        <button id="btn-grav-rehearse" data-i18n="grav.rehearse">Rehearse</button>
+        <button id="btn-grav-run" class="danger" disabled
+                data-i18n="grav.run">Run on hardware</button>
+      </div>
+      <p class="hint" id="grav-state"></p>
+      <div class="row">
+        <button id="btn-rescreen" class="small hidden"
+                data-i18n="grav.rescreen">Rebuild the screen</button>
+      </div>
+
+      <h3 data-i18n="inspect.title">Review the planned poses</h3>
+      <p class="hint" data-i18n="inspect.hint">Step through them in the 3D
+        view before anything moves. The selected pose is drawn solid; the
+        margin is the widest clearance it was re-screened against and still
+        passed, so the smallest number is the pose to look at.</p>
+      <div class="row">
+        <button id="pose-prev" class="small" disabled>&#9664;</button>
+        <span id="pose-where" class="muted"></span>
+        <button id="pose-next" class="small" disabled>&#9654;</button>
+        <div class="spacer"></div>
+        <button id="pose-worst" class="small" disabled
+                data-i18n="inspect.worst">tightest</button>
+        <button id="pose-fly" class="small" disabled
+                data-i18n="inspect.fly">fly the tour</button>
+      </div>
+      <p class="hint" id="pose-detail"></p>
+      <table class="kv" id="grav-table"></table>
+    </div>
+  </details>
+
+  <details class="group" id="group-rest">
+    <summary data-i18n="group.rest">Remaining calibration</summary>
+
+    <div class="card">
+      <h2 data-i18n="run.title">Full campaign</h2>
+      <div class="row">
+        <button id="btn-rehearse" data-i18n="run.rehearse">Rehearse</button>
+        <button id="btn-hardware" class="danger" disabled
+                data-i18n="run.hardware">Run on hardware</button>
+      </div>
+      <p class="hint" id="ack-hint"></p>
     </div>
 
     <div class="card">
@@ -201,16 +318,6 @@
           <span data-i18n="sweep.resume">resume the last one</span></label>
       </div>
       <div id="sweep-line" class="muted"></div>
-    </div>
-
-    <div class="card">
-      <h2 data-i18n="conn.title">Connection</h2>
-      <table class="kv" id="conn-table"></table>
-      <p class="hint" id="guards"></p>
-      <div class="row">
-        <button id="btn-profile" class="small"
-                data-i18n="profile.open">Edit envelope</button>
-      </div>
     </div>
 
     <div class="card">
@@ -271,6 +378,7 @@
       <pre id="notes"></pre>
     </div>
 
+  </details>
   </aside>
 </main>
 

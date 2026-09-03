@@ -19,6 +19,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import itertools
 import json
+import threading
 import uuid
 
 import numpy as np
@@ -29,12 +30,37 @@ import pinocchio as pin
 # collision would veto every pose.
 NEIGHBOUR_DEPTH = 1
 
+# How close two shapes may come before the pose is refused. A bare
+# intersection test calls a pose clear when the shapes are touching, and
+# "touching" is what a real arm does a few millimetres later once servo lag,
+# mesh simplification and mounting tolerance are added. Measured on this
+# workspace, the unmargined screen accepted a pose with the right wrist 0.0 mm
+# from the left upper arm and another at 7.1 mm.
+SAFETY_MARGIN_M = 0.02
+
+# Margins a pose is re-screened against so the panel can rank poses by how
+# tight they are. The list is the resolution of that ranking, nothing more.
+CLEARANCE_PROBES_M = (0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.25)
+
 # Written into every saved file. Bump it only when old files stop loading.
-SCHEMA_VERSION = 1
+# Version 2 is the dashboard's whole configuration rather than the scene
+# alone: an older build reading one would take the obstacles and silently drop
+# the planner envelope, which is the setting that keeps poses out of the other
+# arm, so it has to be refused instead.
+SCHEMA_VERSION = 2
 BOX_SHAPE = "box"
 # Extension point: adding a shape means adding it here and to _geometry_for.
 SHAPES = (BOX_SHAPE,)
 MINIMUM_SIZE_M = 1e-4
+
+
+def write_document(path, document: dict) -> None:
+    """Write beside the target and rename, so an interrupted save is a no-op."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    scratch = target.with_suffix(target.suffix + ".partial")
+    scratch.write_text(json.dumps(document, indent=2) + "\n")
+    scratch.replace(target)
 
 
 def _se3(xyz_m, rpy_deg) -> pin.SE3:
@@ -102,10 +128,12 @@ class ObstacleScene:
     """
 
     def __init__(self, model: pin.Model, urdf_text: str = "",
-                 package_dirs: list[str] | None = None) -> None:
+                 package_dirs: list[str] | None = None,
+                 safety_margin_m: float = SAFETY_MARGIN_M) -> None:
         self.model = model
         self.urdf_text = urdf_text
         self.package_dirs = [str(path) for path in (package_dirs or [])]
+        self.safety_margin_m = max(0.0, float(safety_margin_m))
         self._obstacles: dict[str, Obstacle] = {}
         self._robot_geometry: pin.GeometryModel | None = None
         self._robot_geometry_error = ""
@@ -113,6 +141,10 @@ class ObstacleScene:
         self._geometry_data = None
         self._data = model.createData()
         self._obstacle_geom_ids: dict[str, int] = {}
+        # Every query writes into the one GeometryData, and the web surface
+        # answers several requests at once. Without this a margin raised for
+        # one pose is briefly the margin every other thread screens against.
+        self._busy = threading.Lock()
         self._load_robot_geometry()
 
     # -- frames ----------------------------------------------------------
@@ -177,7 +209,7 @@ class ObstacleScene:
     # -- persistence -----------------------------------------------------
 
     def as_document(self) -> dict:
-        """The scene in the form written to disk.
+        """The scene's share of the configuration document.
 
         Versioned and shape-tagged so a file saved by this build survives new
         obstacle kinds, and so a newer file is refused rather than misread.
@@ -196,7 +228,7 @@ class ObstacleScene:
         version = int(payload.get("schema_version", 0))
         if version > SCHEMA_VERSION:
             raise ValueError(
-                f"obstacle file is schema version {version}; this build "
+                f"config file is schema version {version}; this build "
                 f"understands up to {SCHEMA_VERSION}")
         kept, skipped = {}, []
         for entry in payload.get("obstacles") or []:
@@ -211,17 +243,9 @@ class ObstacleScene:
         self._invalidate()
         return skipped
 
-    def save(self, path) -> None:
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Write beside the target and rename, so an interrupted save cannot
-        # leave the operator with a truncated scene.
-        scratch = target.with_suffix(target.suffix + ".partial")
-        scratch.write_text(json.dumps(self.as_document(), indent=2) + "\n")
-        scratch.replace(target)
-
-    def load(self, path) -> list[str]:
-        return self.load_document(json.loads(Path(path).read_text()))
+    # There is deliberately no save() here: the scene is one section of a file
+    # that also carries the planner envelope, and a writer that knows only
+    # about boxes would erase the rest of it on every edit.
 
     def _invalidate(self) -> None:
         self._geometry = None
@@ -253,6 +277,7 @@ class ObstacleScene:
             "enabled_obstacles": sum(1 for item in self._obstacles.values()
                                      if item.enabled),
             "robot_geometry_error": self._robot_geometry_error,
+            "safety_margin_m": self.safety_margin_m,
             # Without link shapes we can still stop the arm driving a box
             # through itself, but not self-collision. Say so plainly.
             "self_collision_checked": robot_shapes > 0,
@@ -283,6 +308,10 @@ class ObstacleScene:
         self._pair(geometry, link_ids)
         self._geometry = geometry
         self._geometry_data = geometry.createData()
+        # A pair counts as touching once it is within the margin, so "clear"
+        # means clear by that much rather than merely not yet intersecting.
+        for request in self._geometry_data.collisionRequests:
+            request.security_margin = self.safety_margin_m
 
     def _pair(self, geometry: pin.GeometryModel, link_ids: list[int]) -> None:
         """Obstacle-vs-link and link-vs-link pairs, minus the trivial ones."""
@@ -337,57 +366,105 @@ class ObstacleScene:
         return angles
 
     def collision_free(self, pose_deg) -> bool:
-        """False when this pose puts any checked pair in contact."""
+        """False when this pose puts any checked pair within the margin."""
+        with self._busy:
+            if self._geometry is None:
+                self._build()
+            if self._geometry.ngeoms == 0 or not self._geometry.collisionPairs:
+                return True
+            hit = pin.computeCollisions(
+                self.model, self._data, self._geometry, self._geometry_data,
+                self._configuration(pose_deg), True)
+            return not hit
+
+    def clearance_rank(self, pose_deg, probes=CLEARANCE_PROBES_M) -> dict:
+        """The widest tested margin this pose clears, and what stops it there.
+
+        A distance would be the obvious answer, but the mesh distance solver on
+        this robot saturates -- every pose in a plan came back at exactly the
+        same number -- whereas the collision test against an inflated margin is
+        exact. So the pose is re-screened at growing margins and the largest it
+        survives is reported.
+
+        The limiting pair is named because without it the number is unreadable:
+        a pair fixed by the arm's own construction bounds every pose at the
+        same value, and the operator needs to see that it is the base against a
+        link rather than anything they could plan away.
+        """
         if self._geometry is None:
             self._build()
         if self._geometry.ngeoms == 0 or not self._geometry.collisionPairs:
-            return True
-        hit = pin.computeCollisions(
-            self.model, self._data, self._geometry, self._geometry_data,
-            self._configuration(pose_deg), True)
-        return not hit
+            return {"margin_m": float(max(probes)), "against": ""}
+        requests = self._geometry_data.collisionRequests
+        angles = self._configuration(pose_deg)
+        best, against = 0.0, ""
+        with self._busy:
+            try:
+                for probe in sorted(float(value) for value in probes):
+                    for request in requests:
+                        request.security_margin = probe
+                    if pin.computeCollisions(self.model, self._data,
+                                             self._geometry,
+                                             self._geometry_data,
+                                             angles, False):
+                        against = self._first_contact()
+                        break
+                    best = probe
+            finally:
+                for request in requests:
+                    request.security_margin = self.safety_margin_m
+        return {"margin_m": best, "against": against}
+
+    def _first_contact(self) -> str:
+        for index, pair in enumerate(self._geometry.collisionPairs):
+            if self._geometry_data.collisionResults[index].isCollision():
+                return (f"{self._geometry.geometryObjects[pair.first].name} | "
+                        f"{self._geometry.geometryObjects[pair.second].name}")
+        return ""
 
     def contacts(self, pose_deg) -> list[dict]:
         """Every colliding pair, named. Used to explain a rejected pose."""
-        if self._geometry is None:
-            self._build()
-        if self._geometry.ngeoms == 0 or not self._geometry.collisionPairs:
-            return []
-        pin.computeCollisions(
-            self.model, self._data, self._geometry, self._geometry_data,
-            self._configuration(pose_deg), False)
-        found = []
-        for index, pair in enumerate(self._geometry.collisionPairs):
-            result = self._geometry_data.collisionResults[index]
-            if not result.isCollision():
-                continue
-            found.append({
-                "first": self._geometry.geometryObjects[pair.first].name,
-                "second": self._geometry.geometryObjects[pair.second].name,
-            })
-        return found
+        with self._busy:
+            if self._geometry is None:
+                self._build()
+            if self._geometry.ngeoms == 0 or not self._geometry.collisionPairs:
+                return []
+            pin.computeCollisions(
+                self.model, self._data, self._geometry, self._geometry_data,
+                self._configuration(pose_deg), False)
+            found = []
+            for index, pair in enumerate(self._geometry.collisionPairs):
+                result = self._geometry_data.collisionResults[index]
+                if not result.isCollision():
+                    continue
+                found.append({
+                    "first": self._geometry.geometryObjects[pair.first].name,
+                    "second": self._geometry.geometryObjects[pair.second].name,
+                })
+            return found
 
     def placements(self, pose_deg) -> list[dict]:
         """World pose of every enabled box, for the 3D view to draw."""
-        if self._geometry is None:
-            self._build()
-        angles = self._configuration(pose_deg)
-        pin.forwardKinematics(self.model, self._data, angles)
-        pin.updateFramePlacements(self.model, self._data)
-        drawn = []
-        for obstacle in self._obstacles.values():
-            if not obstacle.enabled:
-                continue
-            frame_id = self._frame_id(obstacle.parent_frame)
-            world = self._data.oMf[frame_id] * obstacle.placement()
-            drawn.append({
-                "id": obstacle.id,
-                "name": obstacle.name,
-                "parent_frame": obstacle.parent_frame,
-                "size_m": list(obstacle.size_m),
-                "matrix": world.homogeneous.reshape(-1).tolist(),
-            })
-        return drawn
+        with self._busy:
+            if self._geometry is None:
+                self._build()
+            angles = self._configuration(pose_deg)
+            pin.forwardKinematics(self.model, self._data, angles)
+            pin.updateFramePlacements(self.model, self._data)
+            drawn = []
+            for obstacle in self._obstacles.values():
+                if not obstacle.enabled:
+                    continue
+                frame_id = self._frame_id(obstacle.parent_frame)
+                world = self._data.oMf[frame_id] * obstacle.placement()
+                drawn.append({
+                    "id": obstacle.id,
+                    "name": obstacle.name,
+                    "parent_frame": obstacle.parent_frame,
+                    "size_m": list(obstacle.size_m),
+                    "matrix": world.homogeneous.reshape(-1).tolist(),
+                })
+            return drawn
 
 
 def _box(size_m) -> object:

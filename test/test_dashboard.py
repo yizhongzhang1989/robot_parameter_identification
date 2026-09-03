@@ -8,15 +8,19 @@ import unittest
 import urllib.error
 import urllib.request
 
+import numpy as np
+
 try:
     from robot_parameter_identification import identification as ident
     from robot_parameter_identification import campaign as campaign_module
     from robot_parameter_identification.dashboard.http_server import (
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
-        DashboardConfig, IdentificationService, _comparison, _swept_here)
+        DashboardConfig, IdentificationService, _comparison, _swept_here,
+        parse_gravity_terms, GRAVITY_MODE, GRAVITY_REHEARSAL)
     from robot_parameter_identification.interfaces import (
         SignalMap, TelemetrySpec)
+    from robot_parameter_identification.obstacles import SCHEMA_VERSION
     from fixtures import synthetic_urdf, test_profile, PREFIX
 except ImportError as error:
     raise unittest.SkipTest(f"needs pinocchio: {error}") from error
@@ -92,12 +96,12 @@ class ObstacleApiTest(unittest.TestCase):
         self.assertFalse(blank.collision_report([0.0])["available"])
 
 
-class ObstacleSaveTest(unittest.TestCase):
-    """Naming the scene, so each arm can keep its own."""
+class ConfigSaveTest(unittest.TestCase):
+    """Naming the configuration, so each cell can keep its own."""
 
     def saving_service(self, directory, launched=""):
         made = IdentificationService(DashboardConfig(
-            output_directory=directory, obstacle_path=launched))
+            output_directory=directory, config_file_path=launched))
         made.adopt_description(synthetic_urdf())
         return made
 
@@ -105,11 +109,11 @@ class ObstacleSaveTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             made = self.saving_service(directory)
             made.add_obstacle({"parent_frame": f"{PREFIX}base_link"})
-            written = made.save_obstacles("left_arm_cell.json")
+            written = made.save_config("left_arm_cell.json")
             self.assertTrue(written["ok"])
             self.assertEqual(Path(written["path"]).name, "left_arm_cell.json")
             again = json.loads(Path(written["path"]).read_text())
-            self.assertEqual(again["schema_version"], 1)
+            self.assertEqual(again["schema_version"], SCHEMA_VERSION)
             self.assertEqual(len(again["obstacles"]), 1)
 
     def test_a_save_lands_beside_the_results_and_nowhere_else(self):
@@ -119,19 +123,19 @@ class ObstacleSaveTest(unittest.TestCase):
             made = self.saving_service(directory)
             for attempt in ("../escape.json", "/etc/passwd", "sub/dir.json",
                             "no_suffix", "scene.yaml"):
-                answer = made.save_obstacles(attempt)
+                answer = made.save_config(attempt)
                 self.assertFalse(answer["ok"], attempt)
                 self.assertIn(".json", answer["message"])
             self.assertFalse((Path(directory) / ".." / "escape.json").exists())
 
     def test_no_name_keeps_the_file_the_launch_named(self):
         made = self.saving_service("results", launched="/tmp/given.json")
-        self.assertEqual(str(made._obstacle_save_target()), "/tmp/given.json")
+        self.assertEqual(str(made._config_save_target()), "/tmp/given.json")
 
     def test_without_a_launch_file_it_still_has_somewhere_to_go(self):
         made = self.saving_service("results")
-        self.assertEqual(Path(made._obstacle_save_target()).name,
-                         "obstacles.json")
+        self.assertEqual(Path(made._config_save_target()).name,
+                         "dashboard_config.json")
 
     def test_a_file_that_does_not_exist_yet_is_still_the_target(self):
         # Naming a scene the first time is how a scene gets started; refusing
@@ -139,8 +143,8 @@ class ObstacleSaveTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "cell" / "scene.json"
             made = self.saving_service(directory, launched=str(target))
-            self.assertEqual(made._obstacle_save_target(), target)
-            self.assertEqual(made.snapshot()["obstacle_autosave"], str(target))
+            self.assertEqual(made._config_save_target(), target)
+            self.assertEqual(made.snapshot()["config_autosave"], str(target))
             made.add_obstacle({"parent_frame": f"{PREFIX}base_link"})
             self.assertTrue(target.exists())
             self.assertEqual(
@@ -150,8 +154,7 @@ class ObstacleSaveTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             made = self.saving_service(directory)
             routes = build_routes(made, None)
-            answer = routes["/api/obstacles"][1](
-                {"action": "save", "name": "cell.json"})
+            answer = routes["/api/config/save"][1]({"name": "cell.json"})
             self.assertTrue(answer["ok"])
             self.assertTrue(Path(answer["path"]).exists())
 
@@ -205,7 +208,7 @@ class RunGateTest(unittest.TestCase):
             def run(self):
                 return campaign_module.CampaignResult()
 
-        made._build_plant = lambda _mode: object()
+        made._build_plant = lambda _mode, _plan=None: object()
         made._finish = lambda *_args: None
         with mock.patch.object(campaign_module, "Campaign", Run):
             made._run("rehearsal")
@@ -358,7 +361,7 @@ class OptimalComparisonTest(unittest.TestCase):
                 return campaign_module.CampaignResult(
                     validation_rms_a=[0.1] * made.arm.joint_count)
 
-        made._build_plant = lambda _mode: object()
+        made._build_plant = lambda _mode, _plan=None: object()
         made._compare_with_load_sweep = lambda _result, _rows: {
             "available": False, "reason": "test"}
         made._finish = lambda mode, result, *_args: captured.update(
@@ -706,6 +709,405 @@ class ViewerStateTest(unittest.TestCase):
         self.assertEqual(len(payload["obstacles"]), 1)
 
 
+class GravityTermsTest(unittest.TestCase):
+    """The two URDF numbers gravity is made of, on their way to the canvas."""
+
+    def gravity(self) -> dict:
+        return service().viewer_state()["gravity"]
+
+    def test_every_link_that_has_mass_carries_a_term(self):
+        self.assertEqual(
+            [item["link"] for item in self.gravity()["links"]],
+            [f"{PREFIX}link{index}" for index in range(1, 8)])
+
+    def test_the_mass_and_the_lever_are_the_files_own_numbers(self):
+        first = self.gravity()["links"][0]
+        self.assertAlmostEqual(first["mass_kg"], 2.78, places=3)
+        self.assertEqual(first["com_m"], [0.01, 0.004, 0.09])
+
+    def test_the_total_is_the_sum_of_the_terms(self):
+        payload = self.gravity()
+        self.assertAlmostEqual(
+            payload["total_mass_kg"],
+            sum(item["mass_kg"] for item in payload["links"]))
+
+    def test_every_term_names_a_frame_the_canvas_can_place(self):
+        payload = service().viewer_state()
+        for item in payload["gravity"]["links"]:
+            self.assertIn(item["link"], payload["link_tf"])
+
+    def test_a_link_with_no_mass_has_no_term(self):
+        # The fixture's base_link carries no <inertial> at all.
+        self.assertNotIn(f"{PREFIX}base_link",
+                         [item["link"] for item in self.gravity()["links"]])
+        self.assertEqual(parse_gravity_terms(
+            '<robot name="r"><link name="a"><inertial>'
+            '<mass value="0"/></inertial></link></robot>'), [])
+
+    def test_a_missing_origin_puts_the_mass_on_the_link_frame(self):
+        [term] = parse_gravity_terms(
+            '<robot name="r"><link name="a"><inertial>'
+            '<mass value="1.5"/></inertial></link></robot>')
+        self.assertEqual(term["com_m"], [0.0, 0.0, 0.0])
+
+    def test_a_description_that_does_not_parse_is_not_fatal(self):
+        self.assertEqual(parse_gravity_terms("<robot>"), [])
+
+
+class GravityModeTest(unittest.TestCase):
+    """Gravity on its own: armed by its own dry run, and only for its numbers."""
+
+    # Above 2*joints+3, or joint 1's gravity columns are underdetermined and
+    # the holdout gate refuses the run however well friction came back.
+    OPTIONS = {"static_poses": 24, "gravity_validation_poses": 6,
+               "gravity_probe_deg": 4.0}
+
+    def rehearsed(self, directory, options=None):
+        made = IdentificationService(
+            DashboardConfig(output_directory=directory), profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        made._options = dict(options or self.OPTIONS)
+        made._run(GRAVITY_REHEARSAL)
+        return made
+
+    def test_the_arm_may_not_move_before_a_gravity_dry_run(self):
+        answer = service().start(GRAVITY_MODE, self.OPTIONS)
+        self.assertFalse(answer["ok"])
+        self.assertIn("rehearse", answer["message"])
+
+    def test_a_dry_run_that_recovers_what_it_planted_arms_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.rehearsed(directory)
+            self.assertTrue(made.result["rehearsal_check"]["passed"],
+                            made.result["rehearsal_check"])
+            self.assertTrue(made.gravity_armed)
+            self.assertTrue(made.snapshot()["gravity_armed"])
+
+    def test_retuning_after_a_dry_run_disarms_until_it_is_repeated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.rehearsed(directory)
+            answer = made.start(GRAVITY_MODE,
+                                dict(self.OPTIONS, static_poses=25))
+            self.assertFalse(answer["ok"])
+            self.assertIn("changed", answer["message"])
+            # The same numbers are still armed, so re-tuning is reversible.
+            self.assertEqual(
+                made.gravity_armed,
+                made._gravity_signature(made._gravity_plan(self.OPTIONS)))
+
+    def test_the_dry_run_only_measures_gravity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.rehearsed(directory)
+            phases = [entry["phase"] for entry in made.result["phases"]]
+            self.assertEqual(phases, ["A_gravity", "D_validation"])
+
+    def test_recovering_the_friction_alone_does_not_arm_the_run(self):
+        """Too few poses leaves gravity underdetermined and Coulomb exact.
+
+        The crossing pair separates the two, so the friction gate on its own
+        armed a model whose worst joint was three hundred times the noise.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            made = self.rehearsed(directory, {"static_poses": 4,
+                                              "gravity_validation_poses": 3})
+            check = made.result["rehearsal_check"]
+            self.assertLessEqual(check["worst_coulomb_error"],
+                                 check["tolerance"])
+            self.assertFalse(check["holdout_passed"])
+            self.assertFalse(check["passed"])
+            self.assertFalse(made.gravity_armed)
+
+    def test_two_probe_speeds_are_planned_by_default(self):
+        speeds = service()._gravity_plan({}).gravity_probe_speeds_deg_s
+        self.assertEqual(len(speeds), 2)
+        self.assertEqual(list(speeds), sorted(speeds))
+
+    def test_a_probe_speed_above_the_envelope_is_clamped(self):
+        plan = service()._gravity_plan(
+            {"gravity_probe_speeds_deg_s": [0.5, 1e6]})
+        self.assertLessEqual(max(plan.gravity_probe_speeds_deg_s),
+                             plan.maximum_speed_deg_s)
+
+    def test_too_few_poses_is_said_out_loud(self):
+        made = service()
+        least = made.gravity_defaults()["minimum_poses"]
+        self.assertEqual(least, 2 * made.arm.joint_count + 3)
+        made._gravity_plan({"static_poses": least - 1})
+        self.assertTrue(any("cannot identify joint 1" in note
+                            for note in made.notes))
+        before = len(made.notes)
+        made._gravity_plan({"static_poses": least})
+        self.assertEqual(len(made.notes), before)
+
+
+class PlanPreviewTest(unittest.TestCase):
+    """The poses a run designed, as skeletons the canvas can draw."""
+
+    def test_nothing_is_previewed_before_a_run(self):
+        self.assertFalse(service().preview_payload()["available"])
+
+    def test_a_dry_run_publishes_a_skeleton_for_every_planned_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = GravityModeTest().rehearsed(directory)
+            preview = made.preview_payload()
+            self.assertTrue(preview["available"])
+            self.assertEqual([group["phase"] for group in preview["groups"]],
+                             ["A_gravity", "D_validation"])
+            first = preview["groups"][0]["poses"][0]
+            self.assertEqual(len(first["pose_deg"]), made.arm.joint_count)
+            # One point per joint origin, plus the model's last frame.
+            self.assertEqual(len(first["points"]), made.arm.joint_count + 1)
+            self.assertTrue(all(len(point) == 3 for point in first["points"]))
+
+    def test_the_token_changes_so_the_canvas_knows_to_refetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = GravityModeTest().rehearsed(directory)
+            first = made.viewer_state()["preview_token"]
+            made._options = dict(GravityModeTest.OPTIONS, static_poses=25)
+            made._run(GRAVITY_REHEARSAL)
+            self.assertGreater(made.viewer_state()["preview_token"], first)
+
+
+class PlannerEnvelopeTest(unittest.TestCase):
+    """The one setting that decides whether a pose can reach the other arm."""
+
+    def test_unset_means_the_arm_s_own_range(self):
+        made = service()
+        space = made.workspace_payload()
+        self.assertEqual(space["range_deg"], [])
+        self.assertEqual(space["urdf_range_deg"], made.urdf_range_deg())
+
+    def test_setting_it_narrows_what_the_planner_may_reach(self):
+        made = service()
+        before = max(made.jog_limits_deg())
+        made.set_workspace_limit([30.0])
+        after = made.jog_range_deg()
+        self.assertLess(max(pair[1] for pair in after), before)
+        self.assertTrue(all(-30.0 <= low and high <= 30.0
+                            for low, high in after))
+
+    def test_the_two_bounds_are_independent(self):
+        """A cell is not symmetric; one +/- number cannot describe it."""
+        made = service()
+        made.set_workspace_range([[-20.0, 80.0]])
+        self.assertTrue(all(pair == [-20.0, 80.0]
+                            for pair in made.jog_range_deg()))
+        self.assertEqual(made.plan.workspace_range_deg,
+                         ((-20.0, 80.0),) * made.arm.joint_count)
+
+    def test_a_designed_pose_respects_an_asymmetric_bound(self):
+        made = service()
+        made.set_workspace_range([[-10.0, 70.0]])
+        made.plan_preview(GRAVITY_MODE, {"static_poses": 8,
+                                         "gravity_validation_poses": 3})
+        for group in made.preview_payload()["groups"]:
+            for pose in group["poses"]:
+                for angle in pose["pose_deg"]:
+                    self.assertGreaterEqual(angle, -10.0)
+                    self.assertLessEqual(angle, 70.0)
+
+    def test_jogging_is_clamped_to_the_asymmetric_bound(self):
+        made = service()
+        made.set_workspace_range([[-10.0, 70.0]])
+        clamped = made._screened_pose([-90.0] * made.arm.joint_count)
+        self.assertTrue(all(value >= -10.0 for value in clamped))
+        clamped = made._screened_pose([90.0] * made.arm.joint_count)
+        self.assertTrue(all(value <= 70.0 for value in clamped))
+
+    def test_one_range_covers_every_joint(self):
+        made = service()
+        made.set_workspace_range([[-45.0, 45.0]])
+        self.assertEqual(len(made.config.workspace_range_deg),
+                         made.arm.joint_count)
+
+    def test_it_cannot_exceed_the_urdf(self):
+        made = service()
+        made.set_workspace_range([[-1e4, 1e4]])
+        self.assertEqual([list(pair) for pair in made.config.workspace_range_deg],
+                         made.urdf_range_deg())
+
+    def test_empty_resets_to_the_arm_s_range(self):
+        made = service()
+        made.set_workspace_range([[-30.0, 30.0]])
+        made.set_workspace_range([])
+        self.assertEqual(made.workspace_payload()["range_deg"], [])
+
+    def test_a_bad_range_is_answered_not_raised(self):
+        made = service()
+        self.assertFalse(made.set_workspace_range([[0.0, 1.0], [0.0, 1.0]])["ok"])
+        self.assertFalse(made.set_workspace_range([[50.0, 10.0]])["ok"])
+        self.assertFalse(made.set_workspace_range([[float("nan"), 10.0]])["ok"])
+        self.assertFalse(made.set_workspace_range([["low", "high"]])["ok"])
+        self.assertFalse(made.set_workspace_limit([-5.0])["ok"])
+
+    def test_changing_it_disarms_whatever_was_rehearsed(self):
+        made = service()
+        made.rehearsal_passed = True
+        made.gravity_armed = "something"
+        made.set_workspace_range([[-60.0, 60.0]])
+        self.assertFalse(made.rehearsal_passed)
+        self.assertFalse(made.gravity_armed)
+
+
+class StoredSettingsTest(unittest.TestCase):
+    """One file, and everything the panel edits comes back out of it."""
+
+    def cell(self, directory):
+        made = IdentificationService(
+            DashboardConfig(output_directory=directory,
+                            config_file_path=str(Path(directory) / "cell.json")),
+            profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        return made
+
+    def test_the_planner_envelope_survives_a_restart(self):
+        # The envelope describes the cell, not the arm, so nothing else can
+        # reconstruct it and retyping it is how a pose reaches the other arm.
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.cell(directory)
+            first.set_workspace_range([[-20.0, 80.0]])
+            again = self.cell(directory)
+            self.assertEqual(
+                [list(pair) for pair in again.config.workspace_range_deg],
+                [[-20.0, 80.0]] * again.arm.joint_count)
+            self.assertEqual(again.plan.workspace_range_deg,
+                             ((-20.0, 80.0),) * again.arm.joint_count)
+
+    def test_the_gravity_card_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.cell(directory)
+            first.plan_preview(GRAVITY_MODE, {"static_poses": 21,
+                                              "gravity_validation_poses": 5,
+                                              "gravity_probe_deg": 4.0})
+            again = self.cell(directory)
+            defaults = again.gravity_defaults()
+            self.assertEqual(defaults["static_poses"], 21)
+            self.assertEqual(defaults["gravity_validation_poses"], 5)
+            self.assertEqual(defaults["gravity_probe_deg"], 4.0)
+
+    def test_one_edit_does_not_erase_the_others(self):
+        # The whole point of one file: a writer that knows only about boxes
+        # would blank the envelope on the next drag of a box.
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.cell(directory)
+            first.set_workspace_range([[-15.0, 45.0]])
+            first.plan_preview(GRAVITY_MODE, {"static_poses": 19})
+            first.add_obstacle({"parent_frame": f"{PREFIX}base_link"})
+            document = json.loads((Path(directory) / "cell.json").read_text())
+            self.assertEqual(len(document["obstacles"]), 1)
+            self.assertEqual(document["workspace_range_deg"][0], [-15.0, 45.0])
+            self.assertEqual(document["gravity"]["static_poses"], 19)
+
+    def test_a_reset_envelope_is_stored_as_a_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.cell(directory)
+            first.set_workspace_range([[-15.0, 45.0]])
+            first.set_workspace_range([])
+            self.assertEqual(self.cell(directory).config.workspace_range_deg, ())
+
+    def test_a_malformed_envelope_is_dropped_whole(self):
+        # Half an envelope is a cell the arm may leave on the joints that
+        # went missing, which is worse than no envelope at all.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cell.json"
+            path.write_text(json.dumps(
+                {"schema_version": SCHEMA_VERSION,
+                 "workspace_range_deg": [[-10.0, 10.0], [40.0, 5.0]]}))
+            made = self.cell(directory)
+            self.assertEqual(made.config.workspace_range_deg, ())
+            self.assertTrue(any("envelope ignored" in note
+                                for note in made.notes))
+
+    def test_a_newer_file_is_refused_rather_than_half_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cell.json"
+            path.write_text(json.dumps(
+                {"schema_version": SCHEMA_VERSION + 1,
+                 "workspace_range_deg": [[-10.0, 10.0]],
+                 "obstacles": []}))
+            made = self.cell(directory)
+            self.assertEqual(made.config.workspace_range_deg, ())
+            self.assertTrue(any("schema version" in note
+                                for note in made.notes))
+
+    def test_without_a_file_the_panel_says_so_rather_than_pretending(self):
+        made = IdentificationService(DashboardConfig(), profile=test_profile())
+        self.assertTrue(any("config_file_path was not set" in note
+                            for note in made.notes))
+        self.assertEqual(made.snapshot()["config_autosave"], "")
+
+    def test_an_envelope_from_another_arm_is_dropped_not_stretched(self):
+        # The same file may be carried between robots, and a bound list of the
+        # wrong length would surface as a broadcast error mid-design.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cell.json"
+            path.write_text(json.dumps(
+                {"schema_version": SCHEMA_VERSION,
+                 "workspace_range_deg": [[-10.0, 10.0], [-10.0, 10.0]]}))
+            made = self.cell(directory)
+            self.assertEqual(made.config.workspace_range_deg, ())
+            self.assertEqual(made.plan.workspace_range_deg, ())
+            self.assertTrue(any("envelope ignored" in note
+                                for note in made.notes))
+
+
+class PlanOnlyTest(unittest.TestCase):
+    """Design the poses so a human can look before the arm moves."""
+
+    def test_planning_publishes_poses_without_running_anything(self):
+        made = service()
+        answer = made.plan_preview(GRAVITY_MODE, {"static_poses": 6,
+                                                  "gravity_validation_poses": 3})
+        self.assertTrue(answer["ok"])
+        self.assertIsNone(made.result)
+        self.assertEqual(made.progress, {"phase": "idle"})
+        groups = answer["preview"]["groups"]
+        self.assertEqual([g["phase"] for g in groups],
+                         ["A_gravity", "D_validation"])
+        self.assertEqual(len(groups[0]["poses"]), 6)
+
+    def test_every_planned_pose_carries_how_tight_it_is(self):
+        made = service()
+        made.plan_preview(GRAVITY_MODE, {"static_poses": 5,
+                                         "gravity_validation_poses": 2})
+        for group in made.preview_payload()["groups"]:
+            for pose in group["poses"]:
+                clearance = pose["clearance"]
+                self.assertGreaterEqual(clearance["margin_m"], 0.0)
+                # Naming what limits it is what makes the number readable.
+                self.assertIn("against", clearance)
+
+    def test_the_envelope_bounds_the_poses_it_designs(self):
+        made = service()
+        made.set_workspace_limit([25.0])
+        made.plan_preview(GRAVITY_MODE, {"static_poses": 6,
+                                         "gravity_validation_poses": 2})
+        for group in made.preview_payload()["groups"]:
+            for pose in group["poses"]:
+                self.assertLessEqual(max(abs(v) for v in pose["pose_deg"]), 25.0)
+    def test_only_the_gravity_mode_can_be_previewed(self):
+        self.assertFalse(service().plan_preview("optimal_excitation")["ok"])
+
+    def test_planning_says_when_the_screen_has_stopped_matching(self):
+        """The poses are screened against where the rest of the robot was.
+
+        Planning is harmless so it is not refused, but reviewing poses that
+        were screened against a robot that is not standing there is worse than
+        useless, and the run gate is the wrong place to find that out.
+        """
+        made = ScreenDriftTest().build({"other_arm_joint1": math.radians(45.0)})
+        made.bridge.move({"other_arm_joint1": math.radians(80.0)})
+        answer = made.plan_preview(GRAVITY_MODE, {"static_poses": 5,
+                                                  "gravity_validation_poses": 2})
+        self.assertTrue(answer["ok"])
+        self.assertEqual([item["joint"] for item in answer["astray"]],
+                         ["other_arm_joint1"])
+        self.assertTrue(any("other_arm_joint1 moved" in note
+                            for note in made.notes))
+        self.assertEqual([item["joint"] for item in made.snapshot()["astray"]],
+                         ["other_arm_joint1"])
+
+
 class TwoArmViewTest(unittest.TestCase):
     """This dashboard drives one arm and draws the whole robot.
 
@@ -759,40 +1161,214 @@ class TwoArmViewTest(unittest.TestCase):
         self.assertTrue(made.viewer_state()["have_model"])
 
 
-class ElsewhereGateTest(unittest.TestCase):
-    """The collision screen pins every joint it does not drive at neutral."""
+class ScreenDriftTest(unittest.TestCase):
+    """The screen holds the joints it cannot drive where it last saw them."""
 
     class Bridge(TwoArmViewTest.Bridge):
-        pass
+        def move(self, elsewhere):
+            self._elsewhere = elsewhere
 
     def build(self, elsewhere):
         made = IdentificationService(DashboardConfig(),
                                      bridge=self.Bridge(elsewhere),
                                      profile=test_profile())
         made.adopt_description(synthetic_urdf())
+        # What the node does, and what makes "a joint this dashboard does not
+        # drive" mean anything at all.
+        made.adopt_driven_joints([f"{PREFIX}joint{index}"
+                                  for index in range(1, 8)])
         made.rehearsal_passed = True
         return made
 
-    def test_driving_is_refused_when_another_joint_is_off_neutral(self):
+    def test_the_screen_is_built_where_the_other_arm_actually_is(self):
+        # The whole point: a cell whose zero configuration is in collision
+        # cannot be asked to go there first, so the screen goes to the arm.
         made = self.build({"other_arm_joint2": math.radians(60.0)})
+        self.assertEqual(made.screen_drift(), [])
+        self.assertAlmostEqual(made.screen_reference["other_arm_joint2"],
+                               math.radians(60.0), places=9)
+
+    def test_driving_is_refused_once_that_arm_moves_under_the_screen(self):
+        made = self.build({"other_arm_joint2": math.radians(60.0)})
+        made.bridge.move({"other_arm_joint2": math.radians(90.0)})
         answer = made.start("load_sweep")
         self.assertFalse(answer["ok"])
         self.assertIn("other_arm_joint2", answer["message"])
-        self.assertIn("neutral", answer["message"])
+        self.assertIn("moved", answer["message"])
 
     def test_a_joint_this_dashboard_drives_does_not_trip_the_gate(self):
-        made = self.build({f"{PREFIX}joint1": math.radians(60.0)})
-        self.assertEqual(made.elsewhere_off_neutral(), [])
+        made = self.build({})
+        made.bridge.move({f"{PREFIX}joint1": math.radians(60.0)})
+        self.assertEqual(made.screen_drift(), [])
 
-    def test_small_offsets_are_tolerated(self):
-        made = self.build({"other_arm_joint2": math.radians(0.4)})
-        self.assertEqual(made.elsewhere_off_neutral(), [])
+    def test_small_movements_are_tolerated(self):
+        made = self.build({"other_arm_joint2": math.radians(60.0)})
+        made.bridge.move({"other_arm_joint2": math.radians(61.0)})
+        self.assertEqual(made.screen_drift(), [])
 
     def test_the_rehearsal_is_not_gated_on_the_other_arm(self):
         # It moves nothing, so where the other arm stands cannot matter.
         made = self.build({"other_arm_joint2": math.radians(60.0)})
+        made.bridge.move({"other_arm_joint2": math.radians(90.0)})
         self.assertTrue(made.start("rehearsal")["ok"])
         made.stop()
+
+    def test_rebuilding_the_screen_clears_the_drift_and_the_arming(self):
+        made = self.build({"other_arm_joint2": math.radians(60.0)})
+        made.gravity_armed = "something"
+        made.bridge.move({"other_arm_joint2": math.radians(90.0)})
+        self.assertTrue(made.screen_drift())
+        answer = made.rescreen()
+        self.assertTrue(answer["ok"])
+        self.assertEqual(made.screen_drift(), [])
+        # The poses that were cleared were cleared against the old placement.
+        self.assertFalse(made.gravity_armed)
+        self.assertFalse(made.rehearsal_passed)
+
+    def test_rebuilding_is_reachable_over_http(self):
+        made = self.build({"other_arm_joint2": math.radians(60.0)})
+        made.bridge.move({"other_arm_joint2": math.radians(90.0)})
+        self.assertTrue(build_routes(made, None)["/api/rescreen"][1]({})["ok"])
+
+
+class StandingStartTest(unittest.TestCase):
+    """A tour is designed from where the arm is, not from where zero is."""
+
+    class Bridge(TwoArmViewTest.Bridge):
+        def __init__(self, pose):
+            super().__init__({})
+            self.pose = list(pose)
+            self.opened_with = None
+
+        def latest_sample(self):
+            return {"position_deg": list(self.pose)}
+
+        def hardware_plant(self, profile, scene, **kwargs):
+            self.opened_with = kwargs
+            raise AssertionError("no motion in this test")
+
+    def build(self, pose):
+        made = IdentificationService(DashboardConfig(),
+                                     bridge=self.Bridge(pose),
+                                     profile=test_profile())
+        made.adopt_description(synthetic_urdf())
+        return made
+
+    def test_the_plan_carries_where_the_arm_is_standing(self):
+        made = self.build([12.0, -40.2, 0.0, 0.0, 0.0, 0.0, 0.0])
+        plan = made._gravity_plan({})
+        self.assertEqual(plan.start_deg[0], 12.0)
+        self.assertEqual(plan.start_deg[1], -40.0)
+
+    def test_a_held_pose_reads_the_same_twice(self):
+        # Encoder noise below the quantum must not expire an arming.
+        made = self.build([0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        first = made._gravity_signature(made._gravity_plan({}))
+        made.bridge.pose[0] = -0.03
+        self.assertEqual(first, made._gravity_signature(made._gravity_plan({})))
+
+    def test_moving_the_arm_expires_the_arming(self):
+        made = self.build([0.0] * 7)
+        made.gravity_armed = made._gravity_signature(made._gravity_plan({}))
+        made.bridge.pose[1] = -40.0
+        answer = made.start(GRAVITY_MODE, {})
+        self.assertFalse(answer["ok"])
+        self.assertIn("changed", answer["message"])
+
+    def test_the_tour_starts_where_the_arm_is(self):
+        made = self.build([0.0, -40.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        plan = made._gravity_plan({})
+        campaign = campaign_module.GravityCampaign(
+            made.arm, made._build_plant(GRAVITY_REHEARSAL, plan), plan)
+        self.assertTrue(np.allclose(campaign._standing(), plan.start_deg))
+
+
+class FlownTourTest(unittest.TestCase):
+    """The canvas animates a plan from the model that screened it."""
+
+    def setUp(self):
+        self.made = service()
+        self.count = self.made.arm.joint_count
+
+    def ask(self, **payload):
+        return self.made.kinematics(payload)
+
+    def test_a_transit_is_sampled_along_the_straight_joint_space_line(self):
+        answer = self.ask(from_deg=[0.0] * self.count,
+                          to_deg=[20.0] * self.count, steps=4)
+        self.assertTrue(answer["ok"])
+        self.assertEqual(len(answer["frames"]), 5)
+
+    def test_only_the_driven_arm_s_frames_are_sent(self):
+        # The rest of the robot is already drawn where it is; a second copy of
+        # it in the flier's colour is clutter, and it is most of the payload.
+        answer = self.ask(from_deg=[0.0] * self.count,
+                          to_deg=[20.0] * self.count, steps=2)
+        sent = set(answer["frames"][0])
+        every = set(self.made.arm.link_transforms([0.0] * self.count))
+        self.assertTrue(sent)
+        self.assertLess(len(sent), len(every))
+        self.assertNotIn("universe", sent)
+
+    def test_the_ends_are_the_two_poses_themselves(self):
+        end = [10.0] * self.count
+        answer = self.ask(from_deg=[0.0] * self.count, to_deg=end, steps=3)
+        exact = self.made.arm.link_transforms(end)
+        for name, flat in answer["frames"][-1].items():
+            self.assertTrue(np.allclose(flat, exact[name]), name)
+
+    def test_one_pose_needs_no_start(self):
+        answer = self.ask(to_deg=[5.0] * self.count)
+        self.assertTrue(answer["ok"])
+        self.assertEqual(len(answer["frames"]), 2)
+
+    def test_a_bad_request_is_answered_not_raised(self):
+        self.assertFalse(self.ask()["ok"])
+        self.assertFalse(self.ask(to_deg=[0.0])["ok"])
+        self.assertFalse(self.ask(to_deg="everywhere")["ok"])
+        self.assertFalse(
+            self.ask(to_deg=[float("nan")] * self.count)["ok"])
+
+    def test_the_step_count_is_capped(self):
+        # The web surface listens on every interface; an unbounded step count
+        # is an unbounded amount of work per request.
+        answer = self.ask(from_deg=[0.0] * self.count,
+                          to_deg=[1.0] * self.count, steps=10_000)
+        self.assertLessEqual(len(answer["frames"]), 61)
+
+    def test_it_is_reachable_over_http(self):
+        routes = build_routes(self.made, None)
+        answer = routes["/api/kinematics"][1]({"to_deg": [0.0] * self.count})
+        self.assertTrue(answer["ok"])
+
+    def test_it_is_honest_without_a_model(self):
+        blank = IdentificationService(DashboardConfig())
+        self.assertFalse(blank.kinematics({"to_deg": [0.0]})["ok"])
+
+    def test_a_run_publishes_its_poses_before_it_visits_them(self):
+        # A run designs its own poses, so without this the canvas has nothing
+        # to fly until the run is over -- which is when watching it stops
+        # being useful.
+        made = service()
+        made._activity = GRAVITY_REHEARSAL
+        made._on_progress(campaign_module.PHASE_GRAVITY,
+                          {"designed": [[0.0] * made.arm.joint_count,
+                                        [10.0] * made.arm.joint_count]})
+        groups = made.preview_payload()["groups"]
+        self.assertEqual(len(groups[0]["poses"]), 2)
+        # The big list is drawn, not carried in every poll of the snapshot.
+        self.assertNotIn("designed", made.progress)
+
+    def test_a_later_phase_adds_to_the_tour_rather_than_replacing_it(self):
+        made = service()
+        made._activity = GRAVITY_REHEARSAL
+        made._on_progress(campaign_module.PHASE_GRAVITY,
+                          {"designed": [[0.0] * made.arm.joint_count]})
+        made._on_progress(campaign_module.PHASE_VALIDATION,
+                          {"designed": [[5.0] * made.arm.joint_count]})
+        phases = [group["phase"] for group in made.preview_payload()["groups"]]
+        self.assertEqual(phases, [campaign_module.PHASE_GRAVITY,
+                                  campaign_module.PHASE_VALIDATION])
 
 
 class RehearsalEndToEndTest(unittest.TestCase):
@@ -1003,8 +1579,8 @@ class SalvageTest(unittest.TestCase):
     def _dying(self, service):
         original = service._build_plant
 
-        def build(mode):
-            plant = original(mode)
+        def build(mode, plan=None):
+            plant = original(mode, plan)
 
             def traverse(*_args, **_kwargs):
                 raise RuntimeError("the driver went away")

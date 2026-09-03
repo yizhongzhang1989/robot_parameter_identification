@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ElementTree
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from .. import report as report_module
 from ..interfaces import CommandSpec, TelemetrySpec
 from ..loadsweep_run import LoadSweepRun
 from ..model import ModelComponents
+from .. import obstacles as obstacles_module
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
 
@@ -35,7 +37,18 @@ IDLE, RUNNING, JOGGING = "idle", "running", "jogging"
 # and guarded exactly as a hand-written file is.
 EDITED_SOURCE = "<edited in the dashboard>"
 PROFILE_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.yaml")
-OBSTACLE_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.json")
+CONFIG_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.json")
+DEFAULT_CONFIG_FILE = "dashboard_config.json"
+# How far a joint this dashboard does not drive may move away from where the
+# screen was built around it before every pose it cleared is suspect. Small,
+# because it is a distance at the wrist that matters and leverage is long.
+SCREEN_DRIFT_DEG = 2.0
+# The starting pose is rounded to this before it enters a design or an arming
+# signature, so a servo holding still reads the same number twice.
+STANDING_QUANTUM_DEG = 0.5
+# Sample points the canvas may ask for along one transit. A ceiling because
+# the request comes off a web surface listening on every interface.
+MAXIMUM_ANIMATION_STEPS = 60
 # A ceiling nobody supplied is infinite, and JSON has no way to say so.
 UNBOUNDED_LIMITS = ("continuous_current_a", "peak_current_a")
 
@@ -62,6 +75,50 @@ def _with_infinities(payload: dict) -> dict:
                            for entry in values]
     document["limits"] = limits
     return document
+
+
+def parse_gravity_terms(urdf_text: str) -> list[dict]:
+    """Each link's mass and where that mass sits, from the URDF's <inertial>.
+
+    Those two are the whole of gravity. A static balance uses the mass and the
+    lever and nothing else in the block, so the rotation tensor is left out
+    rather than shown as though it carried a gravity term, and ``origin rpy``
+    goes with it: it turns the tensor, not the centre of mass. A link with no
+    mass has no term at all and is dropped rather than drawn at zero.
+
+    Each entry names the link frame, which is a frame the viewer already has a
+    world pose for, so a marker lands wherever forward kinematics puts it.
+    """
+    try:
+        root = ElementTree.fromstring(urdf_text or "")
+    except ElementTree.ParseError:
+        return []
+    terms = []
+    for link in root.findall("link"):
+        inertial = link.find("inertial")
+        if inertial is None:
+            continue
+        mass = inertial.find("mass")
+        try:
+            kilograms = float(mass.get("value")) if mass is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(kilograms) or kilograms <= 0.0:
+            continue
+        terms.append({"link": link.get("name", ""),
+                      "mass_kg": kilograms,
+                      "com_m": _origin_xyz(inertial.find("origin"))})
+    return terms
+
+
+def _origin_xyz(origin) -> list[float]:
+    if origin is None or not origin.get("xyz"):
+        return [0.0, 0.0, 0.0]
+    try:
+        values = [float(part) for part in origin.get("xyz").split()]
+    except ValueError:
+        return [0.0, 0.0, 0.0]
+    return values if len(values) == 3 else [0.0, 0.0, 0.0]
 
 
 def _swept_here(record, joint: int) -> bool:
@@ -112,6 +169,14 @@ STILL_SPEED_DEG_S = 0.01
 # completes proves the code executes, not that it computes.
 REHEARSAL_NOISE = 0.002
 REHEARSAL_TOLERANCE = 0.02
+# What a gravity dry run's held-out error may be before its answer is refused.
+# Recovering the planted friction is not enough on its own: the bidirectional
+# pairing separates friction from gravity, so a joint whose gravity columns are
+# underdetermined still returns its Coulomb term exactly. Measured on this arm,
+# fourteen poses gave joint 1 a held-out error of 0.667 A while its Coulomb
+# error was 0.003 -- the friction gate passed a model that could not hold the
+# arm up. Ten times the planted noise; twenty-four poses land at 0.002.
+GRAVITY_HOLDOUT_TOLERANCE = 10.0 * REHEARSAL_NOISE
 # Homing is a recovery move from an unknown pose, so it goes slowly whatever
 # speed the campaign was configured for.
 HOMING_SPEED_DEG_S = 10.0
@@ -121,6 +186,20 @@ JOG_SPEED_DEG_S = 10.0
 # How long the jog worker naps when no new pose has been asked for.
 JOG_POLL_S = 0.05
 OPTIMAL_MODE = "optimal_excitation"
+# Gravity alone, and its dry run. Split out because the answer it produces is
+# usable on its own -- it is what holds the arm up -- and because it takes
+# minutes rather than the hour a full campaign does.
+GRAVITY_MODE = "gravity"
+GRAVITY_REHEARSAL = "gravity_rehearsal"
+# Modes that move the real arm, and therefore need a passing dry run first.
+HARDWARE_MODES = ("hardware", OPTIMAL_MODE, GRAVITY_MODE)
+# Slow enough that the viscous term is small, fast enough to clear the 0.145
+# deg/s a parked joint reaches from coupling alone. Two of them, because their
+# difference is the only measurement of the viscous term a gravity run makes.
+DEFAULT_GRAVITY_PROBE_SPEEDS = (1.0, 3.0)
+# Plan fields the gravity card may set.
+GRAVITY_OPTIONS = ("static_poses", "gravity_validation_poses",
+                   "gravity_probe_deg")
 
 
 def _comparison(optimal_errors, sweep: dict, joint_names) -> dict:
@@ -179,11 +258,20 @@ class DashboardConfig:
     # How far the campaign may swing each joint. The URDF describes the arm,
     # not the stand it is bolted to, so this is often tighter than the URDF.
     workspace_limit_deg: tuple[float, ...] = ()
+    # Per-joint lower and upper bound, which is what the panel edits. Set, it
+    # replaces the symmetric cap above entirely.
+    workspace_range_deg: tuple[tuple[float, float], ...] = ()
     # Top sweep speed. Zero keeps the conservative derived default, which is
     # too slow to see viscous friction on a full-size arm.
     maximum_speed_deg_s: float = 0.0
-    # Where the drawn obstacle scene lives between sessions. Empty disables it.
-    obstacle_path: str = ""
+    # Where everything this panel edits lives between sessions: the obstacle
+    # scene, the planner envelope and the gravity card's numbers. All three
+    # describe the cell rather than the robot, so none of them can come from
+    # the URDF and all of them are lost on restart without this. Empty
+    # disables the file entirely.
+    config_file_path: str = ""
+    # How close the arm may come to anything before a pose is refused.
+    safety_margin_m: float = obstacles_module.SAFETY_MARGIN_M
 
 
 class IdentificationService:
@@ -198,7 +286,12 @@ class IdentificationService:
         self.whole: ident.ArmModel | None = None
         self.scene: ObstacleScene | None = None
         self.urdf_text = ""
+        self.gravity_terms: list[dict] = []
         self.driven_joints: list[str] = []
+        # Where the joints this dashboard cannot drive were when the collision
+        # model was reduced around them. The screen is true while they are
+        # still there and false the moment they are not.
+        self.screen_reference: dict = {}
         self.configured_profile = profile
         # What the launch supplied, kept so an edit can be undone.
         self.launch_profile = profile
@@ -209,6 +302,22 @@ class IdentificationService:
         self.progress: dict = {"phase": "idle"}
         self.notes: list[str] = []
         self.rehearsal_passed = False
+        # What a passing gravity dry run actually validated. Re-tuning the card
+        # changes the experiment, so the arming does not carry over.
+        self.gravity_armed = ""
+        # The gravity card's last committed numbers, kept across restarts.
+        self.gravity_options: dict = {}
+        # What the config file held, so the parts that need a model can wait
+        # for one and the parts that do not are in force before the first plan.
+        self._stored: dict = {}
+        self.preview: dict = {"available": False}
+        self.preview_token = 0
+        # Poses the phases of a running campaign have designed so far.
+        self._designed: dict = {}
+        # Designing takes about as long as a short move and moves nothing, so
+        # nothing else reports it; without this the panel looks dead.
+        self.planning = False
+        self._running_signature = ""
         self._state = IDLE
         self._activity = ""
         self._worker: threading.Thread | None = None
@@ -219,6 +328,7 @@ class IdentificationService:
         self._options: dict = {}
         # The pose a slider last asked for, or None once it has been driven.
         self._jog_target: list[float] | None = None
+        self._restore_settings()
 
     # -- model -----------------------------------------------------------
 
@@ -247,6 +357,18 @@ class IdentificationService:
         self.note(f"controller drives {len(names)} joints")
         return self._rebuild()
 
+    def adopt_elsewhere(self) -> bool:
+        """Rebuild the screen the first time the rest of the robot is visible.
+
+        The URDF is latched and arrives before the first joint state, so the
+        screen is often built before anything is known about the other arm and
+        holds it at zero. This is not a change of policy, it is the same policy
+        applied to a reading that had not arrived yet.
+        """
+        if self.arm is None or self.screen_reference:
+            return False
+        return bool(self._elsewhere_rad()) and self._rebuild()
+
     def adopt_signals(self, signals) -> None:
         """Take the effort channel the robot turned out to publish.
 
@@ -266,7 +388,7 @@ class IdentificationService:
         profile, source = self.configured_profile, "configured"
         if profile is None and self.driven_joints:
             try:
-                cap = list(self.config.workspace_limit_deg) or None
+                cap = self._symmetric_cap() or None
                 profile = autoprofile.derive_profile(
                     self.urdf_text, self.driven_joints,
                     workspace_limit_deg=cap,
@@ -274,9 +396,14 @@ class IdentificationService:
                 source = "derived"
             except Exception as error:  # noqa: BLE001
                 self.note(f"profile could not be derived: {error}")
+        # Whatever the rest of the robot is doing right now is what the screen
+        # is built against. Neutral would be a guess, and a wrong one is a
+        # cleared path through an arm that is standing in it.
+        elsewhere = self._elsewhere_rad()
         try:
             if profile is not None:
-                arm = ident.ArmModel.from_profile(self.urdf_text, profile)
+                arm = ident.ArmModel.from_profile(self.urdf_text, profile,
+                                                  elsewhere)
             else:
                 arm = ident.ArmModel.from_urdf_text(self.urdf_text, "")
                 source = "none"
@@ -287,6 +414,7 @@ class IdentificationService:
             self.arm = arm
             self.profile = profile
             self.profile_source = source
+            self.screen_reference = elsewhere
             # The picture and the collision scene cover the whole robot, not
             # just the arm this dashboard drives, so the drawing needs a model
             # that still has the other arm's joints in it.
@@ -295,8 +423,11 @@ class IdentificationService:
             except Exception as error:  # noqa: BLE001 - drawing is not the job
                 self.whole = None
                 self.note(f"whole-robot view unavailable: {error}")
+            self.gravity_terms = parse_gravity_terms(self.urdf_text)
             previous = self.scene.as_list() if self.scene else []
-            self.scene = ObstacleScene(arm.model, urdf_text=self.urdf_text)
+            self.scene = ObstacleScene(
+                arm.model, urdf_text=self.urdf_text,
+                safety_margin_m=self.config.safety_margin_m)
             if previous:
                 try:
                     self.scene.replace_all(previous)
@@ -309,7 +440,24 @@ class IdentificationService:
             self._restore_obstacles()
         self.note(f"model ready: {arm.joint_count} joints, "
                   f"{arm.parameter_count} parameters, profile {source}")
+        if elsewhere:
+            self.note(f"collision screen built against "
+                      f"{len(elsewhere)} joints this dashboard does not "
+                      f"drive, where they are now")
         return True
+
+    def _elsewhere_rad(self) -> dict:
+        """The joints this dashboard cannot drive, in radians, as read.
+
+        An optional bridge capability, and a bridge without it leaves the
+        screen on the neutral assumption it always had.
+        """
+        reader = getattr(self.bridge, "elsewhere", None)
+        if reader is None:
+            return {}
+        driven = set(self.driven_joints)
+        return {name: float(value) for name, value in (reader() or {}).items()
+                if name not in driven and math.isfinite(float(value))}
 
     def _requested_speed(self) -> float | None:
         speed = float(self.config.maximum_speed_deg_s or 0.0)
@@ -319,17 +467,247 @@ class IdentificationService:
         """The plan follows the operator's speed, clamped to the envelope."""
         speed = self._requested_speed()
         if speed is None:
-            return campaign_module.default_plan(profile)
-        plan, notes = campaign_module.clamp_campaign_plan(
-            {"maximum_speed_deg_s": speed}, profile)
-        for entry in notes:
-            self.note(entry)
-        self.note(f"sweep speeds {list(plan.friction_speeds_deg_s)} deg/s, "
-                  f"amplitude {plan.friction_amplitude_deg:g} deg")
+            plan = campaign_module.default_plan(profile)
+        else:
+            plan, notes = campaign_module.clamp_campaign_plan(
+                {"maximum_speed_deg_s": speed}, profile)
+            for entry in notes:
+                self.note(entry)
+            self.note(f"sweep speeds {list(plan.friction_speeds_deg_s)} deg/s, "
+                      f"amplitude {plan.friction_amplitude_deg:g} deg")
+        # The panel's envelope wins over whatever the profile carries: it is a
+        # statement about the cell the arm stands in, and a profile written for
+        # a bare bench knows nothing about that. A stored one from another arm
+        # is dropped rather than stretched: a bound list of the wrong length is
+        # not a tighter cell, it is a shape mismatch that would otherwise
+        # surface as a broadcast error several steps into a design.
+        joints = self.arm.joint_count if self.arm is not None else 0
+        if self.config.workspace_range_deg and joints and (
+                len(self.config.workspace_range_deg) != joints):
+            self.note(f"stored planner envelope covers "
+                      f"{len(self.config.workspace_range_deg)} joints and this "
+                      f"arm has {joints}; envelope ignored")
+            self.config.workspace_range_deg = ()
+        if self.config.workspace_range_deg:
+            plan.workspace_range_deg = tuple(self.config.workspace_range_deg)
+        elif self.config.workspace_limit_deg:
+            plan.workspace_limit_deg = tuple(self.config.workspace_limit_deg)
         return plan
+
+    def _symmetric_cap(self) -> list[float]:
+        """The envelope as one magnitude per joint, for the derived profile.
+
+        A profile's position limit is a single number, so an asymmetric range
+        has to be widened to the larger side to be expressed at all. The plan
+        keeps the true bounds; this is only what the envelope's own paperwork
+        can hold.
+        """
+        if self.config.workspace_range_deg:
+            return [max(abs(low), abs(high))
+                    for low, high in self.config.workspace_range_deg]
+        return list(self.config.workspace_limit_deg)
+
+    def urdf_limit_deg(self) -> list[float]:
+        """The arm's own travel, the ceiling any envelope sits under."""
+        if self.arm is None:
+            return []
+        _low, high = self.arm.limits_deg()
+        return [round(float(value), 1) for value in high]
+
+    def urdf_range_deg(self) -> list[list[float]]:
+        """The arm's own lower and upper bound per joint."""
+        if self.arm is None:
+            return []
+        low, high = self.arm.limits_deg()
+        return [[round(float(a), 1), round(float(b), 1)]
+                for a, b in zip(low, high)]
+
+    def workspace_payload(self) -> dict:
+        return {
+            "joint_names": list(self.arm.joint_names) if self.arm else [],
+            "urdf_limit_deg": self.urdf_limit_deg(),
+            "urdf_range_deg": self.urdf_range_deg(),
+            "limit_deg": list(self.config.workspace_limit_deg),
+            "range_deg": [list(pair)
+                          for pair in self.config.workspace_range_deg],
+            "effective_deg": self.jog_limits_deg(),
+            "effective_range_deg": self.jog_range_deg(),
+            "editable": self._state == IDLE,
+        }
+
+    def set_workspace_limit(self, values) -> dict:
+        """The symmetric shorthand: one magnitude per joint, meaning +/- it."""
+        if not values:
+            return self.set_workspace_range([])
+        try:
+            given = [float(value) for value in values]
+        except (TypeError, ValueError):
+            return {"ok": False, "message": f"not a list of degrees: {values!r}"}
+        if any(value <= 0.0 for value in given):
+            return {"ok": False, "message": "every limit must be positive"}
+        return self.set_workspace_range([[-value, value] for value in given])
+
+    def set_workspace_range(self, ranges) -> dict:
+        """Where each joint may go, low and high, set from the panel.
+
+        Two bounds rather than one magnitude because a cell is not symmetric:
+        this arm is mounted at an angle, so swinging one way meets the bench
+        and the other way meets nothing. Unset, the planner uses the arm's own
+        range, which describes the arm and not the cell it stands in: here that
+        is +/-178 deg, which puts planned poses within reach of the other arm.
+        Empty resets to that deliberately, because a bare bench is a real case.
+        """
+        self._require_idle("the envelope cannot change while a run is going")
+        ceiling = self.urdf_range_deg()
+        if not ceiling:
+            return {"ok": False, "message": "no model yet"}
+        cleaned: list[tuple[float, float]] = []
+        if ranges:
+            rows = list(ranges)
+            if len(rows) == 1:
+                rows = rows * len(ceiling)
+            if len(rows) != len(ceiling):
+                return {"ok": False,
+                        "message": f"expected 1 or {len(ceiling)} ranges, "
+                                   f"got {len(rows)}"}
+            trimmed = []
+            for index, (row, bound) in enumerate(zip(rows, ceiling)):
+                try:
+                    low, high = (float(row[0]), float(row[1]))
+                except (TypeError, ValueError, IndexError, KeyError):
+                    return {"ok": False,
+                            "message": f"joint {index + 1} needs a low and a "
+                                       f"high, got {row!r}"}
+                if not (math.isfinite(low) and math.isfinite(high)):
+                    return {"ok": False,
+                            "message": f"joint {index + 1} bounds must be finite"}
+                if low >= high:
+                    return {"ok": False,
+                            "message": f"joint {index + 1} low {low:g} is not "
+                                       f"below high {high:g}"}
+                capped = (max(low, bound[0]), min(high, bound[1]))
+                if capped != (low, high):
+                    trimmed.append(index + 1)
+                cleaned.append((round(capped[0], 3), round(capped[1], 3)))
+            if trimmed:
+                self.note(f"envelope capped by the URDF on joints {trimmed}")
+        with self._lock:
+            self.config.workspace_range_deg = tuple(cleaned)
+            self.config.workspace_limit_deg = ()
+            # The poses a dry run validated are not the poses this envelope
+            # will design, so the arming goes with it.
+            self.gravity_armed = ""
+            self.rehearsal_passed = False
+        self._rebuild()
+        self._persist_config()
+        self.note("planner envelope "
+                  + (f"set to {[list(pair) for pair in cleaned]} deg"
+                     if cleaned else "reset to the arm's own range"))
+        return {"ok": True, "workspace": self.workspace_payload()}
+
+    def plan_preview(self, mode: str, options: dict | None = None) -> dict:
+        """Design the poses and publish them, without moving anything.
+
+        The point is that a human looks at them before the arm does. Designing
+        is the one expensive part of a run that has no consequences, so it is
+        worth being able to do on its own.
+        """
+        if not self.have_model():
+            return {"ok": False, "message": "no /robot_description yet"}
+        if self.profile is None:
+            return {"ok": False, "message": "no robot profile loaded"}
+        self._require_idle("a run is going; wait for it to finish")
+        if mode != GRAVITY_MODE:
+            return {"ok": False, "message": f"cannot preview {mode!r}"}
+        with self._lock:
+            if self.planning:
+                return {"ok": False, "message": "already planning"}
+            self.planning = True
+        try:
+            return self._plan_gravity(dict(options or {}))
+        finally:
+            with self._lock:
+                self.planning = False
+
+    def _plan_gravity(self, options: dict) -> dict:
+        plan = self._gravity_plan(options)
+        self._remember_gravity(plan)
+        limits = plan.design_limits(self.arm)
+        screen = self.scene.collision_free if self.scene is not None else None
+        phases = []
+        standing = (list(plan.start_deg) if plan.start_deg else None)
+        for phase, count, seed in (
+                (campaign_module.PHASE_GRAVITY, plan.static_poses, plan.seed),
+                (campaign_module.PHASE_VALIDATION,
+                 plan.gravity_validation_poses, plan.seed + 7717)):
+            design = excitation.design_static_poses(
+                self.arm, limits, count=count,
+                candidates=plan.static_candidates, seed=seed,
+                collision_free=screen, start_deg=standing,
+                crossing_deg=float(plan.gravity_probe_deg))
+            standing = design.final_deg or standing
+            phases.append({"phase": phase, "detail": design.as_dict()})
+        preview = self._build_preview("plan", {"phases": phases})
+        with self._lock:
+            if preview.get("available"):
+                self.preview = preview
+                self.preview_token += 1
+        drawn = sum(len(entry["detail"].get("poses_deg") or [])
+                    for entry in phases)
+        astray = self.screen_drift()
+        if astray:
+            where = ", ".join(f"{item['joint']} moved {item['moved_deg']:+g} deg"
+                              for item in astray[:4])
+            self.note(f"these {drawn} poses were screened against a placement "
+                      f"the rest of the robot has since left: {where}")
+        self.note(f"planned {drawn} poses for review; nothing has moved")
+        return {"ok": True, "preview": self.preview_payload(),
+                "astray": astray}
 
     def have_model(self) -> bool:
         return self.arm is not None
+
+    def kinematics(self, payload: dict) -> dict:
+        """Link poses along the straight joint-space line between two poses.
+
+        The canvas cannot do forward kinematics and must not learn how: the
+        picture agreeing with the model that screened the motion is the whole
+        reason it is drawn from the model rather than from TF. This is that
+        model, sampled along the path the arm is actually commanded to fly, so
+        an animation of a plan cannot show a path the plan does not contain.
+
+        Only the driven arm's own frames are returned. Everything the model
+        holds still -- the other arm, the stand -- hangs off the universe
+        joint after the reduction and is already drawn where it is.
+        """
+        if self.arm is None:
+            return {"ok": False, "message": "no model yet"}
+        count = self.arm.joint_count
+        try:
+            end = np.asarray(payload["to_deg"], dtype=float)
+            start = (np.asarray(payload["from_deg"], dtype=float)
+                     if payload.get("from_deg") else end)
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "message": "to_deg is a list of degrees"}
+        if len(end) != count or len(start) != count:
+            return {"ok": False,
+                    "message": f"this arm has {count} joints"}
+        if not (np.all(np.isfinite(start)) and np.all(np.isfinite(end))):
+            return {"ok": False, "message": "every angle must be finite"}
+        try:
+            steps = int(payload.get("steps", 1))
+        except (TypeError, ValueError):
+            steps = 1
+        steps = min(max(steps, 1), MAXIMUM_ANIMATION_STEPS)
+        driven = {frame.name for frame in self.arm.model.frames
+                  if frame.parentJoint > 0}
+        frames = []
+        for index in range(steps + 1):
+            pose = start + (end - start) * (index / steps)
+            placed = self.arm.link_transforms(pose)
+            frames.append({name: flat for name, flat in placed.items()
+                           if name in driven})
+        return {"ok": True, "frames": frames}
 
     # -- robot profile ---------------------------------------------------
 
@@ -430,53 +808,53 @@ class IdentificationService:
         self._require_idle("obstacles cannot be edited while a run is active")
         box = self.scene.add(Obstacle.from_dict(payload))
         self.note(f"obstacle {box.name} bolted to {box.parent_frame}")
-        self._persist_obstacles()
+        self._persist_config()
         return box.as_dict()
 
     def update_obstacle(self, obstacle_id: str, changes: dict) -> dict:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
         box = self.scene.update(obstacle_id, **changes).as_dict()
-        self._persist_obstacles()
+        self._persist_config()
         return box
 
     def remove_obstacle(self, obstacle_id: str) -> None:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
         self.scene.remove(obstacle_id)
-        self._persist_obstacles()
+        self._persist_config()
 
     def replace_obstacles(self, payloads: list[dict]) -> list[dict]:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
         self.scene.replace_all(payloads)
-        self._persist_obstacles()
+        self._persist_config()
         return self.scene.as_list()
 
-    def obstacle_path(self) -> Path | None:
-        raw = (self.config.obstacle_path or "").strip()
+    # -- configuration file ----------------------------------------------
+
+    def config_file(self) -> Path | None:
+        raw = (self.config.config_file_path or "").strip()
         return Path(raw).expanduser() if raw else None
 
-    def save_obstacles(self, name: str = "") -> dict:
-        """Write the scene where the operator says, so each arm keeps its own.
+    def save_config(self, name: str = "") -> dict:
+        """Write the configuration where the operator says.
 
         The launch path is where edits are kept automatically; this is how a
-        scene gets a name worth carrying to another robot.
+        cell's settings get a name worth carrying to another robot.
         """
-        if self.scene is None:
-            return {"ok": False, "message": "no model yet"}
         try:
-            target = self._obstacle_save_target(name)
+            target = self._config_save_target(name)
         except ValueError as error:
             return {"ok": False, "message": str(error)}
         try:
-            self.scene.save(target)
+            obstacles_module.write_document(target, self._config_document())
         except OSError as error:
             return {"ok": False, "message": f"not saved: {error}"}
-        self.note(f"obstacles written to {target}")
+        self.note(f"configuration written to {target}")
         return {"ok": True, "path": str(target)}
 
-    def _obstacle_save_target(self, name: str = "") -> Path:
+    def _config_save_target(self, name: str = "") -> Path:
         """Where a save may land, which is never wherever the caller says.
 
         Same rule as the profile: the web surface listens on every interface,
@@ -485,51 +863,129 @@ class IdentificationService:
         """
         cleaned = str(name or "").strip()
         if not cleaned:
-            launched = self.obstacle_path()
+            launched = self.config_file()
             return (launched if launched is not None
-                    else Path(self.config.output_directory) / "obstacles.json")
-        if not OBSTACLE_FILE_NAME.fullmatch(cleaned):
+                    else Path(self.config.output_directory)
+                    / DEFAULT_CONFIG_FILE)
+        if not CONFIG_FILE_NAME.fullmatch(cleaned):
             raise ValueError(
-                "an obstacle file name may use letters, digits, dot, dash and "
+                "a config file name may use letters, digits, dot, dash and "
                 f"underscore, and must end in .json: {cleaned!r}")
         return Path(self.config.output_directory) / cleaned
 
-    def _persist_obstacles(self) -> None:
-        """Save after every edit; a scene lost on restart is a scene retyped."""
-        path = self.obstacle_path()
-        if path is None or self.scene is None:
+    def _config_document(self) -> dict:
+        """Everything this panel edits, in the form written to disk.
+
+        Built on top of whatever was read, so a section this build has no
+        model for yet -- obstacles, before a URDF arrives -- is carried
+        forward rather than blanked by the first unrelated edit.
+        """
+        document = dict(self._stored)
+        document["schema_version"] = obstacles_module.SCHEMA_VERSION
+        if self.scene is not None:
+            document["obstacles"] = self.scene.as_list()
+        document["workspace_range_deg"] = [
+            list(pair) for pair in self.config.workspace_range_deg]
+        if self.gravity_options:
+            document["gravity"] = dict(self.gravity_options)
+        return document
+
+    def _persist_config(self) -> None:
+        """Save after every edit; a setting lost on restart is one retyped."""
+        path = self.config_file()
+        if path is None:
+            return
+        document = self._config_document()
+        try:
+            obstacles_module.write_document(path, document)
+        except OSError as error:
+            self.note(f"configuration not saved to {path}: {error}")
+            return
+        self._stored = document
+
+    def _restore_settings(self) -> None:
+        """Read the file and take everything that needs no model.
+
+        The envelope and the gravity card have to be in force before the first
+        plan is built, and neither of them mentions a frame, so neither has to
+        wait for a URDF. Obstacles do, and are placed later.
+        """
+        path = self.config_file()
+        # An empty configuration has three causes and they are not
+        # interchangeable: nothing was asked for, what was asked for is not
+        # there, or the file was read. Saying nothing makes all three look
+        # like the same bug.
+        if path is None:
+            self.note("config_file_path was not set: the obstacle scene, the "
+                      "planner envelope and the gravity settings start empty "
+                      "and every edit is lost on restart")
+            return
+        if not path.exists():
+            self.note(f"no config file at {path.resolve()} yet: settings "
+                      "start empty and the first edit creates it there")
             return
         try:
-            self.scene.save(path)
-        except OSError as error:
-            self.note(f"obstacles not saved to {path}: {error}")
-
-    def _restore_obstacles(self) -> bool:
-        path = self.obstacle_path()
-        if self.scene is None:
-            return False
-        # An empty scene has three causes and they are not interchangeable:
-        # nothing was asked for, what was asked for is not there, or the file
-        # was read. Saying nothing makes all three look like the same bug.
-        if path is None:
-            self.note("obstacle_file was not set: the scene starts empty and "
-                      "edits are lost on restart unless you save them")
-            return False
-        if not path.exists():
-            self.note(f"no obstacle file at {path.resolve()} yet: the scene "
-                      "starts empty and the first edit creates it there")
-            return False
-        try:
-            skipped = self.scene.load(path)
+            document = json.loads(path.read_text())
         except (OSError, ValueError) as error:
-            self.note(f"obstacle file {path} not loaded: {error}")
-            return False
-        self.note(f"obstacles restored from {path}: "
+            self.note(f"config file {path} not read: {error}")
+            return
+        if not isinstance(document, dict):
+            self.note(f"config file {path} is not an object")
+            return
+        version = int(document.get("schema_version", 0) or 0)
+        if version > obstacles_module.SCHEMA_VERSION:
+            self.note(f"config file {path} is schema version {version}; this "
+                      f"build understands up to "
+                      f"{obstacles_module.SCHEMA_VERSION}")
+            return
+        self._stored = document
+        self._restore_envelope(document.get("workspace_range_deg"))
+        self._restore_gravity(document.get("gravity"))
+
+    def _restore_envelope(self, ranges) -> None:
+        """The stored envelope, unchecked against a URDF nobody has sent yet.
+
+        Every design intersects it with the arm's own travel, so a stored
+        range wider than the robot cannot widen the robot. A malformed one is
+        dropped whole rather than half-applied: half an envelope is a cell
+        the arm may leave on the joints that went missing.
+        """
+        if not ranges:
+            return
+        try:
+            bounds = [(float(low), float(high)) for low, high in ranges]
+        except (TypeError, ValueError):
+            self.note(f"stored planner envelope ignored: {ranges!r}")
+            return
+        if any(not (math.isfinite(low) and math.isfinite(high))
+               or low >= high for low, high in bounds):
+            self.note(f"stored planner envelope ignored: {ranges!r}")
+            return
+        self.config.workspace_range_deg = tuple(bounds)
+        self.config.workspace_limit_deg = ()
+        self.note(f"planner envelope restored: "
+                  f"{[list(pair) for pair in bounds]} deg")
+
+    def _restore_gravity(self, options) -> None:
+        if not isinstance(options, dict) or not options:
+            return
+        self.gravity_options = dict(options)
+        self.note(f"gravity settings restored: {options}")
+
+    def _restore_obstacles(self) -> None:
+        """Boxes name frames, so they are placed once a model exists."""
+        if self.scene is None or not self._stored.get("obstacles"):
+            return
+        try:
+            skipped = self.scene.load_document(self._stored)
+        except ValueError as error:
+            self.note(f"obstacles not loaded: {error}")
+            return
+        self.note(f"obstacles restored from {self.config_file()}: "
                   f"{len(self.scene.as_list())} kept"
                   + (f", {len(skipped)} dropped" if skipped else ""))
         for reason in skipped:
             self.note(f"obstacle dropped: {reason}")
-        return True
 
     def collision_report(self, pose_deg=None) -> dict:
         """Whether the current pose is clear, and what it touches if not."""
@@ -606,6 +1062,19 @@ class IdentificationService:
                                  (float(v) for v in sample["position_deg"]))))
         return pose
 
+    def gravity_payload(self) -> dict:
+        """The URDF's gravity terms, for the canvas to draw them where they are.
+
+        Only the file's own numbers travel. Where each mass ends up follows
+        from ``link_tf``, which the canvas already has, so the picture cannot
+        offer a second opinion on the kinematics.
+        """
+        return {
+            "links": list(self.gravity_terms),
+            "total_mass_kg": sum(item["mass_kg"]
+                                 for item in self.gravity_terms),
+        }
+
     def viewer_state(self) -> dict:
         """Everything the 3D canvas needs for one frame."""
         if self.arm is None:
@@ -630,68 +1099,126 @@ class IdentificationService:
             "link_tf": transforms,
             "obstacles": self.scene.placements(pose) if self.scene else [],
             "frames": self.frame_names(),
+            "gravity": self.gravity_payload(),
+            # Bumped when a run designs new poses, so the canvas fetches the
+            # skeletons once instead of on every poll.
+            "preview_token": self.preview_token,
         }
+        # Which planned pose the run is on, so the canvas can pick it out of
+        # the tour it is already drawing.
+        visiting = self.progress.get("pose_deg")
+        if visiting is not None:
+            payload["moving"] = {
+                "pose_deg": list(visiting),
+                "phase": str(self.progress.get("phase") or ""),
+                "index": int(self.progress.get("pose") or 0),
+            }
         if self.plan is not None and getattr(self.plan, "workspace_limit_deg", None):
             payload["workspace_limit_deg"] = list(self.plan.workspace_limit_deg)
         return payload
 
     # -- campaign --------------------------------------------------------
 
-    def elsewhere_off_neutral(self, tolerance_deg: float = 5.0) -> list[dict]:
-        """Joints this dashboard does not drive that are not where the screen
-        thinks they are.
+    def screen_drift(self, tolerance_deg: float = SCREEN_DRIFT_DEG) -> list[dict]:
+        """Joints this dashboard does not drive that have moved since the
+        screen was built against them.
 
         The collision scene carries every link the URDF ships -- sixteen on
-        this robot, both arms -- but it is built on a model reduced against the
-        neutral configuration, so the arm this dashboard does not drive is
-        pinned at zero inside the screen. Park that arm somewhere else and the
-        screen will cheerfully clear a path straight through it. Nothing else
-        catches this: the geometry is loaded, the pair count is right, and the
-        screen refuses folded poses exactly as it should.
+        this robot, both arms -- but the arm this dashboard does not drive is
+        *locked* inside it, held at whatever configuration the model was
+        reduced against. That configuration is where the other arm was when
+        the screen was built, so the screen is true exactly as long as the
+        other arm has not moved since. Let it move and the screen will
+        cheerfully clear a path straight through it. Nothing else catches
+        this: the geometry is loaded, the pair count is right, and the screen
+        refuses folded poses exactly as it should.
+
+        Measured on this cell, an arm 70 deg from where the screen holds it
+        puts its wrist 621 mm from the screen's idea of it.
         """
-        driven = set(self.arm.joint_names) if self.arm is not None else set()
-        astray = []
-        for name, radians in (self.bridge.elsewhere()
-                              if self.bridge is not None else {}).items():
-            if name in driven:
-                continue
-            degrees = float(np.degrees(radians))
+        drifted = []
+        for name, radians in self._elsewhere_rad().items():
+            # A joint the screen never had a reading for is held at zero
+            # inside it, so zero is what it has drifted from.
+            was = self.screen_reference.get(name, 0.0)
+            degrees = float(np.degrees(radians - was))
             if abs(degrees) > tolerance_deg:
-                astray.append({"joint": name, "at_deg": round(degrees, 2)})
-        return sorted(astray, key=lambda item: -abs(item["at_deg"]))
+                drifted.append({"joint": name,
+                                "at_deg": round(float(np.degrees(radians)), 2),
+                                "moved_deg": round(degrees, 2)})
+        return sorted(drifted, key=lambda item: -abs(item["moved_deg"]))
+
+    def rescreen(self) -> dict:
+        """Rebuild the screen around where the rest of the robot is now.
+
+        Every pose already designed was screened against the old placement, so
+        the arming goes with it rather than carrying over onto a scene that no
+        longer matches the poses it cleared.
+        """
+        self._require_idle("the screen cannot be rebuilt while a run is going")
+        drifted = self.screen_drift()
+        with self._lock:
+            self.gravity_armed = ""
+            self.rehearsal_passed = False
+        if not self._rebuild():
+            return {"ok": False, "message": "no model to rebuild"}
+        self.note(f"collision screen rebuilt; {len(drifted)} joints had moved. "
+                  "Plan and rehearse again: the poses that were cleared were "
+                  "cleared against the old placement.")
+        return {"ok": True, "drift": self.screen_drift()}
 
     def start(self, mode: str, options: dict | None = None) -> dict:
         if not self.have_model():
             return {"ok": False, "message": "no /robot_description yet"}
         if self.profile is None:
             return {"ok": False, "message": "no robot profile loaded"}
+        options = dict(options or {})
         with self._lock:
             if self._state != IDLE:
                 return {"ok": False, "message": f"{self._activity} is running"}
-            if mode in ("hardware", OPTIMAL_MODE) and not self.rehearsal_passed:
+            if mode == GRAVITY_MODE:
+                wanted = self._gravity_signature(self._gravity_plan(options))
+                if not self.gravity_armed:
+                    return {"ok": False,
+                            "message": "rehearse the gravity run first: a dry "
+                                       "run must recover what it planted "
+                                       "before the arm is allowed to move"}
+                if self.gravity_armed != wanted:
+                    # Re-tuning is expected and allowed; running numbers that
+                    # were never rehearsed is not.
+                    return {"ok": False,
+                            "message": "the gravity settings changed since the "
+                                       "dry run that passed. Rehearse again "
+                                       "with these numbers, then run."}
+            elif mode in HARDWARE_MODES and not self.rehearsal_passed:
                 # Not ceremony: the rehearsal plants known friction and must
                 # find it again, and it is what caught the fit returning zero.
                 return {"ok": False,
                         "message": "rehearse first: a dry run must pass "
                                    "before the arm is allowed to move"}
-            if mode in ("hardware", "load_sweep", OPTIMAL_MODE):
-                astray = self.elsewhere_off_neutral()
+            if mode in HARDWARE_MODES + ("load_sweep",):
+                astray = self.screen_drift()
                 if astray:
-                    where = ", ".join(f"{item['joint']} at {item['at_deg']:g} deg"
-                                      for item in astray[:4])
+                    where = ", ".join(
+                        f"{item['joint']} moved {item['moved_deg']:+g} deg"
+                        for item in astray[:4])
                     return {"ok": False,
-                            "message": "the collision screen places every joint "
-                                       "this dashboard does not drive at neutral, "
-                                       f"and these are not: {where}. Home them "
-                                       "before driving, or the screen will clear "
-                                       "a path through them."}
+                            "message": "the collision screen holds every joint "
+                                       "this dashboard does not drive where it "
+                                       "was when the screen was built, and "
+                                       f"these have moved since: {where}. "
+                                       "Rebuild the screen and plan again, or "
+                                       "put them back."}
             self._state = RUNNING
-            self._activity = (mode if mode in ("load_sweep", OPTIMAL_MODE)
-                              else f"campaign_{mode}")
+            self._activity = (
+                mode if mode in ("load_sweep", OPTIMAL_MODE, GRAVITY_MODE,
+                                 GRAVITY_REHEARSAL)
+                else f"campaign_{mode}")
             self._abort.clear()
             self._started_at = time.monotonic()
             self._samples = []
-            self._options = dict(options or {})
+            self._options = options
+            self._designed = {}
             # The previous run's verdict is not this run's; leaving it up reads
             # as though the campaign now moving has already passed.
             self.result = None
@@ -836,17 +1363,25 @@ class IdentificationService:
         self._abort.set()
         return {"ok": True, "message": "jogging stopped"}
 
-    def jog_limits_deg(self) -> list[float]:
-        """How far each joint may be jogged: the campaign's own envelope.
+    def jog_range_deg(self) -> list[list[float]]:
+        """Where each joint may be jogged: the campaign's own envelope.
 
         Deliberately not the URDF's: the URDF describes the arm, not the bench
         it is bolted to, and a slider is the easiest way there is to drive an
-        arm into its surroundings.
+        arm into its surroundings. Both bounds, because the envelope may be
+        asymmetric and clamping to the upper one as a magnitude would let a
+        joint go somewhere the planner is forbidden from designing.
         """
         if self.plan is None or self.arm is None:
             return []
-        return [round(float(value), 1)
-                for value in self.plan.design_limits(self.arm).upper_deg]
+        limits = self.plan.design_limits(self.arm)
+        return [[round(float(low), 1), round(float(high), 1)]
+                for low, high in zip(limits.lower_deg, limits.upper_deg)]
+
+    def jog_limits_deg(self) -> list[float]:
+        """The envelope as one magnitude per joint, for anything symmetric."""
+        return [round(max(abs(low), abs(high)), 1)
+                for low, high in self.jog_range_deg()]
 
     def _screened_pose(self, position_deg) -> list[float]:
         """Clamp to the envelope, then refuse anything that would hit something.
@@ -855,7 +1390,7 @@ class IdentificationService:
         not have to have come from this dashboard, and the arm has no idea what
         is bolted around it.
         """
-        limits = self.jog_limits_deg()
+        limits = self.jog_range_deg()
         values = [float(value) for value in (position_deg or [])]
         if not limits:
             raise ValueError("no motion plan yet")
@@ -864,8 +1399,8 @@ class IdentificationService:
                              f"got {len(values)}")
         if not all(math.isfinite(value) for value in values):
             raise ValueError("joint angles must be finite")
-        clamped = [max(-limit, min(limit, value))
-                   for value, limit in zip(values, limits)]
+        clamped = [max(bound[0], min(bound[1], value))
+                   for value, bound in zip(values, limits)]
         report = self.collision_report(clamped)
         if report.get("available") and not report.get("clear", True):
             touching = ", ".join(
@@ -915,10 +1450,16 @@ class IdentificationService:
             return
         plant = None
         run = None
+        gravity = mode in (GRAVITY_MODE, GRAVITY_REHEARSAL)
         try:
-            monitor = (self._monitor()
-                       if mode in ("hardware", OPTIMAL_MODE) else None)
-            plan = self._optimal_plan() if mode == OPTIMAL_MODE else self.plan
+            monitor = self._monitor() if mode in HARDWARE_MODES else None
+            if gravity:
+                plan = self._gravity_plan(self._options)
+                self._remember_gravity(plan)
+            elif mode == OPTIMAL_MODE:
+                plan = self._optimal_plan()
+            else:
+                plan = self.plan
             reused = None
             if mode == OPTIMAL_MODE and self._options.get("reuse_friction"):
                 folder = self._latest_optimal_friction(plan)
@@ -926,12 +1467,19 @@ class IdentificationService:
                     raise RuntimeError(
                         "no compatible completed optimal low-speed phase found")
                 reused = self._read_optimal_friction(folder)
-            plant = self._build_plant(mode)
+            plant = self._build_plant(mode, plan)
             setter = getattr(plant, "set_monitor", None)
             if setter is not None and monitor is not None:
                 setter(monitor)
-            run_type = (campaign_module.OptimalExcitationCampaign
-                        if mode == OPTIMAL_MODE else campaign_module.Campaign)
+            # What this run is about to validate, read back when it finishes.
+            self._running_signature = (self._gravity_signature(plan)
+                                       if gravity else "")
+            if gravity:
+                run_type = campaign_module.GravityCampaign
+            elif mode == OPTIMAL_MODE:
+                run_type = campaign_module.OptimalExcitationCampaign
+            else:
+                run_type = campaign_module.Campaign
             run = run_type(
                 self.arm, plant, plan,
                 progress=self._on_progress,
@@ -961,30 +1509,95 @@ class IdentificationService:
                 self._state = IDLE
                 self._activity = ""
 
-    def _optimal_plan(self):
-        """Apply the small set of options exposed by the optimal-run card."""
-        plan = replace(self.plan)
+    def _apply_options(self, plan, names, options: dict) -> None:
+        """Operator numbers onto a plan, bounded by this arm's envelope."""
         bounds = campaign_module.campaign_bounds(self.profile)
-        for name in ("optimal_training_trajectories",
-                     "optimal_validation_trajectories",
-                     "optimal_friction_repeats",
-                     "optimal_friction_postures",
-                     "fourier_base_frequency_hz",
-                     "fourier_duration_s"):
-            if name not in self._options:
+        for name in names:
+            if name not in options:
                 continue
             low, high = bounds[name]
             try:
-                value = float(self._options[name])
+                value = float(options[name])
             except (TypeError, ValueError):
-                self.note(f"ignoring optimal excitation option "
-                          f"{name}={self._options[name]!r}")
+                self.note(f"ignoring option {name}={options[name]!r}")
                 continue
             bounded = min(max(value, low), high)
             if bounded != value:
                 self.note(f"{name} {value:g} clamped to {bounded:g}")
-            setattr(plan, name, int(bounded) if name.startswith("optimal_")
-                    else float(bounded))
+            setattr(plan, name,
+                    campaign_module.coerce_plan_value(name, bounded))
+
+    def _gravity_plan(self, options: dict):
+        """The gravity card's numbers, bounded, on a copy of the plan."""
+        plan = replace(self.plan)
+        plan.gravity_probe_speeds_deg_s = DEFAULT_GRAVITY_PROBE_SPEEDS
+        plan.start_deg = self._standing_deg()
+        self._apply_options(plan, GRAVITY_OPTIONS, options)
+        speeds = options.get("gravity_probe_speeds_deg_s")
+        if speeds:
+            ceiling = float(plan.maximum_speed_deg_s)
+            try:
+                cleaned = sorted({round(min(max(float(value), 0.05), ceiling), 3)
+                                  for value in speeds if float(value) > 0.0})
+            except (TypeError, ValueError):
+                cleaned = []
+                self.note(f"ignoring probe speeds {speeds!r}")
+            if cleaned:
+                plan.gravity_probe_speeds_deg_s = tuple(cleaned)
+        least = self._minimum_gravity_poses()
+        if least and plan.static_poses < least:
+            self.note(f"{plan.static_poses} poses cannot identify joint 1: it "
+                      f"carries {least} gravity terms and a pose gives one row")
+        return plan
+
+    def _gravity_signature(self, plan) -> str:
+        """What a gravity dry run validated, as one comparable string.
+
+        Every field here changes the experiment, so a rehearsal of one set of
+        them says nothing about another. The panel stays editable; the arming
+        is what expires.
+        """
+        return json.dumps({
+            "static_poses": plan.static_poses,
+            "static_candidates": plan.static_candidates,
+            "gravity_validation_poses": plan.gravity_validation_poses,
+            "gravity_probe_deg": plan.gravity_probe_deg,
+            "gravity_probe_speeds_deg_s": list(plan.gravity_probe_speeds_deg_s),
+            "workspace_limit_deg": list(plan.workspace_limit_deg),
+            "workspace_range_deg": [list(pair)
+                                    for pair in plan.workspace_range_deg],
+            # The tour is designed from here and its first transit is the
+            # longest, so a dry run from one starting pose says nothing about
+            # a real run from another.
+            "start_deg": list(plan.start_deg),
+            "seed": plan.seed,
+            "joints": list(self.driven_joints),
+        }, sort_keys=True)
+
+    def _standing_deg(self) -> tuple:
+        """Where the arm is now, quantised so a held pose reads the same twice.
+
+        The quantum is well inside the tolerance the plant checks the start
+        against, so rounding here cannot let the arm begin somewhere the
+        design did not screen; it only stops encoder noise from expiring an
+        arming every poll.
+        """
+        sample = self.latest_sample()
+        pose = (sample or {}).get("position_deg")
+        if not pose:
+            return ()
+        return tuple(round(float(value) / STANDING_QUANTUM_DEG)
+                     * STANDING_QUANTUM_DEG for value in pose)
+
+    def _optimal_plan(self):
+        """Apply the small set of options exposed by the optimal-run card."""
+        plan = replace(self.plan)
+        self._apply_options(plan, ("optimal_training_trajectories",
+                                   "optimal_validation_trajectories",
+                                   "optimal_friction_repeats",
+                                   "optimal_friction_postures",
+                                   "fourier_base_frequency_hz",
+                                   "fourier_duration_s"), self._options)
         return plan
 
     def _latest_load_sweep(self) -> Path | None:
@@ -1269,6 +1882,112 @@ class IdentificationService:
             self.note(f"{mode} run salvaged unfitted: {len(observations)} "
                       f"observations kept, fit failed: {second}")
 
+    def gravity_defaults(self) -> dict:
+        """What the gravity card starts at, from the plan actually in force.
+
+        Whatever was last committed wins over the plan's own numbers, so the
+        card comes back showing the experiment this cell was tuned for rather
+        than the module's defaults. Those values were bounded when they were
+        committed, so they need no second clamp here.
+        """
+        plan = self.plan
+        if plan is None:
+            return {}
+        defaults = {
+            "static_poses": plan.static_poses,
+            "gravity_validation_poses": plan.gravity_validation_poses,
+            "gravity_probe_deg": plan.gravity_probe_deg,
+            "gravity_probe_speeds_deg_s": list(
+                plan.gravity_probe_speeds_deg_s or DEFAULT_GRAVITY_PROBE_SPEEDS),
+        }
+        defaults.update(self.gravity_options)
+        defaults["minimum_poses"] = self._minimum_gravity_poses()
+        return defaults
+
+    def _remember_gravity(self, plan) -> None:
+        """Keep the card's numbers, so a restart is not a retype.
+
+        Stored after the bounding, so what comes back is what the run would
+        have used and not what was typed at it.
+        """
+        wanted = {
+            "static_poses": plan.static_poses,
+            "gravity_validation_poses": plan.gravity_validation_poses,
+            "gravity_probe_deg": plan.gravity_probe_deg,
+            "gravity_probe_speeds_deg_s": list(plan.gravity_probe_speeds_deg_s),
+        }
+        if wanted == self.gravity_options:
+            return
+        self.gravity_options = wanted
+        self._persist_config()
+
+    def _minimum_gravity_poses(self) -> int:
+        """Poses below which the first joint cannot be identified at all.
+
+        Static passes give one row per pose per joint, and the joint nearest
+        the base carries every link downstream of it: two gravity parameters
+        each, plus its own Coulomb, viscous and offset terms. Fewer poses than
+        that is not a noisier fit, it is an underdetermined one -- measured on
+        this arm, ten poses left joint one with a held-out error of 0.35 A
+        while every other joint sat at the 0.002 A noise floor.
+        """
+        count = self.arm.joint_count if self.arm is not None else 0
+        return 2 * count + 3 if count else 0
+
+    def _build_preview(self, mode: str, payload: dict) -> dict:
+        """Where the run went, as skeletons the 3D canvas can draw.
+
+        Read back out of the phases the run designed rather than re-derived
+        from the plan, so what is drawn is what the arm was actually asked to
+        visit -- including the poses a collision screen refused to place.
+        """
+        if self.arm is None:
+            return {"available": False}
+        groups = []
+        for phase in payload.get("phases") or []:
+            name = str(phase.get("phase") or "")
+            detail = phase.get("detail") or {}
+            poses = list(detail.get("poses_deg") or [])
+            if not poses:
+                poses = [sweep.get("start_deg") for sweep
+                         in detail.get("sweeps") or []
+                         if sweep.get("start_deg")]
+            entries = []
+            for index, pose in enumerate(poses):
+                try:
+                    points = self.arm.skeleton(pose)
+                except (ValueError, TypeError):
+                    continue
+                entry = {
+                    "index": index + 1,
+                    "pose_deg": [round(float(value), 3) for value in pose],
+                    "points": [[round(float(v), 5) for v in point]
+                               for point in points],
+                }
+                # How much room this pose has, so the operator reviewing them
+                # can go straight to the tightest one instead of all of them.
+                if self.scene is not None:
+                    try:
+                        entry["clearance"] = self.scene.clearance_rank(pose)
+                    except (ValueError, RuntimeError):
+                        pass
+                entries.append(entry)
+            if entries:
+                groups.append({"phase": name, "poses": entries})
+        return {
+            "available": bool(groups),
+            "mode": mode,
+            "joint_names": list(self.arm.joint_names),
+            "probes_m": list(obstacles_module.CLEARANCE_PROBES_M),
+            "groups": groups,
+        }
+
+    def preview_payload(self) -> dict:
+        with self._lock:
+            payload = dict(self.preview)
+        payload["token"] = self.preview_token
+        return payload
+
     def _monitor(self):
         """The drive guards, with the voltage window only when it was supplied.
 
@@ -1327,6 +2046,7 @@ class IdentificationService:
         # Within a phase, updates report different things -- pose index here,
         # sample count there -- so they merge. Across a phase boundary they
         # do not, or the old phase's pose index would haunt the new one.
+        designed = (detail or {}).pop("designed", None)
         with self._lock:
             carried = (dict(self.progress)
                        if self.progress.get("phase") == phase else {})
@@ -1334,6 +2054,36 @@ class IdentificationService:
                             "elapsed_s": time.monotonic() - self._started_at})
             carried.update(detail or {})
             self.progress = carried
+        if designed is not None:
+            self._publish_designed(phase, designed)
+        # Between motions is the only place a run can notice that the robot it
+        # was screened against has stopped being the robot standing there.
+        if self._activity in HARDWARE_MODES and not self._abort.is_set():
+            drifted = self.screen_drift()
+            if drifted:
+                where = ", ".join(f"{item['joint']} moved {item['moved_deg']:+g} deg"
+                                  for item in drifted[:4])
+                self.note(f"stopping: the screen no longer matches the robot; "
+                          f"{where}")
+                self._abort.set()
+
+    def _publish_designed(self, phase: str, poses) -> None:
+        """The poses a running phase just designed, drawn before it moves.
+
+        A run designs its own poses, so without this the canvas has nothing to
+        show until the run is over -- which is exactly when watching it stops
+        being useful.
+        """
+        with self._lock:
+            self._designed[phase] = [list(pose) for pose in poses]
+            phases = [{"phase": name, "detail": {"poses_deg": entries}}
+                      for name, entries in self._designed.items()]
+        preview = self._build_preview("running", {"phases": phases})
+        if not preview.get("available"):
+            return
+        with self._lock:
+            self.preview = preview
+            self.preview_token += 1
 
     def _finish(self, mode: str, result, observations, raw_frames=None) -> None:
         payload = result.as_dict() if hasattr(result, "as_dict") else dict(result)
@@ -1351,10 +2101,12 @@ class IdentificationService:
         payload.update(self._plot_data(payload, observations,
                                        getattr(result, "fits", None)))
         aborted = payload.get("aborted")
-        recovery = ({} if mode in ("hardware", OPTIMAL_MODE)
-                else self._check_recovery(payload))
+        recovery = ({} if mode in HARDWARE_MODES else self._check_recovery(
+            payload,
+            GRAVITY_HOLDOUT_TOLERANCE if mode == GRAVITY_REHEARSAL else 0.0))
         if recovery:
             payload["rehearsal_check"] = recovery
+        preview = self._build_preview(mode, payload)
         with self._lock:
             self.result = payload
             # A stopped run that still says "finished" is how a half-measured
@@ -1363,9 +2115,16 @@ class IdentificationService:
                              "phase": "stopped" if aborted else "finished"}
             if aborted:
                 self.progress["error"] = str(aborted)
-            if mode not in ("hardware", OPTIMAL_MODE):
-                self.rehearsal_passed = (bool(payload.get("complete"))
-                                         and bool(recovery.get("passed")))
+            passed = (bool(payload.get("complete"))
+                      and bool(recovery.get("passed")))
+            if mode == GRAVITY_REHEARSAL:
+                self.gravity_armed = (
+                    getattr(self, "_running_signature", "") if passed else "")
+            elif mode not in HARDWARE_MODES:
+                self.rehearsal_passed = passed
+            if preview.get("available"):
+                self.preview = preview
+                self.preview_token += 1
         self._write(payload, mode, observations, raw_frames)
         if aborted:
             self.note(f"{mode} run stopped: {aborted}")
@@ -1464,11 +2223,13 @@ class IdentificationService:
                 "friction_standstill_excluded": standstill,
                 "friction_standstill_speed_deg_s": STILL_SPEED_DEG_S}
 
-    def _build_plant(self, mode: str):
-        if mode in ("hardware", OPTIMAL_MODE):
+    def _build_plant(self, mode: str, plan=None):
+        if mode in HARDWARE_MODES:
             if self.bridge is None:
                 raise RuntimeError("no ROS bridge; cannot drive hardware")
-            return self.bridge.hardware_plant(self.profile, self.scene)
+            return self.bridge.hardware_plant(
+                self.profile, self.scene,
+                expected_start_deg=tuple(getattr(plan, "start_deg", ()) or ()))
         from ..plants.analytic import AnalyticPlant  # noqa: PLC0415
 
         injected = self._rehearsal_friction()
@@ -1495,7 +2256,8 @@ class IdentificationService:
             "transition": 1.8,
         }
 
-    def _check_recovery(self, payload: dict) -> dict:
+    def _check_recovery(self, payload: dict,
+                        holdout_tolerance: float = 0.0) -> dict:
         """Did the rehearsal get back what was planted in it?"""
         injected = getattr(self, "_injected", None)
         joints = payload.get("joints") or []
@@ -1513,13 +2275,23 @@ class IdentificationService:
                 "error": round(abs(actual - expected), 4),
             })
         worst = max((item["error"] for item in errors), default=0.0)
-        return {
+        report = {
             "available": True,
             "worst_coulomb_error": round(worst, 4),
             "tolerance": REHEARSAL_TOLERANCE,
             "passed": worst <= REHEARSAL_TOLERANCE,
             "joints": errors,
         }
+        if holdout_tolerance > 0.0:
+            held = [float(value)
+                    for value in payload.get("validation_rms_a") or []]
+            worst_held = max(held) if held else float("inf")
+            report["worst_holdout_a"] = (None if not held
+                                         else round(worst_held, 5))
+            report["holdout_tolerance"] = holdout_tolerance
+            report["holdout_passed"] = worst_held <= holdout_tolerance
+            report["passed"] = report["passed"] and report["holdout_passed"]
+        return report
 
     def _write(self, payload: dict, mode: str, observations=None,
                raw_frames=None) -> None:
@@ -1589,13 +2361,24 @@ class IdentificationService:
                     and autoprofile.current_guard_active(self.profile)),
                 "driven_joints": list(self.driven_joints),
                 "reach_deg": self.jog_limits_deg(),
+                "reach_range_deg": self.jog_range_deg(),
+                # Joints this dashboard cannot drive that have moved since the
+                # screen was reduced around them. Everything screened while
+                # this is non-empty was screened against a robot that is not
+                # the one standing there.
+                "astray": self.screen_drift(),
                 "jogging": self._state == JOGGING,
                 "rehearsal_passed": self.rehearsal_passed,
+                "gravity_armed": bool(self.gravity_armed),
+                "gravity_defaults": self.gravity_defaults(),
+                "workspace": self.workspace_payload(),
+                "preview_token": self.preview_token,
+                "planning": self.planning,
                 "obstacles": self.obstacles(),
-                "obstacle_file": str(self._obstacle_save_target()),
+                "config_file": str(self._config_save_target()),
                 # Where edits are written by themselves, which is nowhere
                 # unless the launch named a file.
-                "obstacle_autosave": str(self.obstacle_path() or ""),
+                "config_autosave": str(self.config_file() or ""),
                 "frames": self.frame_names(),
                 "collision": self.collision_report(),
                 "progress": dict(self.progress),

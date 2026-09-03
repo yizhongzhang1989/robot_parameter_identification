@@ -15,6 +15,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { ColladaLoader } from 'three/addons/loaders/ColladaLoader.js';
+import { t } from '/i18n.js';
 
 const POLL_MS = 100;
 const SMOOTH_TAU = 0.06;
@@ -48,7 +49,10 @@ const linkGroup = new THREE.Group();
 const frameGroup = new THREE.Group();
 const obstacleGroup = new THREE.Group();
 const ghostGroup = new THREE.Group();
-scene.add(linkGroup, frameGroup, obstacleGroup, ghostGroup);
+const flierGroup = new THREE.Group();
+const gravityGroup = new THREE.Group();
+scene.add(linkGroup, frameGroup, obstacleGroup, ghostGroup, flierGroup,
+         gravityGroup);
 
 const gizmo = new TransformControls(camera, renderer.domElement);
 gizmo.setSpace('local');
@@ -62,12 +66,21 @@ const state = {
   frames: {},           // frame name -> THREE.Matrix4 (world)
   linkNodes: new Map(),  // link name -> Object3D
   boxNodes: new Map(),   // obstacle id -> Mesh
+  massNodes: new Map(),  // link name -> {node, local, mass, label, world}
+  massKey: '',
+  ghostNodes: [],        // one skeleton per planned pose
+  flierNodes: new Map(), // link name -> the second arm's Object3D
+  flying: false,
+  flight: 0,             // which flight is current; older loops stand down
+  flyFrom: 0,
+  previewToken: -1,
   obstacles: [],
   selected: null,
   showMesh: true,
   showFrames: false,
   showLabels: false,
   showGhost: true,
+  showGravity: false,
   meshCache: new Map(),
 };
 
@@ -76,6 +89,12 @@ window.__viewer = {
   selected: () => state.selected,
   setMode: (mode) => gizmo.setMode(mode),
   frames: () => Object.keys(state.frames),
+  highlight: (phase, index) => highlightPose(phase, index),
+  plannedPoses: () => state.ghostNodes.length,
+  fly: () => { if (!state.flying) flyTour(); },
+  stopFlying,
+  flying: () => state.flying,
+  flierLinks: () => [...state.flierNodes.values()].filter((n) => n.visible).length,
   onChange: null,       // dashboard.js hooks this to refresh the form
 };
 
@@ -272,6 +291,309 @@ function syncFrames(linkTf) {
   }
 }
 
+/* ---------------- gravity terms ---------------- */
+/* What the URDF says gravity has to work with: a mass, and how far from the
+ * joint it hangs. Drawn where forward kinematics puts it, so a lever entered
+ * on the wrong axis is visible as a ball sitting outside its own link.
+ */
+
+const MASS_COLOR = 0xff6b6b;
+const TOTAL_COLOR = 0x6ee7ff;
+const MASS_MIN_R = 0.012;
+const MASS_MAX_R = 0.042;
+
+const ballGeometry = new THREE.SphereGeometry(1, 16, 12);
+const labelLayer = document.getElementById('gravity-labels');
+
+const totalNode = new THREE.Group();
+const totalBall = new THREE.Mesh(ballGeometry, new THREE.MeshBasicMaterial({
+  color: TOTAL_COLOR, wireframe: true, transparent: true, opacity: 0.8 }));
+totalBall.scale.setScalar(0.05);
+const weightArrow = new THREE.ArrowHelper(
+  new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 0.3, TOTAL_COLOR,
+  0.06, 0.035);
+totalNode.add(totalBall, weightArrow);
+totalNode.visible = false;
+gravityGroup.add(totalNode);
+const totalLabel = makeLabel('total');
+
+function makeLabel(extra) {
+  if (!labelLayer) return null;
+  const element = document.createElement('div');
+  element.className = extra ? `mass-label ${extra}` : 'mass-label';
+  labelLayer.appendChild(element);
+  return element;
+}
+
+function buildGravity(links) {
+  for (const entry of state.massNodes.values()) {
+    gravityGroup.remove(entry.node);
+    entry.label?.remove();
+  }
+  state.massNodes.clear();
+  const heaviest = Math.max(...links.map((item) => item.mass_kg), 0) || 1;
+  for (const item of links) {
+    const local = new THREE.Vector3(...item.com_m);
+    const node = new THREE.Group();
+    node.matrixAutoUpdate = false;
+    const ball = new THREE.Mesh(ballGeometry, new THREE.MeshStandardMaterial({
+      color: MASS_COLOR, transparent: true, opacity: 0.85,
+      metalness: 0.0, roughness: 0.5 }));
+    ball.position.copy(local);
+    // Radius by cube root, so it is the volume that tracks the mass: scaling
+    // the radius directly gives a link twice as heavy eight times the ink.
+    ball.scale.setScalar(MASS_MIN_R + (MASS_MAX_R - MASS_MIN_R)
+                         * Math.cbrt(item.mass_kg / heaviest));
+    const stem = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), local]),
+      new THREE.LineBasicMaterial({ color: MASS_COLOR, transparent: true,
+                                    opacity: 0.55 }));
+    node.add(ball, stem);
+    gravityGroup.add(node);
+    const label = makeLabel();
+    if (label) {
+      label.innerHTML = `<b>${item.mass_kg.toFixed(3)} kg</b>`
+        + `<span>${item.link}</span>`;
+    }
+    state.massNodes.set(item.link, { node, local, mass: item.mass_kg, label,
+                                     world: null });
+  }
+}
+
+/** Place every mass where this frame's kinematics puts it, and total them. */
+function syncGravity() {
+  const centre = new THREE.Vector3();
+  let total = 0;
+  for (const [name, entry] of state.massNodes) {
+    const world = state.frames[name];
+    entry.node.visible = !!world;
+    entry.world = null;
+    if (!world) continue;
+    entry.node.matrix.copy(world);
+    entry.world = entry.local.clone().applyMatrix4(world);
+    centre.addScaledVector(entry.world, entry.mass);
+    total += entry.mass;
+  }
+  totalNode.visible = total > 0;
+  if (total <= 0) return;
+  centre.divideScalar(total);
+  totalNode.position.copy(centre);
+  // The arrow reaches the floor, so it shows both which way weight pulls and
+  // the point on the bench the whole robot's weight passes through.
+  weightArrow.setLength(Math.max(0.08, centre.z), 0.06, 0.035);
+  if (totalLabel) {
+    totalLabel.innerHTML = `<b>${total.toFixed(3)} kg</b>`
+      + `<span>${t('view.gravity_total')}</span>`;
+  }
+}
+
+/** Labels follow the camera, so they are placed per rendered frame. */
+const projected = new THREE.Vector3();
+function placeLabels() {
+  const width = renderer.domElement.clientWidth;
+  const height = renderer.domElement.clientHeight;
+  const place = (label, world) => {
+    if (!label) return;
+    if (!world) { label.style.display = 'none'; return; }
+    projected.copy(world).project(camera);
+    const onScreen = projected.z < 1 && Math.abs(projected.x) <= 1
+      && Math.abs(projected.y) <= 1;
+    label.style.display = onScreen ? 'block' : 'none';
+    if (!onScreen) return;
+    label.style.left = `${(projected.x * 0.5 + 0.5) * width}px`;
+    label.style.top = `${(-projected.y * 0.5 + 0.5) * height}px`;
+  };
+  for (const entry of state.massNodes.values()) place(entry.label, entry.world);
+  place(totalLabel, totalNode.visible ? totalNode.position : null);
+}
+
+function setGravityVisible(on) {
+  gravityGroup.visible = on;
+  labelLayer?.classList.toggle('hidden', !on);
+}
+
+/* ---------------- planned poses ---------------- */
+/* Where the run is going, as one skeleton per designed pose. Fetched only when
+ * the server says the plan changed: the poses are fixed once designed, and
+ * re-sending them ten times a second would dwarf everything else on the wire.
+ */
+
+const GHOST_COLORS = {
+  A_gravity: 0x4da3ff,
+  D_validation: 0x39d98a,
+  B_friction: 0xe0b341,
+  C_inertia: 0xb388ff,
+};
+const GHOST_FALLBACK = 0x8b93a5;
+const GHOST_DIM = 0.22;
+
+async function loadPreview() {
+  const response = await fetch('/api/preview', { cache: 'no-store' });
+  const data = await response.json();
+  // A run publishes each phase's poses as it designs them, so this arrives
+  // mid-flight. The old tour is gone, but the intent to watch one is not.
+  const wasFlying = state.flying;
+  stopFlying();
+  ghostGroup.clear();
+  state.ghostNodes = [];
+  for (const group of data.groups || []) {
+    const color = GHOST_COLORS[group.phase] ?? GHOST_FALLBACK;
+    for (const pose of group.poses || []) {
+      const points = (pose.points || []).map((p) => new THREE.Vector3(...p));
+      if (points.length < 2) continue;
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(points),
+        new THREE.LineBasicMaterial({ color, transparent: true,
+                                      opacity: GHOST_DIM }));
+      const tip = new THREE.Mesh(ballGeometry, new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: GHOST_DIM + 0.2 }));
+      tip.position.copy(points[points.length - 1]);
+      tip.scale.setScalar(0.012);
+      ghostGroup.add(line, tip);
+      state.ghostNodes.push({ phase: group.phase, index: pose.index,
+                              pose: pose.pose_deg, line, tip });
+    }
+  }
+  state.flyFrom = 0;
+  // The previous loop is unwound by now; starting here rather than leaving it
+  // to the next poll keeps the gap to one frame instead of four hundred ms.
+  if (wasFlying && state.ghostNodes.length > 1) flyTour();
+}
+
+/** Draw the pose being executed solid, so the plan and the arm can be compared. */
+function highlightPose(phase, index) {
+  for (const node of state.ghostNodes) {
+    const on = node.phase === phase && node.index === index;
+    node.line.material.opacity = on ? 1.0 : GHOST_DIM;
+    node.tip.material.opacity = on ? 1.0 : GHOST_DIM + 0.2;
+    node.tip.scale.setScalar(on ? 0.022 : 0.012);
+  }
+}
+
+/* ---------------- the tour, flown ---------------- */
+/* A second arm in its own colour, walked along the planned tour. A rehearsal
+ * moves nothing on the bench, so watching the run's own progress counter is
+ * not watching the run. This flies the poses the plan contains.
+ *
+ * Deliberately far faster than the arm: the point is to see the shape of the
+ * whole tour in a few seconds, not to sit through it. The pace is set by the
+ * tour rather than by the transit, so twice as many poses does not mean twice
+ * as long a wait, with a floor so a short tour is still followable.
+ *
+ * Every intermediate configuration comes from the server's forward
+ * kinematics, along the straight joint-space line the arm is commanded to
+ * take, so the animation cannot show a path the screen never cleared.
+ */
+
+const FLY_COLOR = 0xff9f43;
+const FLY_TOUR_MS = 8000;      // about how long one lap takes to watch
+const FLY_MIN_MS = 110;        // floor, so a long tour is quick but not a blur
+const FLY_MAX_MS = 420;        // ceiling, so a short tour is not a crawl
+const FLY_FRAME_MS = 16;       // one sample per display frame, no more
+
+function buildFlier() {
+  if (state.flierNodes.size || !state.linkNodes.size) return;
+  const paint = new THREE.MeshStandardMaterial({
+    color: FLY_COLOR, transparent: true, opacity: 0.55,
+    metalness: 0.1, roughness: 0.6, depthWrite: false,
+  });
+  for (const [name, source] of state.linkNodes) {
+    const node = source.clone(true);
+    node.traverse((child) => { if (child.isMesh) child.material = paint; });
+    node.matrixAutoUpdate = false;
+    node.visible = false;
+    flierGroup.add(node);
+    state.flierNodes.set(name, node);
+  }
+}
+
+function placeFlier(frames) {
+  buildFlier();
+  for (const [name, node] of state.flierNodes) {
+    const flat = frames?.[name];
+    if (flat) node.matrix.fromArray(flat).transpose();
+    // Only the arm being flown: the rest of the robot is already drawn where
+    // it is, and a second copy of it in orange is just clutter.
+    node.visible = !!flat;
+  }
+}
+
+async function transit(from, to, steps) {
+  const answer = await fetch('/api/kinematics', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from_deg: from, to_deg: to, steps }),
+  }).then((r) => r.json()).catch(() => ({ ok: false }));
+  return answer.ok ? answer.frames : null;
+}
+
+/** Play one transit over `ms` of wall clock, however often frames arrive.
+ *
+ * Which sample is shown comes from the clock, not from a count of ticks. A
+ * browser that has stopped compositing the tab throttles both timers and
+ * animation frames hard, and a tour paced by counting ticks does not then run
+ * slowly, it crawls -- measured here at a sixteenth speed. Paced by the clock,
+ * throttling costs smoothness and never duration.
+ */
+function playTransit(frames, ms, mine) {
+  return new Promise((done) => {
+    const started = performance.now();
+    const last = frames.length - 1;
+    const tick = () => {
+      if (!state.flying || state.flight !== mine) return done();
+      const share = Math.min(1, (performance.now() - started) / ms);
+      placeFlier(frames[Math.round(share * last)]);
+      if (share >= 1) return done();
+      return setTimeout(tick, FLY_FRAME_MS);
+    };
+    tick();
+  });
+}
+
+/** Walk the planned poses in order until told to stop or the list runs out.
+ *
+ * Numbered, because a plan republished mid-flight starts a new tour while the
+ * old loop is still unwinding, and whichever finished last would otherwise
+ * decide whether anything was flying at all.
+ */
+async function flyTour() {
+  const poses = state.ghostNodes.map((node) => node.pose);
+  if (poses.length < 2) return;
+  const segment = Math.min(FLY_MAX_MS,
+                           Math.max(FLY_MIN_MS, FLY_TOUR_MS / poses.length));
+  const steps = Math.max(3, Math.round(segment / FLY_FRAME_MS));
+  const mine = ++state.flight;
+  state.flying = true;
+  let at = state.flyFrom;
+  // Held here so the next transit is fetched while this one is being watched.
+  let ahead = transit(poses[at], poses[(at + 1) % poses.length], steps);
+  while (state.flying && state.flight === mine) {
+    const frames = await ahead;
+    const next = (at + 1) % poses.length;
+    ahead = transit(poses[next], poses[(next + 1) % poses.length], steps);
+    if (!frames || !frames.length) break;
+    window.__dash?.onFlying?.(next + 1, poses.length);
+    await playTransit(frames, segment, mine);
+    at = next;
+    state.flyFrom = at;
+  }
+  if (state.flight !== mine) return;
+  state.flying = false;
+  placeFlier(null);
+  window.__dash?.onFlying?.(0, poses.length);
+}
+
+function stopFlying() {
+  // Puts the arm away here rather than leaving it to the loop's own tail:
+  // several loops can be unwinding at once once a plan has been republished,
+  // and "stopped" has to mean "gone from the canvas" whichever one gets there
+  // first. Deliberately not bumping the flight number -- only a replacement
+  // flight does that, and that is what makes the one it replaced stand down.
+  state.flying = false;
+  placeFlier(null);
+  window.__dash?.onFlying?.(0, state.ghostNodes.length);
+}
+
 /* ---------------- poll ---------------- */
 
 let inFlight = false;
@@ -289,8 +611,22 @@ async function poll() {
       document.getElementById('loading')?.classList.add('hidden');
     }
     syncFrames(data.link_tf);
+    const links = data.gravity?.links || [];
+    // Rebuilt only when the masses themselves change, not every poll: the
+    // markers are static geometry, it is the kinematics under them that moves.
+    const key = links.map((item) => `${item.link}:${item.mass_kg}`).join('|');
+    if (key !== state.massKey) {
+      state.massKey = key;
+      buildGravity(links);
+    }
+    syncGravity();
+    if (data.preview_token !== state.previewToken) {
+      state.previewToken = data.preview_token;
+      await loadPreview();
+    }
     state.obstacles = data.obstacles || [];
     syncObstacles(state.obstacles);
+    if (data.moving) highlightPose(data.moving.phase, data.moving.index);
     window.__dash?.onViewer?.(data);
   } catch (error) {
     /* the panel already reports connection health */
@@ -315,6 +651,9 @@ bind('show-mesh', 'showMesh');
 bind('show-frames', 'showFrames');
 bind('show-labels', 'showLabels');
 bind('show-ghost', 'showGhost', () => { ghostGroup.visible = state.showGhost; });
+ghostGroup.visible = state.showGhost;
+bind('show-gravity', 'showGravity', () => setGravityVisible(state.showGravity));
+setGravityVisible(state.showGravity);
 
 for (const [id, mode] of [['gizmo-move', 'translate'],
                           ['gizmo-rotate', 'rotate'],
@@ -334,5 +673,6 @@ function frame() {
   requestAnimationFrame(frame);
   orbit.update();
   renderer.render(scene, camera);
+  if (state.showGravity) placeLabels();
 }
 frame();

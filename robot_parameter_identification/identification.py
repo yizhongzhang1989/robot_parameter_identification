@@ -14,6 +14,7 @@ result predicts current directly, which is what the impedance controller needs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import math
 import subprocess
 import tempfile
 from pathlib import Path
@@ -75,11 +76,13 @@ class ArmModel:
             urdf_text, lambda name: name.startswith(prefix), repr(prefix))
 
     @classmethod
-    def from_profile(cls, urdf_text: str, profile) -> "ArmModel":
+    def from_profile(cls, urdf_text: str, profile,
+                     elsewhere_rad: dict | None = None) -> "ArmModel":
         """Keep exactly the joints the profile names, in the model's own order."""
         wanted = set(profile.joint_names)
         model = cls._reduced(
-            urdf_text, lambda name: name in wanted, f"profile {profile.name}")
+            urdf_text, lambda name: name in wanted, f"profile {profile.name}",
+            elsewhere_rad)
         missing = wanted.difference(model.joint_names)
         if missing:
             raise ValueError(
@@ -88,7 +91,8 @@ class ArmModel:
         return model
 
     @classmethod
-    def _reduced(cls, urdf_text: str, keep_joint, described: str) -> "ArmModel":
+    def _reduced(cls, urdf_text: str, keep_joint, described: str,
+                 elsewhere_rad: dict | None = None) -> "ArmModel":
         with tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False) as handle:
             handle.write(urdf_text)
             path = Path(handle.name)
@@ -102,9 +106,32 @@ class ArmModel:
             (keep if keep_joint(full.names[index]) else lock).append(index)
         if not keep:
             raise ValueError(f"no joints matched {described}")
-        reduced = pin.buildReducedModel(full, lock, pin.neutral(full))
+        reduced = pin.buildReducedModel(full, lock,
+                                        cls._reference(full, elsewhere_rad))
         names = [reduced.names[i] for i in range(1, reduced.njoints)]
         return cls(reduced, reduced.createData(), names)
+
+    @staticmethod
+    def _reference(full: pin.Model, elsewhere_rad: dict | None):
+        """Where the joints being locked away are held, in the reduced model.
+
+        Locking is not deletion: a locked joint's links stay in the model, at
+        the configuration given here, and that is what a collision screen then
+        checks against. Neutral is the safe default only because it is a pose
+        that can be commanded and held; when the rest of the robot can be
+        observed, where it actually is beats where it is assumed to be.
+        """
+        q = pin.neutral(full)
+        for name, radians in (elsewhere_rad or {}).items():
+            if not full.existJointName(name):
+                continue
+            joint = full.joints[full.getJointId(name)]
+            if joint.nq != 1:
+                continue
+            value = float(radians)
+            if math.isfinite(value):
+                q[joint.idx_q] = value
+        return q
 
     @property
     def joint_count(self) -> int:
@@ -210,6 +237,22 @@ class ArmModel:
             poses[frame.name] = self.data.oMf[index].homogeneous.reshape(
                 -1).tolist()
         return poses
+
+    def skeleton(self, q_deg) -> list[list[float]]:
+        """Joint origins then the last frame, as a polyline in the root frame.
+
+        Enough to see where a planned pose puts the arm without shipping every
+        link's full pose for every pose in a plan.
+        """
+        q = np.radians(np.asarray(q_deg, dtype=float))
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        points = [self.data.oMi[index].translation.tolist()
+                  for index in range(1, self.model.njoints)]
+        if len(self.model.frames):
+            points.append(
+                self.data.oMf[len(self.model.frames) - 1].translation.tolist())
+        return points
 
 
 def friction_row(velocity_deg_s: float) -> np.ndarray:

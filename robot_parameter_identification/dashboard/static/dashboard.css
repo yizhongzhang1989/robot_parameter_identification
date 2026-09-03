@@ -135,6 +135,20 @@ html, body {
 #chart-trace { width: 100%; display: block; }
 #trace-box .hint { margin: 4px 0 0; font-size: 10px; }
 
+/* Mass readouts, projected onto the canvas every rendered frame. Under the
+   editable overlays, and transparent to the pointer, so they never take a
+   click meant for a box. */
+#gravity-labels { position: absolute; inset: 0; pointer-events: none;
+                  z-index: 1; overflow: hidden; }
+.mass-label {
+  position: absolute; transform: translate(-50%, -155%);
+  padding: 1px 5px; border-radius: 4px; white-space: nowrap;
+  background: rgba(11,13,17,.72); border: 1px solid rgba(255,107,107,.45);
+  font: 10px/1.35 ui-monospace, monospace; color: #ffb0b0;
+}
+.mass-label span { display: block; color: var(--muted); font-size: 9px; }
+.mass-label.total { border-color: rgba(110,231,255,.55); color: #9ceaff; }
+
 #loading {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center; gap: 10px;
@@ -147,6 +161,25 @@ html, body {
   animation: spin .8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------------- panel groups ---------------- */
+
+.group { border-bottom: 1px solid var(--line); margin: 0 -12px; padding: 0 12px; }
+.group > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  padding: 9px 2px; margin: 0 -2px;
+  font-size: 11px; font-weight: 600; letter-spacing: .8px;
+  text-transform: uppercase; color: var(--muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.group > summary::-webkit-details-marker { display: none; }
+.group > summary::before {
+  content: '\25B8'; font-size: 10px; transition: transform .12s ease;
+}
+.group[open] > summary::before { transform: rotate(90deg); }
+.group > summary:hover { color: var(--accent); }
+.group[open] > summary { color: #d7dce6; }
+.group > .card:last-child { margin-bottom: 12px; }
 
 /* ---------------- cards ---------------- */
 
@@ -315,6 +348,35 @@ table.live td.bad { color: var(--bad); }
 table.live .unit { opacity: .6; }
 table.live .tag { color: var(--accent); font-size: 9px; padding: 0 4px;
   border: 1px solid rgba(77,163,255,.4); border-radius: 3px; }
+
+/* ---------------- planner envelope ---------------- */
+
+/* Fixed layout so the two editable columns share what is left after the joint
+   name and the reference range, instead of the inputs setting the width and
+   pushing the table past the panel. */
+#space-joints { table-layout: fixed; }
+#space-joints th, #space-joints td { padding: 2px 4px; }
+#space-joints col.j { width: 28px; }
+#space-joints col.edit { width: 25%; }
+#space-joints input {
+  width: 100%; min-width: 0; box-sizing: border-box;
+  padding: 2px 4px; font-size: 11px;
+  background: #10141b; color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+#space-joints input:focus { outline: 1px solid var(--accent); }
+/* A value typed but not yet applied is not the value the planner is using. */
+#space-joints input.dirty { color: var(--bad); border-color: var(--bad); }
+#space-joints .arm { font-size: 10px; color: var(--muted); text-align: right;
+                     overflow: hidden; text-overflow: ellipsis; }
+/* The set-all boxes hold three digits; letting them take a whole row each is
+   what pushed this card past the panel. A flex item will not shrink below its
+   content's own width without min-width, and a number input's is ~200px. */
+#group-space .row .field { flex: 0 0 88px; min-width: 0; margin: 0; }
+#group-space .row .field input { width: 100%; box-sizing: border-box;
+                                 min-width: 0; }
+#group-space .row { align-items: flex-end; }
 
 /* ---------------- saved runs ---------------- */
 

@@ -79,13 +79,15 @@ class DashboardNode(Node):
             follow_joint_trajectory_action=self._resolve_action(),
             robot_description_topic=str(
                 get("robot_description_topic", "/robot_description")))
+        # The launch argument is symmetric; the panel may make it not.
+        workspace = self._declare_floats("workspace_limit_deg")
         config = DashboardConfig(
             profile_path=str(get("profile_path", "")),
             output_directory=str(get("output_directory",
                                      "identification_results")),
-            obstacle_path=str(get("obstacle_file", "")),
-            workspace_limit_deg=tuple(
-                self._declare_floats("workspace_limit_deg")),
+            config_file_path=str(get("config_file_path", "")),
+            safety_margin_m=float(get("safety_margin_m", 0.02)),
+            workspace_range_deg=tuple((-value, value) for value in workspace),
             maximum_speed_deg_s=float(get("maximum_speed_deg_s", 0.0)),
             telemetry=telemetry, commands=commands)
 
@@ -338,9 +340,15 @@ class DashboardNode(Node):
         elsewhere = {name: float(value) for name, value in positions.items()
                      if name not in driven and value is not None
                      and np.isfinite(value)}
-        if elsewhere:
-            with self._lock:
-                self._elsewhere = elsewhere
+        if not elsewhere:
+            return
+        with self._lock:
+            first = not self._elsewhere
+            self._elsewhere = elsewhere
+        # The latched URDF beats the first joint state, so the screen is
+        # usually built before this is known. Once per session, rebuild it.
+        if first:
+            self.service.adopt_elsewhere()
 
     def elsewhere(self) -> dict:
         with self._lock:
@@ -445,6 +453,7 @@ class DashboardNode(Node):
 
     def hardware_plant(self, profile, collision_scene,
                        require_neutral_start: bool = True,
+                       expected_start_deg=(),
                        maximum_speed_deg_s: float | None = None):
         from ..plants.ros_control import HardwareConfig, HardwarePlant  # noqa: PLC0415
 
@@ -452,7 +461,8 @@ class DashboardNode(Node):
             action=self.service.config.commands.follow_joint_trajectory_action,
             state_topic=self._spec.topic(),
             signals=self._spec.signals,
-            require_neutral_start=require_neutral_start)
+            require_neutral_start=require_neutral_start,
+            expected_start_deg=tuple(float(v) for v in expected_start_deg))
         if maximum_speed_deg_s is not None:
             config.maximum_speed_deg_s = float(maximum_speed_deg_s)
         # The plant must build its OWN node, context and executor. Lending it

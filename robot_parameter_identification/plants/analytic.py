@@ -152,6 +152,40 @@ class AnalyticPlant:
             self._clock += trajectory.duration_s / steps
             yield self._sample(pose, velocity, acceleration, "track")
 
+    def probe_pose(self, pose_deg, delta_deg: float, speed_deg_s: float,
+                   tag: str = "") -> list[dict]:
+        """The hardware plant's bidirectional crossing, in equations.
+
+        Without it a rehearsal falls back to standing still, and the one thing
+        a gravity run depends on -- that the two directions bracket gravity --
+        is the one thing the rehearsal would never exercise.
+        """
+        pose = np.asarray(pose_deg, dtype=float)
+        low, high = self.limits_deg()
+        step = np.full(self.joint_count, abs(float(delta_deg)))
+        start = np.clip(pose - step, low, high)
+        end = np.clip(pose + step, low, high)
+        prefix = tag or "gravity"
+        speed = abs(float(speed_deg_s))
+        frames = []
+        for sign, mark in ((1.0, "+"), (-1.0, "-")):
+            travel = (end - start) if sign > 0.0 else (start - end)
+            span = float(np.max(np.abs(travel)))
+            if span <= 0.0 or speed <= 0.0:
+                continue
+            velocity = travel / span * speed
+            origin = start if sign > 0.0 else end
+            duration = max(span / speed, MINIMUM_SEGMENT_S)
+            count = max(1, int(self.windows_per_move))
+            for index in range(count):
+                share = 0.2 + 0.6 * (index + 0.5) / count
+                self._clock += duration / count
+                sample = self._sample(origin + travel * share, velocity,
+                                      np.zeros(self.joint_count), "probe")
+                sample["motion"] = f"{prefix}:{speed:g}:{mark}"
+                frames.append(sample)
+        return frames
+
     # -- effort model ----------------------------------------------------
 
     def effort(self, pose_deg, velocity_deg_s, acceleration_deg_s2) -> np.ndarray:

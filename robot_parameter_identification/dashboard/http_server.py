@@ -22,6 +22,20 @@ def build_routes(service, node=None) -> dict:
                                query.get("since", 0))),
         "/api/runs": ("GET", lambda _body: {"runs": service.runs()}),
         "/api/viewer": ("GET", lambda _body: _viewer(service, node)),
+        "/api/preview": ("GET", lambda _body: service.preview_payload()),
+        "/api/workspace": ("GET", lambda _body: service.workspace_payload()),
+        "/api/workspace/set": ("POST",
+                               lambda body: service.set_workspace_range(
+                                   body["range_deg"])
+                               if "range_deg" in body
+                               else service.set_workspace_limit(
+                                   body.get("limit_deg"))),
+        "/api/plan": ("POST",
+                      lambda body: service.plan_preview(
+                          str(body.get("mode", "gravity")),
+                          body.get("options") or {})),
+        "/api/rescreen": ("POST", lambda _body: service.rescreen()),
+        "/api/kinematics": ("POST", lambda body: service.kinematics(body)),
         "/api/profile": ("GET", lambda _body: service.profile_payload()),
         "/api/profile/apply": ("POST",
                                lambda body: service.apply_profile(
@@ -31,6 +45,9 @@ def build_routes(service, node=None) -> dict:
                                   str(body.get("name", "")))),
         "/api/profile/reset": ("POST", lambda _body: service.reset_profile()),
         "/api/obstacles": ("POST", lambda body: _obstacles(service, body)),
+        "/api/config/save": ("POST",
+                             lambda body: service.save_config(
+                                 str(body.get("name", "")))),
         "/api/collision": ("POST",
                            lambda body: service.collision_report(
                                body.get("pose_deg"))),
@@ -64,8 +81,6 @@ def _obstacles(service, body: dict):
         return {"ok": True}
     if action == "clear":
         return {"ok": True, "obstacles": service.replace_obstacles([])}
-    if action == "save":
-        return service.save_obstacles(str(body.get("name", "")))
     return {"ok": True,
             "obstacles": service.replace_obstacles(body.get("obstacles") or [])}
 

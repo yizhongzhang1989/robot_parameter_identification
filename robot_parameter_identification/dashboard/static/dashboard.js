@@ -20,7 +20,17 @@ const state = { snapshot: null, selected: null, frames: [], unit: 'A',
                 // which joints are in it, and the frames behind it.
                 signal: 'position_deg', hidden: new Set(), trace: [],
                 jointNames: [], cursor: 0, rate: 0, rows: [], rowKey: '',
-                lastFrameAt: 0, plot: 'normal' };
+                lastFrameAt: 0, plot: 'normal',
+                // The gravity numbers a dry run was last asked to validate.
+                gravityRehearsed: '', gravitySeeded: false,
+                // The designed poses under review, and which one is pointed at.
+                plannedPoses: [], poseAt: 0, previewToken: -1,
+                // Set when the operator stops the flight by hand, so the run
+                // does not immediately start it again on the next poll.
+                flyOptOut: false, wasRunning: false, flyAuto: false,
+                // The envelope the server last confirmed, so a value being
+                // typed is not overwritten by the next poll.
+                spaceApplied: '' };
 
 /* ---------------- language ---------------- */
 
@@ -69,6 +79,11 @@ window.__dash = {
       state.frames = data.frames;
       fillFrames();
     }
+  },
+  // The flier reports which transit it is on; the reviewer follows it so the
+  // numbers under the canvas belong to the arm being watched.
+  onFlying: (at, total) => {
+    if (at) showPose(at - 1);
   },
 };
 
@@ -120,8 +135,7 @@ $('obst-clear').addEventListener('click', async () => {
 });
 
 $('obst-save').addEventListener('click', async () => {
-  const data = await post('/api/obstacles',
-                          { action: 'save', name: $('obst-file').value.trim() });
+  const data = await post('/api/config/save', { name: $('obst-file').value.trim() });
   if (data.ok) toast(t('obst.saved', { v: data.path }), 'ok');
 });
 
@@ -169,12 +183,12 @@ function renderObstacleList() {
   const list = $('obst-list');
   const boxes = state.snapshot?.obstacles || [];
   $('obst-count').textContent = String(boxes.length);
-  const where = state.snapshot?.obstacle_file || '';
-  const autosave = state.snapshot?.obstacle_autosave || '';
-  $('obst-file').placeholder = where.split('/').pop() || 'obstacles.json';
+  const where = state.snapshot?.config_file || '';
+  const autosave = state.snapshot?.config_autosave || '';
+  $('obst-file').placeholder = where.split('/').pop() || 'dashboard_config.json';
   // Saying where it already goes is the point: the name is what gets carried
   // to the next arm, and the launch argument is where it is picked up again.
-  // Without obstacle_file:= nothing is kept at all, and a hint naming a file
+  // Without config_file_path:= nothing is kept at all, and a hint naming a file
   // anyway is how a drawn scene goes missing across a restart.
   $('obst-where').textContent = autosave
     ? t('obst.where', { v: autosave }) : t('obst.nowhere');
@@ -212,12 +226,361 @@ $('btn-sweep').addEventListener('click', () => post('/api/campaign', {
   options: { resume: $('sweep-resume').checked },
 }));
 
+/* ---------------- gravity identification ----------------
+ * Its own mode because its answer stands on its own: it is what holds the arm
+ * up, and it takes minutes rather than the hour a full campaign does. Its
+ * arming is tied to the numbers that were rehearsed, so the card stays
+ * editable and it is the permission that expires, not the settings.
+ */
+
+const GRAVITY_FIELDS = ['grav-poses', 'grav-check', 'grav-arc',
+                        'grav-slow', 'grav-fast'];
+
+function gravityOptions() {
+  const num = (id) => parseFloat($(id).value);
+  return {
+    static_poses: parseInt($('grav-poses').value, 10),
+    gravity_validation_poses: parseInt($('grav-check').value, 10),
+    gravity_probe_deg: num('grav-arc'),
+    gravity_probe_speeds_deg_s: [num('grav-slow'), num('grav-fast')],
+  };
+}
+
+$('btn-grav-rehearse').addEventListener('click', async () => {
+  const options = gravityOptions();
+  const answer = await post('/api/campaign',
+                            { mode: 'gravity_rehearsal', options });
+  if (answer.ok) state.gravityRehearsed = JSON.stringify(options);
+});
+$('btn-grav-run').addEventListener('click', () => post('/api/campaign', {
+  mode: 'gravity', options: gravityOptions(),
+}));
+
+$('btn-rescreen').addEventListener('click', () => post('/api/rescreen', {}));
+for (const id of GRAVITY_FIELDS) {
+  $(id).addEventListener('input', () => { if (state.snapshot) renderGravity(state.snapshot); });
+}
+
+/** Whether the numbers on screen are the ones a passing dry run validated.
+ *
+ * The server decides for real; this only keeps the button from promising
+ * something it will be refused for. A reload loses what was rehearsed here, so
+ * the server's word is taken until the operator edits something. */
+function gravityArmed(snapshot) {
+  if (!snapshot.gravity_armed) return false;
+  if (!state.gravityRehearsed) return true;
+  return state.gravityRehearsed === JSON.stringify(gravityOptions());
+}
+
+function renderGravity(snapshot) {
+  const busy = snapshot.state === 'running' || !!snapshot.jogging;
+  const armed = gravityArmed(snapshot);
+  // Everything the screen says is conditional on the joints this dashboard
+  // cannot drive being where the screen puts them, which is neutral.
+  const astray = snapshot.astray || [];
+  const planning = !!snapshot.planning;
+  $('btn-grav-rehearse').disabled = busy || planning || !snapshot.have_model;
+  $('btn-grav-plan').disabled = busy || planning || !snapshot.have_model;
+  $('btn-grav-run').disabled = busy || planning || !armed || astray.length > 0;
+  const note = $('grav-state');
+  if (planning) {
+    note.textContent = t('grav.planning');
+    note.style.color = 'var(--warn)';
+  } else if (astray.length) {
+    note.textContent = t('grav.astray', {
+      v: astray.slice(0, 4)
+        .map((j) => `${j.joint} ${j.moved_deg > 0 ? '+' : ''}${j.moved_deg}°`)
+        .join(', ') });
+    note.style.color = 'var(--bad)';
+  } else if (armed) {
+    note.textContent = t('grav.armed');
+    note.style.color = 'var(--ok)';
+  } else if (snapshot.gravity_armed) {
+    note.textContent = t('grav.stale');
+    note.style.color = 'var(--warn)';
+  } else {
+    note.textContent = t('grav.locked');
+    note.style.color = 'var(--muted)';
+  }
+  $('btn-rescreen').classList.toggle('hidden', !astray.length);
+  $('btn-rescreen').disabled = busy || planning;
+
+  const options = gravityOptions();
+  const speeds = options.gravity_probe_speeds_deg_s.filter((v) => v > 0);
+  const least = snapshot.gravity_defaults?.minimum_poses || 0;
+  if (!planning && !astray.length && least
+      && options.static_poses < least) {
+    note.textContent = t('grav.toofew', { v: least });
+    note.style.color = 'var(--bad)';
+  }
+  // A rehearsal moves nothing, so say which pose it is on: without it the
+  // only sign a dry run is happening is that the buttons went grey.
+  const at = snapshot.progress || {};
+  if (busy && String(at.mode || '').startsWith('gravity') && at.poses) {
+    note.textContent = t('grav.visiting',
+                         { v: `${at.pose || 0} / ${at.poses}` });
+    note.style.color = 'var(--warn)';
+  }
+  // A rehearsal moves nothing on the bench, so the tour is flown in the
+  // canvas instead of watched. A run designs its own poses and only publishes
+  // them once the design is screened, so this has to keep trying rather than
+  // fire on the instant the run began -- there was nothing to fly yet.
+  const running = String(at.mode || '').startsWith('gravity') && busy;
+  if (running && !state.wasRunning) state.flyOptOut = false;
+  state.wasRunning = running;
+  if (running && !state.flyOptOut && !window.__viewer?.flying?.()) {
+    state.flyAuto = true;
+    window.__viewer?.fly?.();
+  }
+  // A flight the run started ends with it. One started by hand does not.
+  if (!running && state.flyAuto) {
+    state.flyAuto = false;
+    window.__viewer?.stopFlying?.();
+  }
+  // Read back rather than remembered: the flight also ends on its own, and a
+  // button captioned "stop" beside an arm that is not moving is a lie.
+  $('pose-fly').textContent = window.__viewer?.flying?.()
+    ? t('inspect.land') : t('inspect.fly');
+  const rows = [[t('grav.passes'),
+                 (options.static_poses + options.gravity_validation_poses)
+                   * speeds.length * 2]];
+  const result = snapshot.result;
+  if (result && String(result.mode || '').startsWith('gravity')) {
+    const errors = result.validation_rms_a || [];
+    if (errors.length) {
+      const unit = state.unit;
+      const mean = errors.reduce((a, b) => a + b, 0) / errors.length;
+      rows.push([t('grav.holdout'), `${mean.toFixed(4)} ${unit}`]);
+      rows.push([t('grav.worst'),
+                 `${Math.max(...errors).toFixed(4)} ${unit}`]);
+    }
+  }
+  rows.push([t('grav.preview'), window.__viewer?.plannedPoses?.() ?? 0]);
+  $('grav-table').innerHTML = rows.map(
+    ([k, v]) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
+}
+
+/* ---------------- planner envelope ----------------
+ * The one number that decides whether a designed pose can reach the other arm.
+ * It lives here rather than only in a launch argument because it describes the
+ * cell, which is what changes between one session and the next.
+ */
+
+/** What the planner is actually using, which is what a field is compared to.
+ *
+ * The arm's own range when nothing is set -- NOT the effective range, which
+ * has the position margin already taken off it. Seeding the fields from the
+ * effective range would make every Apply narrow the envelope by another
+ * margin, ratcheting it shut over a few clicks. */
+function appliedRanges(space) {
+  const set = space.range_deg || [];
+  return set.length ? set : (space.urdf_range_deg || []);
+}
+
+function renderWorkspace(snapshot) {
+  const space = snapshot.workspace || {};
+  const names = space.joint_names || [];
+  const ceiling = space.urdf_range_deg || [];
+  const applied = appliedRanges(space);
+  const table = $('space-joints');
+  if (table.rows.length !== names.length + 1) {
+    table.innerHTML = '<colgroup><col class="j"/><col class="edit"/>'
+      + '<col class="edit"/><col/></colgroup>'
+      + `<tr><th></th><th>${t('space.low')}</th>`
+      + `<th>${t('space.high')}</th><th>${t('space.arm')}</th></tr>`
+      + names.map((name, index) =>
+        `<tr><td title="${name}">J${index + 1}</td>`
+        + `<td><input id="space-lo${index}" type="number" step="1"/></td>`
+        + `<td><input id="space-hi${index}" type="number" step="1"/></td>`
+        + `<td class="arm" id="space-arm${index}"></td></tr>`).join('');
+    state.spaceApplied = '';
+  }
+  // Only overwrite the fields when the APPLIED envelope changed, so a value
+  // being typed is never yanked back by the next poll. When it does change the
+  // operator asked for it, so even the focused field is refreshed -- leaving
+  // it stale is how Reset used to appear to ignore one row.
+  const key = JSON.stringify(applied);
+  const fresh = key !== state.spaceApplied;
+  if (fresh) state.spaceApplied = key;
+  names.forEach((_name, index) => {
+    const bound = applied[index] || [0, 0];
+    [[`space-lo${index}`, bound[0]], [`space-hi${index}`, bound[1]]]
+      .forEach(([id, value]) => {
+        const field = $(id);
+        if (!field) return;
+        if (fresh) field.value = value;
+        field.classList.toggle('dirty', parseFloat(field.value) !== value);
+      });
+    const arm = ceiling[index];
+    const cell = $(`space-arm${index}`);
+    if (cell && arm) cell.textContent = `${arm[0]} … ${arm[1]}`;
+  });
+  const editable = space.editable !== false;
+  for (const id of ['space-apply', 'space-reset', 'space-fill',
+                    'space-all-low', 'space-all-high']) {
+    $(id).disabled = !editable;
+  }
+  const pending = names.some((_n, index) =>
+    $(`space-lo${index}`)?.classList.contains('dirty')
+    || $(`space-hi${index}`)?.classList.contains('dirty'));
+  const widest = (space.effective_range_deg || []).length
+    ? Math.max(...space.effective_range_deg.map(
+      (pair) => Math.max(...pair.map(Math.abs)))) : null;
+  $('space-state').textContent = pending
+    ? t('space.pending')
+    : (space.range_deg || []).length
+      ? t('space.set')
+      : t('space.unset', { v: widest == null ? '?' : widest.toFixed(0) });
+  $('space-state').style.color = pending ? 'var(--bad)'
+    : (space.range_deg || []).length ? 'var(--muted)' : 'var(--warn)';
+}
+
+/** Repaint the dirty marks as soon as a digit changes, not on the next poll. */
+$('space-joints').addEventListener('input', () => {
+  if (state.snapshot) renderWorkspace(state.snapshot);
+});
+
+function workspaceRanges() {
+  const names = (state.snapshot?.workspace?.joint_names) || [];
+  return names.map((_n, index) => [parseFloat($(`space-lo${index}`).value),
+                                   parseFloat($(`space-hi${index}`).value)]);
+}
+
+$('space-fill').addEventListener('click', () => {
+  const low = parseFloat($('space-all-low').value);
+  const high = parseFloat($('space-all-high').value);
+  if (!Number.isFinite(low) || !Number.isFinite(high)) return;
+  const names = (state.snapshot?.workspace?.joint_names) || [];
+  names.forEach((_n, index) => {
+    $(`space-lo${index}`).value = low;
+    $(`space-hi${index}`).value = high;
+  });
+  if (state.snapshot) renderWorkspace(state.snapshot);
+});
+$('space-apply').addEventListener('click', async () => {
+  const answer = await post('/api/workspace/set', { range_deg: workspaceRanges() });
+  if (answer.ok) toast(t('space.applied'), 'ok');
+});
+$('space-reset').addEventListener('click', async () => {
+  const answer = await post('/api/workspace/set', { range_deg: [] });
+  if (answer.ok) toast(t('space.wasreset'), 'ok');
+});
+
+/* ---------------- reviewing the planned poses ---------------- */
+
+$('btn-grav-plan').addEventListener('click', async () => {
+  const answer = await post('/api/plan',
+                            { mode: 'gravity', options: gravityOptions() });
+  if (answer.ok) {
+    state.poseAt = 0;
+    setTimeout(() => showPose(0), 400);
+  }
+});
+
+/** Walk the drawn poses. The 3D view is the review; this only points at one. */
+function showPose(index) {
+  const poses = state.plannedPoses;
+  if (!poses.length) {
+    $('pose-where').textContent = t('inspect.none');
+    $('pose-detail').textContent = '';
+    return;
+  }
+  const at = Math.max(0, Math.min(index, poses.length - 1));
+  state.poseAt = at;
+  const pose = poses[at];
+  window.__viewer?.highlight?.(pose.phase, pose.index);
+  $('pose-where').textContent = `${at + 1} / ${poses.length}`;
+  const clearance = pose.clearance || {};
+  const margin = clearance.margin_m;
+  const angles = pose.pose_deg.map((v) => v.toFixed(0)).join(', ');
+  // Naming what limits the pose is the point: a pair fixed by the arm's own
+  // construction bounds every pose alike and is not something to plan away.
+  const against = clearance.against
+    ? ` (${clearance.against.replace(/_0\b/g, '')})` : '';
+  $('pose-detail').textContent =
+    `${phaseLabel(pose.phase)} · ${t('inspect.margin')} `
+    + `${margin == null ? '—' : `${(margin * 1000).toFixed(0)} mm`}${against}`
+    + ` · [${angles}]`;
+  $('pose-detail').style.color =
+    margin != null && margin <= 0.02 ? 'var(--warn)' : 'var(--muted)';
+}
+
+$('pose-prev').addEventListener('click', () => showPose(state.poseAt - 1));
+$('pose-next').addEventListener('click', () => showPose(state.poseAt + 1));
+$('pose-fly').addEventListener('click', () => {
+  if (window.__viewer?.flying?.()) {
+    state.flyOptOut = true;
+    window.__viewer.stopFlying();
+  } else {
+    state.flyOptOut = false;
+    state.flyAuto = false;
+    window.__viewer?.fly?.();
+  }
+});
+$('pose-worst').addEventListener('click', () => {
+  const poses = state.plannedPoses;
+  if (!poses.length) return;
+  let worst = 0;
+  poses.forEach((pose, index) => {
+    const here = pose.clearance?.margin_m ?? Infinity;
+    const best = poses[worst].clearance?.margin_m ?? Infinity;
+    if (here < best) worst = index;
+  });
+  showPose(worst);
+});
+
+/** Keep the reviewer's list in step with what the canvas drew. */
+async function refreshPlannedPoses(token) {
+  if (token === state.previewToken) return;
+  state.previewToken = token;
+  try {
+    const data = await (await fetch('/api/preview', { cache: 'no-store' })).json();
+    state.plannedPoses = (data.groups || []).flatMap(
+      (group) => (group.poses || []).map(
+        (pose) => ({ ...pose, phase: group.phase })));
+  } catch (error) {
+    state.plannedPoses = [];
+  }
+  for (const id of ['pose-prev', 'pose-next', 'pose-worst', 'pose-fly']) {
+    $(id).disabled = !state.plannedPoses.length;
+  }
+  showPose(state.poseAt);
+}
+
+/* ---------------- collapsible panel groups ---------------- */
+
+for (const group of document.querySelectorAll('#panel details.group')) {
+  const key = `rpi-${group.id}`;
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored !== null) group.open = stored === '1';
+  } catch (error) { /* private mode: the markup's default stands */ }
+  group.addEventListener('toggle', () => {
+    try { localStorage.setItem(key, group.open ? '1' : '0'); }
+    catch (error) { /* ignore */ }
+  });
+}
+
 /* ---------------- render ---------------- */
 
 function pill(id, ok, label) {
   const node = $(id);
   node.className = 'pill ' + (ok === null ? '' : ok ? 'good' : 'bad');
   node.textContent = label;
+}
+
+/** How far the planner may swing each joint, and where that bound came from.
+ *
+ * Without `workspace_limit_deg:=` the planner uses the URDF's own range, which
+ * on this arm is +/-178 deg and puts poses inside the other arm's reach. That
+ * is a legitimate choice on a bare bench and a bad one in a cell, so it is
+ * stated rather than left to be discovered from the drawn poses. */
+function describeEnvelope(snapshot) {
+  const reach = snapshot.reach_range_deg || [];
+  if (!reach.length) return '—';
+  const low = Math.min(...reach.map((pair) => pair[0]));
+  const high = Math.max(...reach.map((pair) => pair[1]));
+  return `${low.toFixed(0)}° … ${high.toFixed(0)}°`;
 }
 
 function renderConnection(snapshot) {
@@ -245,6 +608,9 @@ function renderConnection(snapshot) {
       ? t('profile.from_panel') : (snapshot.profile_source || 'none')],
     ['conn.shapes', collision.robot_shapes ?? '—'],
     ['conn.obstacles', collision.enabled_obstacles ?? 0],
+    ['conn.margin', collision.safety_margin_m == null
+      ? '—' : `${(collision.safety_margin_m * 1000).toFixed(0)} mm`],
+    ['conn.envelope', describeEnvelope(snapshot)],
   ];
   const extra = connection.extra_topics || [];
   if (extra.length) rows.splice(2, 0, ['conn.extra_topics', extra.join(', ')]);
@@ -303,6 +669,22 @@ function renderSweep(snapshot) {
   });
 }
 
+/** Fill the gravity card from the plan in force, once, before it is edited. */
+function seedGravityFields(snapshot) {
+  const defaults = snapshot.gravity_defaults;
+  if (state.gravitySeeded || !defaults || !Object.keys(defaults).length) return;
+  state.gravitySeeded = true;
+  const set = (id, value) => {
+    if (value != null && document.activeElement !== $(id)) $(id).value = value;
+  };
+  set('grav-poses', defaults.static_poses);
+  set('grav-check', defaults.gravity_validation_poses);
+  set('grav-arc', defaults.gravity_probe_deg);
+  const speeds = defaults.gravity_probe_speeds_deg_s || [];
+  set('grav-slow', speeds[0]);
+  set('grav-fast', speeds[speeds.length - 1]);
+}
+
 function renderRun(snapshot) {
   const running = snapshot.state === 'running';
   // Jogging holds the trajectory action open, so a campaign cannot have it.
@@ -322,6 +704,10 @@ function renderRun(snapshot) {
   // it proves for itself before planning any motion.
   $('btn-sweep').disabled = busy || !snapshot.have_model;
   renderSweep(snapshot);
+  seedGravityFields(snapshot);
+  renderGravity(snapshot);
+  renderWorkspace(snapshot);
+  refreshPlannedPoses(snapshot.preview_token);
   $('ack-hint').textContent = snapshot.rehearsal_passed
     ? t('run.armed') : t('run.locked');
 
@@ -351,6 +737,11 @@ function renderRun(snapshot) {
     bits.push(t('run.worst', { v: progress.worst_deg }));
   }
   $('progress-line').textContent = bits.join(' · ') || t('run.notstarted');
+  // Draw the pose being visited solid among the planned skeletons, so the plan
+  // and the arm can be compared while the run is going.
+  if (progress.pose != null && progress.phase) {
+    window.__viewer?.highlight?.(progress.phase, progress.pose);
+  }
   const failed = progress.phase === 'failed';
   if (progress.error) {
     $('progress-line').textContent =
@@ -591,7 +982,7 @@ const jog = { rows: [], key: '', held: false };
 function renderJog(snapshot) {
   const names = (snapshot.driven_joints || []).length
     ? snapshot.driven_joints : (snapshot.joint_names || []);
-  const limits = snapshot.reach_deg || [];
+  const limits = snapshot.reach_range_deg || [];
   const jogging = !!snapshot.jogging;
   const ready = names.length > 0 && limits.length === names.length;
 
@@ -621,7 +1012,7 @@ function buildJogRows(names, limits) {
   $('jog-sliders').innerHTML = names.map((name, index) =>
     `<div class="jogrow"><span class="name" title="${name}">${name}</span>`
     + `<input type="range" data-joint="${index}" disabled`
-    + ` min="${-limits[index]}" max="${limits[index]}" step="0.1" value="0"/>`
+    + ` min="${limits[index][0]}" max="${limits[index][1]}" step="0.1" value="0"/>`
     + `<span class="val" data-readout="${index}">0.0\u00b0</span></div>`).join('');
   jog.rows = [...$('jog-sliders').children].map((row) => ({
     slider: row.querySelector('input'),
@@ -701,6 +1092,12 @@ function renderResult(snapshot) {
   const note = $('recovery');
   if (!recovery || !recovery.available) {
     note.textContent = '';
+  } else if (recovery.holdout_passed === false) {
+    // The pairing separates friction from gravity, so the planted Coulomb can
+    // come back exactly while the gravity columns are underdetermined.
+    note.textContent = t('recovery.gravity_bad', {
+      v: recovery.worst_holdout_a, t: recovery.holdout_tolerance });
+    note.style.color = 'var(--bad)';
   } else if (recovery.passed) {
     note.textContent = t('recovery.ok', { v: recovery.worst_coulomb_error,
                                           t: recovery.tolerance });

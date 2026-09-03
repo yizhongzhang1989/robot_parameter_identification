@@ -9,7 +9,7 @@ entirely -- is a change of arguments, not of code::
 
     ros2 launch robot_parameter_identification dashboard.launch.py \\
         controller:=left_arm_joint_trajectory_controller \\
-        port:=8301 obstacle_file:=/home/me/left_arm_obstacles.json
+        port:=8301 config_file_path:=/home/me/left_arm_cell.json
 
 Naming the controller is enough: the trajectory action and the controller-state
 topic both follow from it. ``follow_joint_trajectory_action`` remains for a
@@ -42,8 +42,10 @@ from launch_ros.parameter_descriptions import ParameterValue
 TEXT_ARGUMENTS = (
     ("profile_path", "", "robot profile YAML; blank derives one from the URDF"),
     ("output_directory", "identification_results", "where results are written"),
-    ("obstacle_file", "", "where the drawn obstacle scene is kept between "
-                          "sessions; blank keeps it in memory only"),
+    ("config_file_path", "", "where everything this panel edits is kept "
+                              "between sessions -- the obstacle scene, the "
+                              "planner envelope and the gravity settings; "
+                              "blank keeps them in memory only"),
     ("joint_state_topic", "/joint_states", "sensor_msgs/JointState source"),
     ("dynamic_joint_state_topic", "/dynamic_joint_states",
      "control_msgs/DynamicJointState source; blank falls back to joint_states"),

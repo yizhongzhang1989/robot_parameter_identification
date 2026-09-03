@@ -14,6 +14,14 @@ import numpy as np
 
 from . import identification as ident
 
+# Joint travel between consecutive collision checks along a path. A fixed
+# sample count tunnels: measured on this workspace a 300 deg swing checked at
+# 32 points left 9.4 deg between checks, which at arm's length is a 16 cm gap,
+# and a transit that passed took the wrist to 0.0 mm from the other arm.
+PATH_RESOLUTION_DEG = 2.0
+# Ceiling so one enormous swing cannot make a design take minutes.
+MAXIMUM_PATH_STEPS = 400
+
 
 @dataclass
 class DesignLimits:
@@ -38,18 +46,23 @@ class StaticPlan:
     """Poses for gravity identification, plus the conditioning they achieve."""
 
     poses_deg: list[list[float]] = field(default_factory=list)
+    # Where the tour leaves the arm standing, so the next one can start there.
+    final_deg: list[float] = field(default_factory=list)
     condition_number: float = float("inf")
     candidates_screened: int = 0
     rejected_by_collision: int = 0
+    rejected_by_crossing: int = 0
     rejected_by_path: int = 0
     travel_deg: float = 0.0
 
     def as_dict(self) -> dict:
         return {
             "poses_deg": [[round(v, 3) for v in pose] for pose in self.poses_deg],
+            "final_deg": [round(v, 3) for v in self.final_deg],
             "condition_number": float(self.condition_number),
             "candidates_screened": self.candidates_screened,
             "rejected_by_collision": self.rejected_by_collision,
+            "rejected_by_crossing": self.rejected_by_crossing,
             "rejected_by_path": self.rejected_by_path,
             "travel_deg": round(float(self.travel_deg), 1),
         }
@@ -62,9 +75,15 @@ def _static_rows(arm: ident.ArmModel, pose_deg) -> np.ndarray:
 def design_static_poses(
     arm: ident.ArmModel, limits: DesignLimits, count: int,
     candidates: int = 400, seed: int = 0, collision_free=None,
-    start_deg=None,
+    start_deg=None, crossing_deg: float = 0.0,
 ) -> StaticPlan:
-    """Greedily pick poses so the stacked gravity regressor is well conditioned."""
+    """Greedily pick poses so the stacked gravity regressor is well conditioned.
+
+    ``crossing_deg`` is the half-width the gravity probe will drive on every
+    joint at this pose. When given, a candidate has to clear that whole sweep,
+    and the tour is planned between the sweep's own start rather than the
+    centre -- which is where the arm actually goes.
+    """
     rng = np.random.default_rng(seed)
     low, high = limits.usable()
     plan = StaticPlan()
@@ -74,6 +93,11 @@ def design_static_poses(
         plan.candidates_screened += 1
         if collision_free is not None and not collision_free(pose):
             plan.rejected_by_collision += 1
+            if plan.candidates_screened > candidates * 20:
+                break
+            continue
+        if not _crossing_free(pose, crossing_deg, limits, collision_free):
+            plan.rejected_by_crossing += 1
             if plan.candidates_screened > candidates * 20:
                 break
             continue
@@ -98,30 +122,65 @@ def design_static_poses(
             break
         chosen.append(best_index)
 
+    # The arm travels to where the crossing starts, not to the centre, and it
+    # is left there when the crossing returns; the tour has to screen that.
+    approach = None
+    if crossing_deg > 0.0:
+        bounds = limits.usable()
+        approach = (lambda pose: np.clip(np.asarray(pose, dtype=float)
+                                         - crossing_deg, *bounds))
     ordered, plan.rejected_by_path = _short_tour(
-        [pool[index] for index in chosen], start_deg, collision_free)
+        [pool[index] for index in chosen], start_deg, collision_free, approach)
     if not ordered:
         return plan
     plan.poses_deg = [pose.tolist() for pose in ordered]
+    # Where the arm is left standing, which is the crossing's start and not
+    # the pose's centre. The next tour's first transit is screened from here.
+    reach = approach or (lambda pose: pose)
+    plan.final_deg = [float(value) for value in reach(ordered[-1])]
     plan.condition_number = ident.stacked_condition_number(
         [_static_rows(arm, pose) for pose in ordered])
     plan.travel_deg = _tour_length(ordered, start_deg)
     return plan
 
 
-def _path_free(start, end, collision_free, steps: int = 32) -> bool:
+def _path_free(start, end, collision_free, steps: int = 0) -> bool:
     """Joints interpolate between poses, so the swept path needs screening too.
 
     Two poses can each be clear while the straight line between them sweeps the
-    arm through an obstacle.
+    arm through an obstacle. The number of checks follows the distance -- a
+    caller's ``steps`` is a floor, not the answer -- because the gap between
+    checks is what decides whether a thin obstacle can be stepped over.
     """
     start = np.asarray(start, dtype=float)
     end = np.asarray(end, dtype=float)
-    for fraction in np.linspace(0.0, 1.0, steps + 1)[1:-1]:
+    travel = float(np.max(np.abs(end - start)))
+    needed = int(np.ceil(travel / PATH_RESOLUTION_DEG))
+    count = min(max(int(steps), needed, 8), MAXIMUM_PATH_STEPS)
+    for fraction in np.linspace(0.0, 1.0, count + 1)[1:-1]:
         if not collision_free(start + fraction * (end - start)):
             return False
     return True
 
+
+def _crossing_free(pose, crossing_deg: float, limits: "DesignLimits",
+                   collision_free) -> bool:
+    """The whole +/-delta the gravity probe drives, not just its centre.
+
+    The probe crosses the pose in both directions on every joint at once, so a
+    pose that clears can still put the arm somewhere ten degrees away that does
+    not. Measured here: a screened pose whose crossing reached 0.0 mm from the
+    other arm.
+    """
+    if collision_free is None or crossing_deg <= 0.0:
+        return True
+    low, high = limits.usable()
+    pose = np.asarray(pose, dtype=float)
+    start = np.clip(pose - crossing_deg, low, high)
+    end = np.clip(pose + crossing_deg, low, high)
+    if not collision_free(start) or not collision_free(end):
+        return False
+    return _path_free(start, end, collision_free)
 
 
 def _tour_length(poses, start_deg=None) -> float:
@@ -137,7 +196,7 @@ def _tour_length(poses, start_deg=None) -> float:
     return total
 
 
-def _short_tour(poses, start_deg=None, collision_free=None):
+def _short_tour(poses, start_deg=None, collision_free=None, approach=None):
     """Visit the same poses in a nearer-neighbour order, by a clear path.
 
     Conditioning depends on the set of poses, not the order they are visited in,
@@ -145,28 +204,35 @@ def _short_tour(poses, start_deg=None, collision_free=None):
     wall-clock time, and because a long unnecessary swing is alarming to whoever
     is standing next to the arm.
 
+    ``approach`` maps a pose to the configuration the arm actually drives to
+    and is left at. Screening the centres instead would check a path the arm
+    never flies.
+
     A pose unreachable from here may be reachable later, so blocked transits
     reorder the tour rather than discard the pose. Only poses no ordering can
     reach are dropped.
     """
     if not poses:
         return [], 0
+    reach = approach or (lambda pose: pose)
     remaining = list(poses)
     current = np.zeros_like(poses[0]) if start_deg is None else np.asarray(
         start_deg, dtype=float)
     ordered = []
     while remaining:
         order = sorted(range(len(remaining)),
-                       key=lambda i: float(np.max(np.abs(remaining[i] - current))))
+                       key=lambda i: float(np.max(np.abs(reach(remaining[i])
+                                                         - current))))
         chosen = next(
             (i for i in order
              if collision_free is None
-             or _path_free(current, remaining[i], collision_free)),
+             or _path_free(current, reach(remaining[i]), collision_free)),
             None)
         if chosen is None:
             return ordered, len(remaining)
-        current = remaining.pop(chosen)
-        ordered.append(current)
+        picked = remaining.pop(chosen)
+        current = reach(picked)
+        ordered.append(picked)
     return ordered, 0
 
 
