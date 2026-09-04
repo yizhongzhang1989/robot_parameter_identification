@@ -584,6 +584,14 @@ class DashboardShellTest(unittest.TestCase):
         self.assertIn("overflow-wrap: anywhere", self.styles)
         self.assertNotIn("-webkit-line-clamp", self.styles)
 
+    def test_the_dashboard_stacks_without_horizontal_scroll_on_small_screens(self):
+        mobile = self.styles.split("@media (max-width: 600px)", 1)[1]
+        self.assertIn("body { display: flex; flex-direction: column", mobile)
+        self.assertIn("grid-template-columns: minmax(0, 1fr)", mobile)
+        self.assertIn("#topbar > .spacer { display: none; }", mobile)
+        self.assertIn("#panel {", mobile)
+        self.assertIn("min-width: 0", mobile)
+
     def test_canvas_activity_is_mode_neutral(self):
         self.assertIn("onSceneActivity", self.panel)
         self.assertIn("data.scene_activity", self.viewer)
@@ -609,6 +617,19 @@ class DashboardShellTest(unittest.TestCase):
         self.assertIn("post('/api/resume', {})", self.panel)
         self.assertIn("snapshot.state === 'paused'", self.panel)
         self.assertIn("'grav.paused_pose'", self.translations)
+
+    def test_gravity_has_two_attended_validation_actions(self):
+        self.assertEqual(self.markup.count('id="btn-gravtest-hold"'), 1)
+        self.assertEqual(self.markup.count('id="btn-gravtest-drag"'), 1)
+        self.assertIn("post('/api/gravity-test'", self.panel)
+        self.assertIn("window.confirm(t('gravtest.confirm'))", self.panel)
+        self.assertIn("I_AM_HOLDING_ARM_AND_ESTOP_READY", self.panel)
+        self.assertIn("snapshot.result || {}", self.panel)
+        self.assertIn('id="gravtest-evidence"', self.markup)
+        self.assertIn('id="gravtest-capability"', self.markup)
+        self.assertIn("snapshot.gravity_test", self.panel)
+        self.assertNotIn("'signals.handoff'", self.translations)
+        self.assertNotIn("activity === 'gravity_hold_test'", self.panel)
 
     def test_gravity_status_exists_only_in_the_information_strip(self):
         self.assertNotIn('id="grav-state"', self.markup)

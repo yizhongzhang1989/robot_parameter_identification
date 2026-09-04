@@ -3,24 +3,28 @@
 from pathlib import Path
 import json
 import math
+import signal
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 import numpy as np
 
 try:
     from robot_parameter_identification import identification as ident
     from robot_parameter_identification import campaign as campaign_module
+    from robot_parameter_identification.dashboard import service as dashboard_service
     from robot_parameter_identification.dashboard.http_server import (
         DashboardServer, build_routes)
     from robot_parameter_identification.dashboard.service import (
         DashboardConfig, IdentificationService, _comparison, _swept_here,
         parse_gravity_terms, GRAVITY_MODE, GRAVITY_REHEARSAL,
-        RUNNING, PAUSED)
+        GRAVITY_DRAG_TEST, GRAVITY_HOLD_TEST,
+        GRAVITY_TEST_ACKNOWLEDGEMENT, RUNNING, PAUSED)
     from robot_parameter_identification.interfaces import (
         SignalMap, TelemetrySpec)
     from robot_parameter_identification.model import ModelComponents
@@ -197,6 +201,229 @@ class RunGateTest(unittest.TestCase):
 
     def test_no_acknowledgement_is_demanded_anywhere(self):
         self.assertNotIn("acknowledgement", service().snapshot())
+
+
+class GravityValidationTest(unittest.TestCase):
+    class Process:
+        def __init__(self, command, *, result="PASS", gate=None,
+                     exit_code=None):
+            self.command = command
+            self.returncode = None
+            self.signal = None
+            self.stdout = iter([])
+            self.result = result
+            self.gate = gate
+            self.exit_code = exit_code
+
+        def poll(self):
+            return self.returncode
+
+        def send_signal(self, number):
+            self.signal = number
+            if self.gate is not None:
+                self.gate.set()
+
+        def wait(self):
+            if self.gate is not None:
+                self.gate.wait(1.0)
+            self.returncode = (self.exit_code if self.exit_code is not None
+                               else 0 if self.result == "PASS" else 1)
+            return self.returncode
+
+    def made(self, directory, result="PASS", gate=None, exit_code=None):
+        processes = []
+
+        def launch(command, **_kwargs):
+            process = self.Process(
+                command, result=result, gate=gate, exit_code=exit_code)
+            folder = Path(command[command.index("--status-file") + 1]).parent
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "gravity_test_summary.json").write_text(json.dumps({
+                "result": result, "reason": "done" if result == "PASS" else "trip",
+            }))
+            processes.append(process)
+            return process
+
+        made = IdentificationService(
+            DashboardConfig(output_directory=directory),
+            profile=test_profile(), process_launcher=launch)
+        made.adopt_description(synthetic_urdf())
+        return made, processes
+
+    def wait(self, made):
+        deadline = time.monotonic() + 2.0
+        while made.snapshot()["state"] != "idle" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(made.snapshot()["state"], "idle")
+
+    def test_hold_set_requires_exact_ack_and_builds_bounded_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            refused = made.start_gravity_test(
+                GRAVITY_HOLD_TEST, {"acknowledgement": "not-ready"})
+            self.assertFalse(refused["ok"])
+            answer = made.start_gravity_test(GRAVITY_HOLD_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                "poses": 4, "seconds": 2,
+            })
+            self.assertTrue(answer["ok"])
+            self.wait(made)
+            command = processes[0].command
+            self.assertEqual(command[:5], [
+                "ros2", "run", "rm_control", "gravity_compensation_test",
+                "hold-set"])
+            self.assertEqual(command[command.index("--poses") + 1], "4")
+            self.assertEqual(command[command.index("--arm") + 1], "right")
+            result = made.snapshot()["result"]
+            self.assertEqual(result["result"], "PASS")
+            self.assertTrue(result["evidence"].endswith(
+                "/gravity_test_summary.json"))
+
+    def test_drag_is_mutually_exclusive_and_stop_sends_sigint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = threading.Event()
+            made, processes = self.made(directory, gate=gate)
+
+            answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+            })
+            self.assertTrue(answer["ok"])
+            process = processes[0]
+            self.assertEqual(
+                process.command[process.command.index("--seconds") + 1],
+                "10.0")
+            self.assertFalse(made.start("rehearsal")["ok"])
+            made.stop()
+            self.assertEqual(process.signal, signal.SIGINT)
+            gate.set()
+            self.wait(made)
+
+    def test_gravity_validation_is_reachable_over_http(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, _processes = self.made(directory)
+            routes = build_routes(made, None)
+            self.assertIn("/api/gravity-test", routes)
+            answer = routes["/api/gravity-test"][1]({
+                "mode": GRAVITY_HOLD_TEST,
+                "options": {"acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT},
+            })
+            self.assertTrue(answer["ok"])
+            self.wait(made)
+
+    def test_gravity_worker_does_not_treat_stdout_as_telemetry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made = IdentificationService(
+                DashboardConfig(output_directory=directory), bridge=None,
+                profile=test_profile())
+            summary = Path(directory) / "gravity_test_summary.json"
+            summary.write_text(json.dumps({"result": "PASS"}), encoding="utf-8")
+            process = self.Process([])
+            process.stdout = iter([
+                'GRAVITY_TELEMETRY {"joint_names":["right_arm_joint1"],'
+                '"position_deg":[12.5]}\n',
+                'GRAVITY_TEST {"phase":"running","message":"topic-only"}\n',
+            ])
+            made._run_gravity_test(GRAVITY_HOLD_TEST, process, summary)
+            self.assertEqual(made.result["result"], "PASS")
+            self.assertNotIn("sample", made.result)
+
+    def test_activity_is_reserved_before_the_process_launcher_returns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entered = threading.Event()
+            release = threading.Event()
+
+            def launch(command, **_kwargs):
+                folder = Path(command[command.index("--status-file") + 1]).parent
+                (folder / "gravity_test_summary.json").write_text(
+                    json.dumps({"result": "PASS"}), encoding="utf-8")
+                entered.set()
+                release.wait(1.0)
+                return self.Process(command)
+
+            made = IdentificationService(
+                DashboardConfig(output_directory=directory),
+                profile=test_profile(), process_launcher=launch)
+            made.adopt_description(synthetic_urdf())
+            answer = {}
+            caller = threading.Thread(target=lambda: answer.update(
+                made.start_gravity_test(GRAVITY_HOLD_TEST, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                })))
+            caller.start()
+            self.assertTrue(entered.wait(1.0))
+            try:
+                self.assertEqual(made.snapshot()["state"], RUNNING)
+                self.assertFalse(made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                })["ok"])
+            finally:
+                release.set()
+                caller.join(1.0)
+            self.assertTrue(answer["ok"])
+            self.wait(made)
+
+    def test_two_runs_started_in_one_second_get_distinct_evidence_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, _processes = self.made(directory)
+            options = {"acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT}
+            with mock.patch.object(
+                    dashboard_service.time, "strftime",
+                    return_value="20260905-120000"):
+                first = made.start_gravity_test(GRAVITY_HOLD_TEST, options)
+                self.wait(made)
+                second = made.start_gravity_test(GRAVITY_HOLD_TEST, options)
+                self.wait(made)
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertNotEqual(first["output"], second["output"])
+
+    def test_a_nonzero_process_exit_cannot_masquerade_as_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, _processes = self.made(
+                directory, result="PASS", exit_code=7)
+            answer = made.start_gravity_test(GRAVITY_HOLD_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+            })
+            self.assertTrue(answer["ok"])
+            self.wait(made)
+            result = made.snapshot()["result"]
+            self.assertEqual(result["result"], "FAIL")
+            self.assertEqual(result["reported_result"], "PASS")
+
+    def test_shutdown_stops_and_joins_an_external_test(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = threading.Event()
+            made, processes = self.made(directory, gate=gate)
+            answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+            })
+            self.assertTrue(answer["ok"])
+            self.assertTrue(made.shutdown(timeout_s=1.0))
+            self.assertEqual(processes[0].signal, signal.SIGINT)
+            self.assertEqual(made.snapshot()["state"], "idle")
+
+    def test_unsupported_joint_names_cannot_target_a_realman_arm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            made.driven_joints = [f"joint{index}" for index in range(1, 8)]
+            answer = made.start_gravity_test(GRAVITY_HOLD_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+            })
+            self.assertFalse(answer["ok"])
+            self.assertIn("RealMan", answer["message"])
+            self.assertEqual(processes, [])
+
+    def test_left_arm_is_refused_before_any_process_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            made.driven_joints = [
+                f"left_arm_joint{index}" for index in range(1, 8)]
+            refused = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+            })
+            self.assertFalse(refused["ok"])
+            self.assertIn("right RM75", refused["message"])
+            self.assertEqual(processes, [])
 
     def test_rehearsal_does_not_apply_the_hardware_current_envelope(self):
         from unittest import mock

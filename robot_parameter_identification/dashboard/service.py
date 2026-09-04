@@ -15,6 +15,8 @@ import json
 import math
 import platform
 import re
+import signal
+import subprocess
 import threading
 import time
 import traceback
@@ -37,6 +39,9 @@ from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
 
 IDLE, RUNNING, PAUSED, JOGGING = "idle", "running", "paused", "jogging"
+GRAVITY_HOLD_TEST = "gravity_hold_test"
+GRAVITY_DRAG_TEST = "gravity_drag_test"
+GRAVITY_TEST_ACKNOWLEDGEMENT = "I_AM_HOLDING_ARM_AND_ESTOP_READY"
 # An envelope typed into the panel is an operator's envelope, so it is labelled
 # and guarded exactly as a hand-written file is.
 EDITED_SOURCE = "<edited in the dashboard>"
@@ -260,6 +265,7 @@ def _comparison(optimal_errors, sweep: dict, joint_names) -> dict:
 class DashboardConfig:
     profile_path: str = ""
     output_directory: str = "identification_results"
+    gravity_test_source: str = ""
     telemetry: TelemetrySpec = field(default_factory=TelemetrySpec)
     commands: CommandSpec = field(default_factory=CommandSpec)
     # Frame the 3D view renders in. Empty means the model root.
@@ -287,7 +293,8 @@ class IdentificationService:
     """One campaign at a time, plus the scene it runs in."""
 
     def __init__(self, config: DashboardConfig, bridge=None,
-                 profile: RobotProfile | None = None) -> None:
+                 profile: RobotProfile | None = None,
+                 process_launcher=None) -> None:
         self.config = config
         self.bridge = bridge
         self.profile = profile
@@ -344,6 +351,10 @@ class IdentificationService:
         self._options: dict = {}
         # The pose a slider last asked for, or None once it has been driven.
         self._jog_target: list[float] | None = None
+        self._process_launcher = process_launcher or subprocess.Popen
+        self._external_process = None
+        self._external_status_file: Path | None = None
+        self._external_summary_file: Path | None = None
         self._restore_settings()
 
     # -- model -----------------------------------------------------------
@@ -1347,7 +1358,247 @@ class IdentificationService:
     def stop(self) -> dict:
         self._abort.set()
         self._run_gate.set()
+        process = self._external_process
+        if process is not None and process.poll() is None:
+            try:
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
         return {"ok": True, "message": "stop requested"}
+
+    def shutdown(self, timeout_s: float = 15.0) -> bool:
+        """Request a safe stop and wait a bounded time for the owner to exit."""
+        self.stop()
+        worker = self._worker
+        if worker is None or worker is threading.current_thread():
+            return True
+        worker.join(max(0.0, float(timeout_s)))
+        return not worker.is_alive()
+
+    def gravity_test_capability(self) -> dict:
+        """Whether this dashboard maps unambiguously to a supported RM arm."""
+        names = (list(self.driven_joints) if self.driven_joints else
+                 list(self.arm.joint_names) if self.arm is not None else [])
+        right = [f"right_arm_joint{index}" for index in range(1, 8)]
+        left = [f"left_arm_joint{index}" for index in range(1, 8)]
+        if names == right:
+            source = str(self.config.gravity_test_source or "").strip()
+            return {
+                "available": True,
+                "arm": "right",
+                "source": (str(Path(source).expanduser().resolve())
+                           if source else "commissioned default"),
+            }
+        if names == left:
+            return {
+                "available": False,
+                "reason_code": "right_arm_only",
+                "reason": "gravity validation is currently fixed to the right RM75",
+                "arm": "left",
+            }
+        return {
+            "available": False,
+            "reason_code": "unsupported_arm",
+            "reason": "gravity validation requires one complete RealMan arm",
+        }
+
+    def start_gravity_test(self, mode: str, options: dict | None = None) -> dict:
+        """Start one standalone, guard-owned gravity validation activity."""
+        options = dict(options or {})
+        if mode not in (GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST):
+            return {"ok": False, "message": "unknown gravity test mode"}
+        if options.pop("acknowledgement", "") != GRAVITY_TEST_ACKNOWLEDGEMENT:
+            return {"ok": False,
+                    "message": "confirm that the arm is supported and E-stop is ready"}
+        if not self.have_model():
+            return {"ok": False, "message": "no /robot_description yet"}
+        capability = self.gravity_test_capability()
+        if not capability["available"]:
+            return {"ok": False, "message": capability["reason"]}
+        arm = capability["arm"]
+        configured_source = str(self.config.gravity_test_source or "").strip()
+        source = (str(Path(configured_source).expanduser().resolve())
+                  if configured_source else "")
+
+        def bounded(name, default, low, high, integer=False):
+            try:
+                value = int(options.get(name, default)) if integer else float(
+                    options.get(name, default))
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} is not numeric") from None
+            if not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"{name} must be in [{low:g}, {high:g}]")
+            return value
+
+        if mode == GRAVITY_HOLD_TEST:
+            poses = bounded("poses", 5, 1, 20, integer=True)
+            seconds = bounded("seconds", 3.0, 0.5, 10.0)
+            normalized = {"arm": arm, "poses": poses, "seconds": seconds}
+        else:
+            seconds = bounded("seconds", 10.0, 1.0, 300.0)
+            speed = bounded("maximum_speed_deg_s", 120.0, 60.0, 180.0)
+            normalized = {"arm": arm, "seconds": seconds,
+                          "maximum_speed_deg_s": speed}
+        if source:
+            normalized["source"] = source
+
+        with self._lock:
+            if self._state != IDLE:
+                return {"ok": False, "message": f"{self._activity} is running"}
+            # Reserve the one activity slot before mkdir/Popen. The HTTP
+            # server is threaded, so checking and claiming in separate lock
+            # sections would allow two hardware owners to launch together.
+            self._state = RUNNING
+            self._activity = mode
+            self._abort.clear()
+            self._started_at = time.monotonic()
+            self._options = normalized
+            self.result = None
+            self.progress = {"mode": mode, "phase": "starting"}
+
+        folder = None
+        try:
+            root = Path(self.config.output_directory)
+            root.mkdir(parents=True, exist_ok=True)
+            base = root / f"{mode}-{time.strftime('%Y%m%d-%H%M%S')}"
+            for collision in range(1000):
+                candidate = (base if collision == 0
+                             else base.with_name(f"{base.name}-{collision}"))
+                try:
+                    candidate.mkdir()
+                    folder = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if folder is None:
+                raise OSError("could not allocate a gravity-test output directory")
+            status_file = folder / "status.json"
+            summary_file = folder / "gravity_test_summary.json"
+            if mode == GRAVITY_HOLD_TEST:
+                command = [
+                    "ros2", "run", "rm_control", "gravity_compensation_test",
+                    "hold-set", "--arm", arm,
+                    "--poses", str(poses), "--seconds", str(seconds),
+                    "--output-dir", str(folder), "--status-file", str(status_file),
+                    "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
+                ]
+            else:
+                output = folder / "drag.json"
+                command = [
+                    "ros2", "run", "rm_control", "gravity_compensation_test",
+                    "drag", "--arm", arm, "--seconds", str(seconds),
+                    "--maximum-speed-deg-s", str(speed),
+                    "--output", str(output), "--status-file", str(status_file),
+                    "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
+                ]
+            if source:
+                command.extend(["--source", source])
+            process = self._process_launcher(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True)
+        except Exception as error:  # noqa: BLE001
+            if folder is not None:
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
+            with self._lock:
+                self._state = IDLE
+                self._activity = ""
+                self.progress = {"mode": mode, "phase": "failed",
+                                 "error": str(error)}
+            self.publish_event(
+                f"could not start {mode}: {error}", level="error", source=mode)
+            return {"ok": False, "message": f"could not start gravity test: {error}"}
+
+        with self._lock:
+            self._external_process = process
+            self._external_status_file = status_file
+            self._external_summary_file = summary_file
+            self.progress = {"mode": mode, "phase": "starting",
+                             "output": str(folder)}
+            stop_requested = self._abort.is_set()
+        self.publish_event(f"{mode} started", source=mode)
+        if stop_requested and process.poll() is None:
+            try:
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        self._worker = threading.Thread(
+            target=self._run_gravity_test, args=(mode, process, summary_file),
+            daemon=True, name=f"identification-{mode}")
+        self._worker.start()
+        return {"ok": True, "message": f"{mode} started",
+                "output": str(folder)}
+
+    def _run_gravity_test(self, mode: str, process, summary_file: Path) -> None:
+        try:
+            output = getattr(process, "stdout", None)
+            if output is not None:
+                for line in output:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    if text.startswith("GRAVITY_TEST "):
+                        try:
+                            progress = json.loads(text[len("GRAVITY_TEST "):])
+                        except json.JSONDecodeError:
+                            progress = {"phase": "running", "message": text}
+                        with self._lock:
+                            self.progress = dict(progress)
+                    else:
+                        self.publish_event(text[-500:], source=mode)
+            exit_code = process.wait()
+            if summary_file.is_file():
+                result = json.loads(summary_file.read_text(encoding="utf-8"))
+            else:
+                result = {"mode": mode, "result": "FAIL",
+                          "reason": "gravity test wrote no summary",
+                          "child_exit_code": exit_code}
+            result["mode"] = mode
+            result["child_exit_code"] = exit_code
+            if exit_code != 0 and result.get("result") == "PASS":
+                result["reported_result"] = "PASS"
+                result["result"] = "FAIL"
+                result["reason"] = (
+                    f"gravity test exited {exit_code} despite a PASS summary")
+            result["evidence"] = (
+                "/runs/"
+                + summary_file.relative_to(
+                    Path(self.config.output_directory)).as_posix())
+            verdict = str(result.get("result", "FAIL"))
+            phase = ("complete" if verdict == "PASS" else
+                     "stopped" if verdict == "STOPPED" else "failed")
+            with self._lock:
+                self.result = result
+                self.progress = {
+                    "mode": mode,
+                    "phase": phase,
+                    "result": verdict,
+                    "output": str(summary_file.parent),
+                    "error": "" if verdict == "PASS" else
+                    str(result.get("reason") or result.get("child_result", {}).get("reason", "")),
+                }
+            level = ("info" if verdict == "PASS" else
+                     "warning" if verdict == "STOPPED" else "error")
+            self.publish_event(
+                f"{mode} {verdict.lower()}",
+                level=level, source=mode)
+        except Exception as error:  # noqa: BLE001
+            with self._lock:
+                self.result = {"mode": mode, "result": "FAIL", "reason": str(error)}
+                self.progress = {"mode": mode, "phase": "failed",
+                                 "error": str(error)}
+            self.publish_event(f"{mode} failed: {error}", level="error", source=mode)
+        finally:
+            with self._lock:
+                self._external_process = None
+                self._external_status_file = None
+                self._external_summary_file = None
+                self._state = IDLE
+                self._activity = ""
+                if self._worker is threading.current_thread():
+                    self._worker = None
 
     def pause(self) -> dict:
         """Request a gravity hardware pause at the next safe JTC boundary."""
@@ -2870,6 +3121,7 @@ class IdentificationService:
                 "rehearsal_passed": self.rehearsal_passed,
                 "gravity_armed": bool(self.gravity_armed),
                 "gravity_defaults": self.gravity_defaults(),
+                "gravity_test": self.gravity_test_capability(),
                 "workspace": self.workspace_payload(),
                 "preview_token": self.preview_token,
                 "planning": self.planning,

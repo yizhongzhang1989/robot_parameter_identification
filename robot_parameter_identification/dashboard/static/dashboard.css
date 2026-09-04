@@ -257,6 +257,33 @@ button.stop { background: rgba(224,179,65,.16); border-color: rgba(224,179,65,.4
 }
 .field input:focus, .field select:focus { outline: 1px solid var(--accent); }
 
+/* ---------------- attended gravity validation ---------------- */
+
+.gravity-validation {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.gravity-validation > h3,
+.gravity-test-result h4 {
+  margin: 0 0 5px; color: var(--ink); font-size: 12px; font-weight: 600;
+}
+.gravity-test {
+  padding: 9px 0; border-top: 1px solid rgba(255,255,255,.05);
+}
+.gravity-test > strong { display: block; font-size: 11px; margin-bottom: 2px; }
+.gravity-test > .hint { margin-bottom: 6px; }
+.gravity-test-actions {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 6px;
+}
+.gravity-test-actions .field { min-width: 0; margin: 0; }
+.gravity-test-actions input { width: 100%; min-width: 0; }
+.gravity-test-actions button { grid-column: 1 / -1; width: 100%; }
+.gravity-test-result {
+  margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--line);
+}
+.gravity-test-result .button-link { margin-top: 7px; }
+
 /* ---------------- envelope editor ---------------- */
 
 .modal {
@@ -464,4 +491,29 @@ canvas { width: 100%; display: block; }
 
 @media (max-width: 900px) {
   #scene-status { max-width: calc(100% - 24px); top: 54px; }
+}
+
+@media (max-width: 600px) {
+  body { display: flex; flex-direction: column; overflow: hidden; }
+  #topbar {
+    flex: none; height: auto; min-height: 46px;
+    padding: 6px 10px; gap: 8px; flex-wrap: wrap;
+  }
+  #topbar h1 { flex: 1 1 180px; }
+  #topbar > .spacer { display: none; }
+  #conn {
+    order: 2; flex: 1 0 100%; min-width: 0;
+    overflow-x: auto; scrollbar-width: thin;
+  }
+  #layout {
+    flex: 1 1 auto; min-height: 0; width: 100%; height: auto;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(260px, 40%) minmax(0, 1fr);
+  }
+  #stage { min-width: 0; min-height: 260px; }
+  #panel {
+    min-width: 0; border-left: 0; border-top: 1px solid var(--line);
+  }
+  #edit-box { max-width: calc(100% - 24px); }
+  #jointbars { max-width: calc(100% - 24px); }
 }

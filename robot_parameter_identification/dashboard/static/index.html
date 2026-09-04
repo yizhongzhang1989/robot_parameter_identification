@@ -241,6 +241,55 @@
           data-i18n="grav.resume">Resume</button>
       </div>
 
+      <section class="gravity-validation" aria-labelledby="gravtest-title">
+        <h3 id="gravtest-title" data-i18n="gravtest.title">Validate compensation</h3>
+        <p class="hint" data-i18n="gravtest.hint">Attended hardware checks
+          using the commissioned identified-current model. Each run keeps its
+          own status and summary evidence.</p>
+        <p class="hint hidden" id="gravtest-capability"></p>
+
+        <div class="gravity-test">
+          <strong data-i18n="gravtest.hold_title">Hold a pose set</strong>
+          <p class="hint" data-i18n="gravtest.hold_hint">Visit known poses and
+            check that gravity current holds each one inside its corridor.</p>
+          <div class="gravity-test-actions">
+            <label class="field"><span data-i18n="gravtest.poses">test poses</span>
+              <input id="gravtest-poses" type="number" min="1" max="20" step="1" value="5"/>
+            </label>
+            <label class="field"><span data-i18n="gravtest.hold_seconds">hold each (s)</span>
+              <input id="gravtest-hold-seconds" type="number" min="0.5" max="10" step="0.5" value="3"/>
+            </label>
+            <button id="btn-gravtest-hold" class="danger" disabled
+                    data-i18n="gravtest.hold_start">Check pose holding</button>
+          </div>
+        </div>
+
+        <div class="gravity-test">
+          <strong data-i18n="gravtest.drag_title">Hand-guided drag</strong>
+          <p class="hint" data-i18n="gravtest.drag_hint">Release position
+            control and let the operator guide the arm while identified
+            gravity current supports it.</p>
+          <div class="gravity-test-actions">
+            <label class="field"><span data-i18n="gravtest.drag_seconds">session (s)</span>
+              <input id="gravtest-drag-seconds" type="number" min="1" max="300" step="5" value="10"/>
+            </label>
+            <label class="field"><span data-i18n="gravtest.speed_stop">speed stop (°/s)</span>
+              <input id="gravtest-speed-stop" type="number" min="60" max="180" step="5" value="120"/>
+            </label>
+            <button id="btn-gravtest-drag" class="danger" disabled
+                    data-i18n="gravtest.drag_start">Start hand guiding</button>
+          </div>
+        </div>
+
+        <div id="gravtest-result" class="gravity-test-result hidden"
+             aria-live="polite">
+          <h4 data-i18n="gravtest.result_title">Latest validation</h4>
+          <table class="kv" id="gravtest-table"></table>
+          <a id="gravtest-evidence" class="button-link hidden" target="_blank"
+             rel="noopener" data-i18n="gravtest.evidence">Open summary evidence</a>
+        </div>
+      </section>
+
       <h3 data-i18n="inspect.title">Review the planned poses</h3>
       <p class="hint" data-i18n="inspect.hint">Step through them in the 3D
         view before anything moves. The selected pose is drawn solid; the

@@ -57,6 +57,10 @@ def build_routes(service, node=None) -> dict:
                           lambda body: service.start(
                               str(body.get("mode", "rehearsal")),
                               body.get("options") or {})),
+        "/api/gravity-test": ("POST",
+                              lambda body: service.start_gravity_test(
+                                  str(body.get("mode", "")),
+                                  body.get("options") or {})),
         "/api/home": ("POST", lambda _body: service.home()),
         "/api/jog": ("POST", lambda body: service.jog(body)),
         "/api/pause": ("POST", lambda _body: service.pause()),

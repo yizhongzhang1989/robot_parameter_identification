@@ -20,6 +20,18 @@ ros2 launch robot_bringup real.launch.py
 
 它只要三样东西，本机上分别是轨迹控制器 `right_arm_joint_trajectory_controller`、`/robot_description`、`/dynamic_joint_states`。
 
+若要使用面板中的“开始保持检查”或“开始手动拖动”，启动时改用同一完整系统的电流能力入口：
+
+```bash
+ros2 launch robot_bringup direct_current.launch.py \
+  direct_current_ack:=I_ACCEPT_DIRECT_CURRENT_CONTROLLER_RISK
+```
+
+该入口仍然启动正常的双臂 `robot_state_publisher`、唯一一个 `controller_manager`、两个 JTC、
+关节与 F/T broadcaster；只是额外为右臂预加载 inactive 的 A 域 controller 和独立停流 guard。
+不要在已经运行的 `real.launch.py` 上叠加执行它。部署后只需这一次显式重启，之后每次保持/拖动
+都只切换 controller，不退出或替换任何 ROS node。
+
 ### 2. 启动面板（另开终端）
 
 ```bash
@@ -66,6 +78,7 @@ ros2 launch robot_parameter_identification dashboard.launch.py \
 | 参数 | 何时需要 |
 |---|---|
 | `profile_path:=...` | 已经存好一份档案，不想每次重填 |
+| `gravity_test_source:=...` | 为右臂重力补偿验证显式指定另一份完整、通过、安培域且关节名匹配的辨识结果；留空使用已投用默认模型 |
 | `maximum_speed_deg_s:=60.0` | 计划速度默认封顶 10 °/s；黏滞摩擦在爬行速度下根本看不出来 |
 | `signal.voltage:=voltage` | 驱动器有 `voltage` 接口、档案又给了电压窗口，母线电压保护才真正生效 |
 | `config_file_path:=config/rm75_cell.json` | 让障碍物场景、规划包络和重力标定参数在两次会话之间留存；不给它，它们既不会读回也不会保存 |
@@ -261,6 +274,39 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 真机重力标定支持暂停与恢复。`/api/pause` 先锁住后续 JTC goal；已经发出的 goal 不会被半途切断，而是在成功结束后的安全边界进入暂停。一个重力位姿是事务边界：该点所有速度、两个方向的探针都完成后，拟合样本和原始帧才算提交。若暂停落在点位中间，该点已经产生的 observation、phase 计数、峰值和 raw frame 会一起回滚；`/api/resume` 从同一位姿索引重新完整测试。暂停期间归零、点动和其他 campaign 都保持禁用，仍可用“停止”结束并保存此前完整提交的点位。
 
 每次运行仍会写入独立目录中的 `report.html`。`/api/reports` 按运行模式给出最新报告的安全 `/runs/...` URL，重力标定卡片直接显示最新真机重力报告；路径最终仍由结果目录边界检查保护，前端不能指定任意文件。
+
+### 独立重力补偿验证
+
+重力卡片底部有两项**有人值守的验证**。它们不重新拟合模型，也不把 dashboard 变成另一个
+电流发送器；dashboard 只负责互斥、进度和证据展示，实际控制仍由 `rm_control` 中经过验证的
+独立程序负责。
+
+- **多位姿保持检查**：位置控制器依次到达一组已知位姿；每个点再由
+  `identified_static_hold_campaign.py` 原子切换到 forward current controller 保持，并检查是否留在允许走廊内。
+- **任意位置手动拖动**：原子切换到同一个 forward current controller，连续发送辨识出的
+  重力补偿电流；用户可在设定时间内手动移动机械臂，结束后原子切回 JTC。
+
+两个按钮都会先要求操作员确认已经扶住机械臂、工作区无障碍且急停可用；只有确认后前端才会
+提交精确的 `I_AM_HOLDING_ARM_AND_ESTOP_READY`，服务端还会独立复核。两项验证与标定、归零、
+点动共用同一个 activity 槽，不能并行。顶部 **停止** 对外部 CLI 发送 `SIGINT`，CLI 再转发给
+实际控制子进程；子进程无论成功、故障还是停止，都请求一次 STRICT 反向 switch 恢复 JTC。
+关闭 dashboard 节点同样会请求停止并有界等待 worker 退出。
+
+直接电流期间，右臂 JTC 暂时 inactive，但 `ros2_control_node`、`RMSystemHardware`、左臂 JTC、
+joint/F/T broadcaster、TF 和其它 ROS node 全部保持运行。Dashboard 的 sample/history 只有 ROS
+topic callback 可以写入，不再接受 subprocess stdout 遥测；`/dynamic_joint_states` 因此持续提供
+关节角度、电流、速度、温度、电压、使能和故障码。不得并行启动第二套 ros2_control。
+
+每次验证写入 `identification_results/gravity_hold_test-.../` 或
+`gravity_drag_test-.../`，其中 `status.json` 是运行中的原子状态，
+`gravity_test_summary.json` 是最终 `PASS`、`FAIL` 或 `STOPPED` 结论。卡片会显示实际使用的
+辨识模型 source、原因、退出码和输出路径，并通过受结果目录约束的 `/runs/...` 链接打开 summary。
+当前 CLI 默认 source 是 `identified_zero_force_drag.py` 中固定的已投用电流域模型；summary
+始终记录其解析后的绝对路径，因此默认值不会成为不可审计的隐式输入。服务会从
+`right_arm_joint1..7` 精确确认目标臂；其他命名（包括左臂）一律禁用，绝不猜测。当前 integrated
+current 接口硬锁在右侧 RM75 `.18/8080`，所以左臂按钮会显示“当前仅支持右侧 RM75”而不是
+复用右臂端点。父 CLI 会在 controller switch 之前复核 source 的 `result.json`：必须
+完整、结论通过、单位为安培，且七个关节名与右臂逐项一致。
 
 ### 重力结果、原始证据与部署边界
 

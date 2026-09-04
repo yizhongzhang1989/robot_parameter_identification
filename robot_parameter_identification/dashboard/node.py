@@ -85,6 +85,7 @@ class DashboardNode(Node):
             profile_path=str(get("profile_path", "")),
             output_directory=str(get("output_directory",
                                      "identification_results")),
+            gravity_test_source=str(get("gravity_test_source", "")),
             config_file_path=str(get("config_file_path", "")),
             safety_margin_m=float(get("safety_margin_m", 0.02)),
             workspace_range_deg=tuple((-value, value) for value in workspace),
@@ -103,6 +104,7 @@ class DashboardNode(Node):
         self._lock = threading.Lock()
         self._sample: dict | None = None
         self._sample_at = 0.0
+        self._sample_source = ""
         self._observed: set = set()
         self._complained_at = 0.0
         self._history: collections.deque = collections.deque(
@@ -386,11 +388,17 @@ class DashboardNode(Node):
             sample["fault_code"] = [int(value) for value in rows["fault_code"]]
         if not all(np.isfinite(sample["position_deg"])):
             return
+        self._record_sample(
+            sample,
+            {role for role, values in rows.items() if len(values) == count},
+            self._spec.transport())
+
+    def _record_sample(self, sample: dict, observed: set[str], source: str) -> None:
         with self._lock:
             self._sample = sample
             self._sample_at = time.monotonic()
-            self._observed = {role for role, values in rows.items()
-                              if len(values) == count}
+            self._sample_source = source
+            self._observed = set(observed)
             self._sequence += 1
             self._history.append((self._sequence, self._sample_at, sample))
 
@@ -429,6 +437,8 @@ class DashboardNode(Node):
         return {
             "telemetry_ok": age is not None and age <= self._spec.stale_after_s,
             "sample_age_s": None if age is None else round(age, 3),
+            "telemetry_source": (self._sample_source if age is not None
+                                 and age <= self._spec.stale_after_s else ""),
             "action_ok": self._action_available(),
         }
 
@@ -513,6 +523,9 @@ class DashboardNode(Node):
             self.server.stop()
         except Exception:  # noqa: BLE001
             pass
+        if not self.service.shutdown():
+            self.get_logger().error(
+                "dashboard worker did not stop within the shutdown timeout")
         return super().destroy_node()
 
 

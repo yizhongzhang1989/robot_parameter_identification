@@ -42,10 +42,13 @@ from launch_ros.parameter_descriptions import ParameterValue
 TEXT_ARGUMENTS = (
     ("profile_path", "", "robot profile YAML; blank derives one from the URDF"),
     ("output_directory", "identification_results", "where results are written"),
-    ("config_file_path", "", "where everything this panel edits is kept "
-                              "between sessions -- the obstacle scene, the "
-                              "planner envelope and the gravity settings; "
-                              "blank keeps them in memory only"),
+    ("gravity_test_source", "",
+     "passing ampere-domain result directory used by attended gravity "
+     "validation; blank uses the commissioned right-arm default"),
+    ("config_file_path", "",
+     "where everything this panel edits is kept between sessions -- the "
+     "obstacle scene, the planner envelope and the gravity settings; blank "
+     "keeps them in memory only"),
     ("joint_state_topic", "/joint_states", "sensor_msgs/JointState source"),
     ("dynamic_joint_state_topic", "/dynamic_joint_states",
      "control_msgs/DynamicJointState source; blank falls back to joint_states"),

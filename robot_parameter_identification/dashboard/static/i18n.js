@@ -70,7 +70,6 @@ const DICT = {
       + 'frozen number reads exactly like a live one.',
     zh: '遥测已中断。最后一帧不会继续留在屏上——冻住的数字看起来和实时的一模一样。',
   },
-
   'obst.title': { en: 'Obstacles', zh: '障碍物' },
   'obst.add': { en: '+ box', zh: '+ 方块' },
   'obst.delete': { en: 'delete', zh: '删除' },
@@ -206,6 +205,64 @@ const DICT = {
     zh: '当前目标位姿 {v}/{n}',
   },
   'grav.report': { en: 'Open latest report', zh: '打开最新报告' },
+  'gravtest.title': { en: 'Validate compensation', zh: '验证重力补偿' },
+  'gravtest.hint': {
+    en: 'Attended hardware checks using the commissioned identified-current '
+      + 'model. Each run keeps its own status and summary evidence.',
+    zh: '使用已投用的辨识电流模型做有人值守的真机检查。每次运行都单独保存状态和汇总证据。',
+  },
+  'gravtest.hold_title': { en: 'Hold a pose set', zh: '多位姿保持检查' },
+  'gravtest.hold_hint': {
+    en: 'Visit known poses and check that gravity current holds each one '
+      + 'inside its corridor.',
+    zh: '依次到达一组已知位姿，检查重力补偿电流能否将每个位姿保持在允许范围内。',
+  },
+  'gravtest.poses': { en: 'test poses', zh: '测试位姿数' },
+  'gravtest.hold_seconds': { en: 'hold each (s)', zh: '每点保持（秒）' },
+  'gravtest.hold_start': { en: 'Check pose holding', zh: '开始保持检查' },
+  'gravtest.drag_title': { en: 'Hand-guided drag', zh: '任意位置手动拖动' },
+  'gravtest.drag_hint': {
+    en: 'Release position control and let the operator guide the arm while '
+      + 'identified gravity current supports it.',
+    zh: '释放位置控制，由辨识出的重力补偿电流托住机械臂，用户可将它拖到任意位置。',
+  },
+  'gravtest.drag_seconds': { en: 'session (s)', zh: '持续时间（秒）' },
+  'gravtest.speed_stop': { en: 'speed stop (°/s)', zh: '超速停止（°/s）' },
+  'gravtest.drag_start': { en: 'Start hand guiding', zh: '开始手动拖动' },
+  'gravtest.confirm': {
+    en: 'Attended hardware current control will start. Hold the arm now and '
+      + 'keep the E-stop ready. Continue only when the workspace is clear.',
+    zh: '即将启动有人值守的真机电流控制。请立即扶住机械臂并准备好急停，确认工作区无障碍后再继续。',
+  },
+  'gravtest.hold_started': { en: 'Pose-holding check started.', zh: '多位姿保持检查已启动。' },
+  'gravtest.drag_started': { en: 'Hand-guided drag started.', zh: '手动拖动检查已启动。' },
+  'gravtest.result_title': { en: 'Latest validation', zh: '最近一次验证' },
+  'gravtest.mode': { en: 'test', zh: '测试' },
+  'gravtest.verdict': { en: 'verdict', zh: '结论' },
+  'gravtest.verdict_pass': { en: 'PASS', zh: '通过' },
+  'gravtest.verdict_fail': { en: 'FAIL', zh: '失败' },
+  'gravtest.verdict_stopped': { en: 'STOPPED', zh: '已停止' },
+  'gravtest.reason': { en: 'reason', zh: '原因' },
+  'gravtest.source': { en: 'identified model', zh: '辨识模型' },
+  'gravtest.output': { en: 'output', zh: '输出' },
+  'gravtest.exit': { en: 'process exit', zh: '进程退出码' },
+  'gravtest.evidence': { en: 'Open summary evidence', zh: '打开汇总证据' },
+  'gravtest.right_arm_only': {
+    en: 'These checks are currently fixed to the right RM75.',
+    zh: '这些检查当前仅支持右侧 RM75。',
+  },
+  'gravtest.unsupported_arm': {
+    en: 'These checks require one complete RealMan arm with joints 1 through 7.',
+    zh: '这些检查要求一条关节 1 至 7 命名完整的 RealMan 机械臂。',
+  },
+  'activity.gravity_hold_test': { en: 'pose holding', zh: '多位姿保持' },
+  'activity.gravity_drag_test': { en: 'hand-guided drag', zh: '手动拖动' },
+  'phase.hold_set': { en: 'holding pose set', zh: '正在检查位姿保持' },
+  'phase.drag_live': { en: 'hand guiding', zh: '正在手动拖动' },
+  'phase.completed': { en: 'completed', zh: '已完成' },
+  'phase.complete': { en: 'complete', zh: '完成' },
+  'phase.stopped': { en: 'stopped', zh: '已停止' },
+  'phase.failed': { en: 'failed', zh: '失败' },
   'grav.planning': {
     en: 'Designing poses and screening every one of them against the scene. '
       + 'This takes a few seconds and moves nothing.',

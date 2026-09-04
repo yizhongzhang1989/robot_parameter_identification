@@ -248,6 +248,9 @@ $('btn-sweep').addEventListener('click', () => post('/api/campaign', {
 
 const GRAVITY_FIELDS = ['grav-poses', 'grav-check', 'grav-arc',
                         'grav-slow', 'grav-fast'];
+const GRAVITY_TEST_ACKNOWLEDGEMENT = 'I_AM_HOLDING_ARM_AND_ESTOP_READY';
+const GRAVITY_HOLD_TEST = 'gravity_hold_test';
+const GRAVITY_DRAG_TEST = 'gravity_drag_test';
 
 function gravityOptions() {
   const num = (id) => parseFloat($(id).value);
@@ -274,6 +277,28 @@ $('btn-grav-run').addEventListener('click', () => post('/api/campaign', {
 }));
 $('btn-grav-pause').addEventListener('click', () => post('/api/pause', {}));
 $('btn-grav-resume').addEventListener('click', () => post('/api/resume', {}));
+
+async function startGravityTest(mode) {
+  if (!window.confirm(t('gravtest.confirm'))) return;
+  const options = mode === GRAVITY_HOLD_TEST ? {
+    poses: parseInt($('gravtest-poses').value, 10),
+    seconds: parseFloat($('gravtest-hold-seconds').value),
+  } : {
+    seconds: parseFloat($('gravtest-drag-seconds').value),
+    maximum_speed_deg_s: parseFloat($('gravtest-speed-stop').value),
+  };
+  options.acknowledgement = GRAVITY_TEST_ACKNOWLEDGEMENT;
+  const answer = await post('/api/gravity-test', { mode, options });
+  if (answer.ok) {
+    publishLocalEvent(t(mode === GRAVITY_HOLD_TEST
+      ? 'gravtest.hold_started' : 'gravtest.drag_started'), 'info', mode);
+  }
+}
+
+$('btn-gravtest-hold').addEventListener(
+  'click', () => startGravityTest(GRAVITY_HOLD_TEST));
+$('btn-gravtest-drag').addEventListener(
+  'click', () => startGravityTest(GRAVITY_DRAG_TEST));
 
 $('btn-rescreen').addEventListener('click', () => post('/api/rescreen', {}));
 for (const id of GRAVITY_FIELDS) {
@@ -336,6 +361,15 @@ function renderGravity(snapshot) {
   $('btn-grav-rehearse').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-plan').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-run').disabled = busy || planning || !armed || astray.length > 0;
+  const gravityTest = snapshot.gravity_test || { available: false };
+  const gravityTestReady = snapshot.have_model && gravityTest.available;
+  $('btn-gravtest-hold').disabled = busy || planning || !gravityTestReady;
+  $('btn-gravtest-drag').disabled = busy || planning || !gravityTestReady;
+  const capability = $('gravtest-capability');
+  const capabilityKey = gravityTest.reason_code
+    ? `gravtest.${gravityTest.reason_code}` : '';
+  capability.textContent = capabilityKey ? t(capabilityKey) : '';
+  capability.classList.toggle('hidden', !capabilityKey);
   const gravityHardware = snapshot.activity === 'gravity';
   const pausePending = !!snapshot.progress?.pause_pending;
   $('btn-grav-pause').disabled = snapshot.state !== 'running'
@@ -381,6 +415,44 @@ function renderGravity(snapshot) {
   rows.push([t('grav.preview'), window.__viewer?.plannedPoses?.() ?? 0]);
   $('grav-table').innerHTML = rows.map(
     ([k, v]) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
+  renderGravityTestResult(snapshot);
+}
+
+function renderGravityTestResult(snapshot) {
+  const result = snapshot.result || {};
+  const isValidation = result.mode === GRAVITY_HOLD_TEST
+    || result.mode === GRAVITY_DRAG_TEST;
+  $('gravtest-result').classList.toggle('hidden', !isValidation);
+  if (!isValidation) return;
+
+  const child = result.child_result || {};
+  const verdict = String(result.result || 'FAIL').toUpperCase();
+  const reason = result.reason || child.reason || '';
+  const rows = [
+    [t('gravtest.mode'), activityLabel(result.mode), ''],
+    [t('gravtest.verdict'), t(`gravtest.verdict_${verdict.toLowerCase()}`),
+      verdict === 'PASS' ? 'ok' : verdict === 'STOPPED' ? 'warn' : 'bad'],
+  ];
+  if (reason) rows.push([t('gravtest.reason'), reason, '']);
+  if (result.source) rows.push([t('gravtest.source'), result.source, '']);
+  if (result.output) rows.push([t('gravtest.output'), result.output, '']);
+  if (result.child_exit_code != null) {
+    rows.push([t('gravtest.exit'), String(result.child_exit_code), '']);
+  }
+  const table = $('gravtest-table');
+  table.replaceChildren(...rows.map(([key, value, className]) => {
+    const row = document.createElement('tr');
+    const label = document.createElement('td');
+    const content = document.createElement('td');
+    label.textContent = key;
+    content.textContent = value;
+    content.className = `num ${className}`.trim();
+    row.append(label, content);
+    return row;
+  }));
+  const evidence = $('gravtest-evidence');
+  evidence.classList.toggle('hidden', !result.evidence);
+  if (result.evidence) evidence.href = result.evidence;
 }
 
 /* ---------------- planner envelope ----------------
@@ -664,6 +736,12 @@ function phaseLabel(name) {
   return text === key ? name : text;
 }
 
+function activityLabel(name) {
+  const key = 'activity.' + name;
+  const text = t(key);
+  return text === key ? name : text;
+}
+
 /** One description for every progress shape published by the service. */
 function progressText(progress) {
   const bits = [];
@@ -672,6 +750,7 @@ function progressText(progress) {
   const wasUpdated = (...fields) => !updated
     || fields.some((field) => updated.has(field));
   if (progress.phase) bits.push(phaseLabel(progress.phase));
+  if (progress.message) bits.push(String(progress.message));
   if (progress.elapsed_s != null) bits.push(`${Math.round(progress.elapsed_s)}s`);
   if (progress.pause_pending) bits.push(t('grav.pause_pending'));
   if (progress.paused) {
@@ -737,18 +816,20 @@ function renderActivity(snapshot) {
   const active = snapshot.planning || feed.state === 'running'
     || feed.state === 'paused' || feed.state === 'jogging';
   const mode = feed.activity || progress.mode || '';
-  const gravityActive = snapshot.planning || String(mode).startsWith('gravity');
-  const gravityCurrent = gravityActive ? state.gravityStatus : null;
+  const gravityIdentification = snapshot.planning || mode === 'gravity'
+    || mode === 'gravity_rehearsal';
+  const gravityCurrent = gravityIdentification ? state.gravityStatus : null;
     const current = gravityCurrent && (snapshot.planning
       || gravityCurrent.level === 'error'
       || (!active && !gravityCurrent.passive))
     ? gravityCurrent : null;
   const message = current?.message || (active ? progressText(progress)
     : (latest?.message || gravityCurrent?.message || progressText(progress)));
-  $('activity-mode').textContent = current ? current.source : active
+  const shownMode = current ? current.source : active
     ? (mode || feed.state || '')
     : (latest?.source || gravityCurrent?.source
       || feed.activity || progress.mode || feed.state || '');
+  $('activity-mode').textContent = activityLabel(shownMode);
   $('progress-line').textContent = message;
   $('progress-line').title = message;
   const level = current?.level || (progress.error
@@ -765,7 +846,7 @@ function renderSceneActivity(activity) {
   const active = !!activity.id;
   $('scene-status').classList.toggle('hidden', !active);
   $('scene-status').textContent = active
-    ? `${activity.mode || t('state.running')} · ${progressText(progress)}` : '';
+    ? `${activityLabel(activity.mode) || t('state.running')} · ${progressText(progress)}` : '';
 
   if (activity.id !== state.sceneActivityId) {
     state.sceneActivityId = activity.id;
@@ -836,7 +917,7 @@ function renderRun(snapshot) {
   // Jogging holds the trajectory action open, so a campaign cannot have it.
   const busy = campaignBusy || !!snapshot.jogging;
   $('run-state').textContent = paused ? t('state.paused') : running
-    ? (snapshot.activity || t('state.running')) : t('state.idle');
+    ? (activityLabel(snapshot.activity) || t('state.running')) : t('state.idle');
   $('run-state').className = 'state' + (campaignBusy ? ' running' : '');
   $('btn-rehearse').disabled = busy || !snapshot.have_model;
   $('btn-hardware').disabled = busy || !snapshot.rehearsal_passed;
@@ -928,8 +1009,8 @@ function renderSignals() {
   if (!frame || !names.length || !fresh) {
     panel.classList.add('waiting');
     $('signal-rate').textContent = '';
-    $('signal-waiting').textContent =
-      t(state.lastFrameAt ? 'signals.lost' : 'signals.waiting');
+    $('signal-waiting').textContent = t(state.lastFrameAt
+      ? 'signals.lost' : 'signals.waiting');
     return;
   }
   panel.classList.remove('waiting');
