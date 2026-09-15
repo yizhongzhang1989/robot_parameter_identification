@@ -28,6 +28,7 @@ from ..interfaces import (CommandSpec, EFFORT_SOURCES, SignalMap,
                           TelemetrySpec)
 from ..profile import RobotProfile
 from .http_server import DashboardServer
+from .controllers import ControllerInventory
 from .service import DashboardConfig, IdentificationService
 
 MESH_TYPES = {".stl": "model/stl", ".dae": "model/vnd.collada+xml",
@@ -76,6 +77,7 @@ class DashboardNode(Node):
                 voltage=_optional(get("signal.voltage", "")),
             ))
         commands = CommandSpec(
+            controller_manager=str(get("controller_manager", "/controller_manager")),
             follow_joint_trajectory_action=self._resolve_action(),
             robot_description_topic=str(
                 get("robot_description_topic", "/robot_description")))
@@ -121,6 +123,12 @@ class DashboardNode(Node):
                                  self._on_description, DESCRIPTION_QOS)
         self._subscribe_telemetry(telemetry)
         self._subscribe_controller_state(commands)
+        from controller_manager_msgs.srv import ListControllers
+
+        manager = commands.controller_manager.rstrip("/")
+        client = self.create_client(ListControllers, manager + "/list_controllers")
+        self._controllers = ControllerInventory(client, ListControllers.Request, manager)
+        self.create_timer(1.0, self._controllers.poll)
 
         self.server = DashboardServer(self.service, port=port,
                                       mesh_resolver=self._read_mesh, node=self)
@@ -440,6 +448,7 @@ class DashboardNode(Node):
             "telemetry_source": (self._sample_source if age is not None
                                  and age <= self._spec.stale_after_s else ""),
             "action_ok": self._action_available(),
+            "controllers": self._controllers.snapshot(),
         }
 
     def observed_signals(self) -> set:

@@ -1109,6 +1109,10 @@ class IdentificationService:
     def connection(self) -> dict:
         described = self.config.telemetry.describe()
         described["action"] = self.config.commands.follow_joint_trajectory_action
+        described["controllers"] = {
+            "manager": self.config.commands.controller_manager,
+            "available": False, "age_s": None, "error": "unavailable", "items": [],
+        }
         # A guard is live only if the signal is mapped, the data actually
         # arrives, and something enforces it. Naming an interface is not
         # protection, and the panel used to imply it was.

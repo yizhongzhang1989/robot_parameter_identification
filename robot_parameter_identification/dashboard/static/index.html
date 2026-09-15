@@ -23,6 +23,10 @@
     <span class="pill" id="pill-collide">clearance</span>
   </div>
   <div class="spacer"></div>
+  <div id="controller-status">
+    <span class="muted" data-i18n="controllers.active">Active controllers</span>:
+    <span id="active-controllers" data-i18n="controllers.waiting">Waiting for controllers</span>
+  </div>
   <select id="lang" class="lang"></select>
   <span id="run-state" class="state">idle</span>
 </header>
@@ -159,6 +163,16 @@
     <div class="card">
       <h2 data-i18n="conn.title">Connection</h2>
       <table class="kv" id="conn-table"></table>
+      <h3 data-i18n="controllers.title">Controllers</h3>
+      <p class="hint" id="controllers-status" data-i18n="controllers.waiting">Waiting for controllers</p>
+      <table id="controllers-table">
+        <thead><tr>
+          <th scope="col" data-i18n="controllers.name">Name</th>
+          <th scope="col" data-i18n="controllers.type">Type</th>
+          <th scope="col" data-i18n="controllers.state">State</th>
+        </tr></thead>
+        <tbody id="controllers-body"></tbody>
+      </table>
       <p class="hint" id="guards"></p>
       <div class="row">
         <button id="btn-profile" class="small"

@@ -680,8 +680,34 @@ function describeEnvelope(snapshot) {
   return `${low.toFixed(0)}° … ${high.toFixed(0)}°`;
 }
 
+function renderControllers(controllers) {
+  const available = controllers?.available === true;
+  const items = available ? (controllers.items || []) : [];
+  const active = items.filter((item) => item.state === 'active'
+    && !String(item.type || item.name || '').toLowerCase().includes('broadcaster'));
+  const reasons = ['waiting', 'unavailable', 'timeout', 'query_failed', 'stale'];
+  const reason = reasons.includes(controllers?.error) ? controllers.error : 'unavailable';
+  const unavailable = t(`controllers.${reason}`);
+  $('active-controllers').textContent = available
+    ? (active.map((item) => item.name).join(', ') || t('controllers.no_active'))
+    : unavailable;
+  $('controllers-status').textContent = available
+    ? (items.length ? '' : t('controllers.empty')) : unavailable;
+  const rows = items.map((item) => {
+    const row = document.createElement('tr');
+    for (const value of [item.name, item.type, item.state]) {
+      const cell = document.createElement('td');
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+    return row;
+  });
+  $('controllers-body').replaceChildren(...rows);
+}
+
 function renderConnection(snapshot) {
   const connection = snapshot.connection || {};
+  renderControllers(connection.controllers);
   pill('pill-desc', !!connection.description_ok, t('pill.model'));
   pill('pill-tel', !!connection.telemetry_ok, t('pill.telemetry'));
   pill('pill-act', !!connection.action_ok, t('pill.action'));
@@ -1527,10 +1553,16 @@ async function poll() {
   if (state.polling) return;
   state.polling = true;
   try {
-    const snapshot = await (await fetch('/api/state', { cache: 'no-store' })).json();
+    const response = await fetch('/api/state', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const snapshot = await response.json();
     state.snapshot = snapshot;
     renderAll(snapshot);
   } catch (error) {
+    if (state.snapshot?.connection) {
+      state.snapshot.connection.controllers = undefined;
+    }
+    renderControllers(undefined);
     pill('pill-desc', false, t('pill.offline'));
   } finally {
     state.polling = false;

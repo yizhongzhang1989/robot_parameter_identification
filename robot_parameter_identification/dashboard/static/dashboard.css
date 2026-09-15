@@ -23,12 +23,16 @@ html, body {
 
 /* ---------------- top bar ---------------- */
 
+body { display: flex; flex-direction: column; }
+
 #topbar {
   display: flex;
+  flex: none;
+  flex-wrap: wrap;
   align-items: center;
   gap: 16px;
-  height: 46px;
-  padding: 0 16px;
+  min-height: 46px;
+  padding: 6px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
 }
@@ -37,6 +41,17 @@ html, body {
 .spacer { flex: 1; }
 
 .pills { display: flex; gap: 6px; }
+
+#controller-status { flex: 1 1 280px; min-width: 0; overflow-wrap: anywhere; font-size: 11px; }
+#controllers-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 11px; }
+#controllers-table th, #controllers-table td {
+  text-align: left; vertical-align: top; padding: 4px;
+  border-bottom: 1px solid var(--line); overflow-wrap: anywhere;
+}
+#controllers-table th { color: var(--muted); font-weight: 600; }
+#controllers-table th:nth-child(1) { width: 40%; }
+#controllers-table th:nth-child(2) { width: 38%; }
+#controllers-status:empty { display: none; }
 
 .pill {
   padding: 2px 9px;
@@ -63,8 +78,9 @@ html, body {
 
 #layout {
   display: grid;
-  grid-template-columns: 1fr 420px;
-  height: calc(100% - 46px);
+  flex: 1 1 auto;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) 420px;
 }
 
 #stage { position: relative; overflow: hidden; background: #0b0d11; }
@@ -494,19 +510,20 @@ canvas { width: 100%; display: block; }
 }
 
 @media (max-width: 600px) {
-  body { display: flex; flex-direction: column; overflow: hidden; }
+  body { overflow: auto; }
   #topbar {
     flex: none; height: auto; min-height: 46px;
     padding: 6px 10px; gap: 8px; flex-wrap: wrap;
   }
   #topbar h1 { flex: 1 1 180px; }
   #topbar > .spacer { display: none; }
+  #controller-status { order: 3; flex-basis: 100%; }
   #conn {
     order: 2; flex: 1 0 100%; min-width: 0;
     overflow-x: auto; scrollbar-width: thin;
   }
   #layout {
-    flex: 1 1 auto; min-height: 0; width: 100%; height: auto;
+    flex: 1 0 0; min-height: 520px; width: 100%; height: auto;
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(260px, 40%) minmax(0, 1fr);
   }

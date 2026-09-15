@@ -56,6 +56,8 @@ TEXT_ARGUMENTS = (
     ("controller", "",
      "the ros2_control controller that drives the arm, by name; its trajectory "
      "action and controller_state topic follow from it"),
+    ("controller_manager", "/controller_manager",
+     "controller manager used for the read-only controller inventory"),
     ("follow_joint_trajectory_action",
      "/joint_trajectory_controller/follow_joint_trajectory",
      "the only path used to command motion; overrides 'controller' when given"),
