@@ -284,7 +284,6 @@ async function startGravityTest(mode) {
     poses: parseInt($('gravtest-poses').value, 10),
     seconds: parseFloat($('gravtest-hold-seconds').value),
   } : {
-    seconds: parseFloat($('gravtest-drag-seconds').value),
     maximum_speed_deg_s: parseFloat($('gravtest-speed-stop').value),
   };
   options.acknowledgement = GRAVITY_TEST_ACKNOWLEDGEMENT;
@@ -299,6 +298,7 @@ $('btn-gravtest-hold').addEventListener(
   'click', () => startGravityTest(GRAVITY_HOLD_TEST));
 $('btn-gravtest-drag').addEventListener(
   'click', () => startGravityTest(GRAVITY_DRAG_TEST));
+$('btn-gravtest-stop').addEventListener('click', () => post('/api/stop', {}));
 
 $('btn-rescreen').addEventListener('click', () => post('/api/rescreen', {}));
 for (const id of GRAVITY_FIELDS) {
@@ -365,6 +365,8 @@ function renderGravity(snapshot) {
   const gravityTestReady = snapshot.have_model && gravityTest.available;
   $('btn-gravtest-hold').disabled = busy || planning || !gravityTestReady;
   $('btn-gravtest-drag').disabled = busy || planning || !gravityTestReady;
+  $('btn-gravtest-stop').disabled = snapshot.state !== 'running'
+    || snapshot.activity !== GRAVITY_DRAG_TEST;
   const capability = $('gravtest-capability');
   const capabilityKey = gravityTest.reason_code
     ? `gravtest.${gravityTest.reason_code}` : '';

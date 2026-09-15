@@ -13,6 +13,7 @@ import hashlib
 from importlib import metadata
 import json
 import math
+import os
 import platform
 import re
 import signal
@@ -1358,10 +1359,15 @@ class IdentificationService:
     def stop(self) -> dict:
         self._abort.set()
         self._run_gate.set()
-        process = self._external_process
+        with self._lock:
+            process = self._external_process
+            activity = self._activity
         if process is not None and process.poll() is None:
             try:
-                process.send_signal(signal.SIGINT)
+                if activity == GRAVITY_DRAG_TEST:
+                    os.killpg(process.pid, signal.SIGINT)
+                else:
+                    process.send_signal(signal.SIGINT)
             except ProcessLookupError:
                 pass
         return {"ok": True, "message": "stop requested"}
@@ -1435,10 +1441,8 @@ class IdentificationService:
             seconds = bounded("seconds", 3.0, 0.5, 10.0)
             normalized = {"arm": arm, "poses": poses, "seconds": seconds}
         else:
-            seconds = bounded("seconds", 10.0, 1.0, 300.0)
-            speed = bounded("maximum_speed_deg_s", 120.0, 60.0, 180.0)
-            normalized = {"arm": arm, "seconds": seconds,
-                          "maximum_speed_deg_s": speed}
+            speed = bounded("maximum_speed_deg_s", 120.0, 1.0, 120.0)
+            normalized = {"arm": arm, "maximum_speed_deg_s": speed}
         if source:
             normalized["source"] = source
 
@@ -1485,8 +1489,8 @@ class IdentificationService:
             else:
                 output = folder / "drag.json"
                 command = [
-                    "ros2", "run", "rm_control", "gravity_compensation_test",
-                    "drag", "--arm", arm, "--seconds", str(seconds),
+                    "ros2", "run", "rm_control", "manual_drag",
+                    "--arm", arm,
                     "--maximum-speed-deg-s", str(speed),
                     "--output", str(output), "--status-file", str(status_file),
                     "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
@@ -1521,7 +1525,10 @@ class IdentificationService:
         self.publish_event(f"{mode} started", source=mode)
         if stop_requested and process.poll() is None:
             try:
-                process.send_signal(signal.SIGINT)
+                if mode == GRAVITY_DRAG_TEST:
+                    os.killpg(process.pid, signal.SIGINT)
+                else:
+                    process.send_signal(signal.SIGINT)
             except ProcessLookupError:
                 pass
         self._worker = threading.Thread(

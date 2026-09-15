@@ -1,6 +1,7 @@
 """The dashboard surface, exercised without ROS and without a robot."""
 
 from pathlib import Path
+from html.parser import HTMLParser
 import json
 import math
 import signal
@@ -204,12 +205,28 @@ class RunGateTest(unittest.TestCase):
 
 
 class GravityValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.owned_processes = {}
+
+        def interrupt_group(pid, number):
+            process = self.owned_processes[pid]
+            process.group_signal = number
+            if process.gate is not None:
+                process.gate.set()
+
+        patcher = mock.patch.object(
+            dashboard_service.os, "killpg", side_effect=interrupt_group)
+        self.killpg = patcher.start()
+        self.addCleanup(patcher.stop)
+
     class Process:
         def __init__(self, command, *, result="PASS", gate=None,
                      exit_code=None):
             self.command = command
+            self.pid = 123456789
             self.returncode = None
             self.signal = None
+            self.group_signal = None
             self.stdout = iter([])
             self.result = result
             self.gate = gate
@@ -233,13 +250,17 @@ class GravityValidationTest(unittest.TestCase):
     def made(self, directory, result="PASS", gate=None, exit_code=None):
         processes = []
 
-        def launch(command, **_kwargs):
+        def launch(command, **kwargs):
+            self.assertTrue(kwargs["start_new_session"])
             process = self.Process(
                 command, result=result, gate=gate, exit_code=exit_code)
+            process.pid += len(processes)
+            self.owned_processes[process.pid] = process
             folder = Path(command[command.index("--status-file") + 1]).parent
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "gravity_test_summary.json").write_text(json.dumps({
                 "result": result, "reason": "done" if result == "PASS" else "trip",
+                "stop_verified": True, "restore_errors": [],
             }))
             processes.append(process)
             return process
@@ -273,6 +294,7 @@ class GravityValidationTest(unittest.TestCase):
                 "ros2", "run", "rm_control", "gravity_compensation_test",
                 "hold-set"])
             self.assertEqual(command[command.index("--poses") + 1], "4")
+            self.assertEqual(command[command.index("--seconds") + 1], "2.0")
             self.assertEqual(command[command.index("--arm") + 1], "right")
             result = made.snapshot()["result"]
             self.assertEqual(result["result"], "PASS")
@@ -282,21 +304,133 @@ class GravityValidationTest(unittest.TestCase):
     def test_drag_is_mutually_exclusive_and_stop_sends_sigint(self):
         with tempfile.TemporaryDirectory() as directory:
             gate = threading.Event()
-            made, processes = self.made(directory, gate=gate)
+            made, processes = self.made(directory, result="STOPPED", gate=gate)
 
             answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
                 "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
             })
             self.assertTrue(answer["ok"])
             process = processes[0]
-            self.assertEqual(
-                process.command[process.command.index("--seconds") + 1],
-                "10.0")
+            folder = Path(answer["output"])
+            self.assertEqual(process.command, [
+                "ros2", "run", "rm_control", "manual_drag", "--arm", "right",
+                "--maximum-speed-deg-s", "120.0",
+                "--output", str(folder / "drag.json"),
+                "--status-file", str(folder / "status.json"),
+                "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
+            ])
+            self.assertNotIn("seconds", made._options)
+            self.assertEqual(made.snapshot()["state"], RUNNING)
             self.assertFalse(made.start("rehearsal")["ok"])
-            made.stop()
-            self.assertEqual(process.signal, signal.SIGINT)
+            self.assertTrue(build_routes(made, None)["/api/stop"][1]({})["ok"])
+            self.killpg.assert_called_once_with(process.pid, signal.SIGINT)
+            self.assertEqual(process.group_signal, signal.SIGINT)
+            self.assertIsNone(process.signal)
             gate.set()
             self.wait(made)
+            result = made.snapshot()["result"]
+            self.assertEqual(result["result"], "STOPPED")
+            self.assertTrue(result["stop_verified"])
+            self.assertEqual(result["restore_errors"], [])
+            self.assertTrue(result["evidence"].endswith(
+                "/gravity_test_summary.json"))
+
+    def test_drag_ignores_legacy_seconds_and_forwards_configured_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            source = Path(directory) / "model.json"
+            made.config.gravity_test_source = str(source)
+            for seconds in (10, 0, 999, "not-a-duration", None):
+                with self.subTest(seconds=seconds):
+                    options = {
+                        "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                        "seconds": seconds,
+                        "maximum_speed_deg_s": 12,
+                    }
+                    self.assertTrue(made.start_gravity_test(
+                        GRAVITY_DRAG_TEST, options)["ok"])
+                    self.wait(made)
+                    command = processes[-1].command
+                    self.assertNotIn("--seconds", command)
+                    self.assertNotIn("drag", command)
+                    self.assertEqual(command[-2:], ["--source", str(source)])
+                    self.assertEqual(made._options, {
+                        "arm": "right", "maximum_speed_deg_s": 12.0,
+                        "source": str(source),
+                    })
+                    self.assertEqual(options["seconds"], seconds)
+
+    def test_drag_controls_have_no_duration_and_an_explicit_stop(self):
+        static = (Path(__file__).resolve().parents[1]
+                  / "robot_parameter_identification" / "dashboard" / "static")
+        elements = {}
+
+        class Controls(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if "id" in attributes:
+                    elements[attributes["id"]] = (tag, attributes)
+
+        Controls().feed((static / "index.html").read_text(encoding="utf-8"))
+        self.assertNotIn("gravtest-drag-seconds", elements)
+        tag, stop = elements["btn-gravtest-stop"]
+        self.assertEqual(tag, "button")
+        self.assertIn("disabled", stop)
+        self.assertEqual(stop["data-i18n"], "run.stop")
+        speed = elements["gravtest-speed-stop"][1]
+        self.assertEqual((speed["min"], speed["max"], speed["value"]),
+                         ("1", "120", "120"))
+        self.assertIn("gravtest-hold-seconds", elements)
+
+    def test_drag_cannot_exceed_hardware_speed_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            for speed in (0.0, 120.01, 121.0):
+                with self.subTest(speed=speed):
+                    with self.assertRaisesRegex(ValueError, "maximum_speed_deg_s"):
+                        made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                            "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                            "maximum_speed_deg_s": speed,
+                        })
+            self.assertEqual(processes, [])
+
+    def test_hold_and_drag_alternate_without_reusing_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            outputs = []
+            for mode in (GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST,
+                         GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST):
+                answer = made.start_gravity_test(mode, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                })
+                self.assertTrue(answer["ok"])
+                outputs.append(answer["output"])
+                self.wait(made)
+                result = made.snapshot()["result"]
+                self.assertEqual(result["result"], "PASS")
+                self.assertEqual(result["mode"], mode)
+            self.assertEqual(len(set(outputs)), 4)
+            self.assertEqual([process.command[3:5] for process in processes], [
+                ["gravity_compensation_test", "hold-set"],
+                ["manual_drag", "--arm"],
+                ["gravity_compensation_test", "hold-set"],
+                ["manual_drag", "--arm"],
+            ])
+
+    def test_stop_preserves_failure_and_allows_another_test_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = threading.Event()
+            made, processes = self.made(directory, result="FAIL", gate=gate)
+            options = {"acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT}
+            self.assertTrue(made.start_gravity_test(GRAVITY_DRAG_TEST, options)["ok"])
+            made.stop()
+            self.wait(made)
+            self.killpg.assert_called_once_with(processes[0].pid, signal.SIGINT)
+            self.assertIsNone(processes[0].signal)
+            self.assertEqual(made.snapshot()["result"]["result"], "FAIL")
+            self.assertTrue(made.start_gravity_test(GRAVITY_HOLD_TEST, options)["ok"])
+            self.wait(made)
+            self.assertEqual(len(processes), 2)
 
     def test_gravity_validation_is_reachable_over_http(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -399,8 +533,47 @@ class GravityValidationTest(unittest.TestCase):
             })
             self.assertTrue(answer["ok"])
             self.assertTrue(made.shutdown(timeout_s=1.0))
-            self.assertEqual(processes[0].signal, signal.SIGINT)
+            self.killpg.assert_called_once_with(processes[0].pid, signal.SIGINT)
+            self.assertIsNone(processes[0].signal)
             self.assertEqual(made.snapshot()["state"], "idle")
+
+    def test_stop_during_launch_uses_the_same_mode_specific_signal(self):
+        for mode in (GRAVITY_DRAG_TEST, GRAVITY_HOLD_TEST):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                self.killpg.reset_mock()
+                made, processes = self.made(directory, gate=threading.Event())
+                launch = made._process_launcher
+
+                def stop_before_return(command, **kwargs):
+                    process = launch(command, **kwargs)
+                    self.assertIsNone(made._external_process)
+                    self.assertTrue(made.stop()["ok"])
+                    self.killpg.assert_not_called()
+                    return process
+
+                made._process_launcher = stop_before_return
+                self.assertTrue(made.start_gravity_test(mode, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
+                })["ok"])
+                self.wait(made)
+                process = processes[0]
+                if mode == GRAVITY_DRAG_TEST:
+                    self.killpg.assert_called_once_with(process.pid, signal.SIGINT)
+                    self.assertIsNone(process.signal)
+                else:
+                    self.killpg.assert_not_called()
+                    self.assertEqual(process.signal, signal.SIGINT)
+
+    def test_stop_preserves_hold_and_other_activity_signaling(self):
+        for mode in (GRAVITY_HOLD_TEST, GRAVITY_MODE):
+            with self.subTest(mode=mode):
+                made = service()
+                process = self.Process([])
+                made._external_process = process
+                made._activity = mode
+                self.assertTrue(made.stop()["ok"])
+                self.assertEqual(process.signal, signal.SIGINT)
+                self.killpg.assert_not_called()
 
     def test_unsupported_joint_names_cannot_target_a_realman_arm(self):
         with tempfile.TemporaryDirectory() as directory:

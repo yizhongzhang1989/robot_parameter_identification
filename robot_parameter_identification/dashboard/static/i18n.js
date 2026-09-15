@@ -226,7 +226,6 @@ const DICT = {
       + 'identified gravity current supports it.',
     zh: '释放位置控制，由辨识出的重力补偿电流托住机械臂，用户可将它拖到任意位置。',
   },
-  'gravtest.drag_seconds': { en: 'session (s)', zh: '持续时间（秒）' },
   'gravtest.speed_stop': { en: 'speed stop (°/s)', zh: '超速停止（°/s）' },
   'gravtest.drag_start': { en: 'Start hand guiding', zh: '开始手动拖动' },
   'gravtest.confirm': {
