@@ -1,6 +1,9 @@
 """Hardware plant tests: the ROS edges are faked, the logic is real."""
 
 import unittest
+from concurrent.futures import Future
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -164,6 +167,322 @@ class PositionRateGuardTest(unittest.TestCase):
             found.append(plant._position_speed(position, 10.0 + 0.005 * index))
 
         self.assertGreater(found[-1][3], 69.9)
+
+
+class MotionStopVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.plant = hardware.HardwarePlant(rm75_profile())
+        self.points = [(np.zeros(JOINTS), np.zeros(JOINTS), 1.0)]
+        self.result_future = Future()
+        self.cancel_future = Future()
+        self.handle = SimpleNamespace(
+            accepted=True, goal_id="test-goal",
+            get_result_async=Mock(return_value=self.result_future),
+            cancel_goal_async=Mock(return_value=self.cancel_future))
+        self.send_future = Future()
+        self.send_future.set_result(self.handle)
+        self.plant._client = SimpleNamespace(
+            send_goal_async=Mock(return_value=self.send_future))
+        self.plant._goal = Mock(return_value=object())
+        self.plant._action_type = SimpleNamespace(
+            Result=SimpleNamespace(SUCCESSFUL=0))
+        self.plant._wait = Mock(side_effect=self.wait)
+        self.plant._require_fit_to_move = Mock()
+        self.plant.sample = Mock(return_value=frame())
+        self.original = RuntimeError("operator abort")
+        self.plant._spin_once = Mock(side_effect=self.original)
+        self.terminal_status = 5
+
+    def complete_result(self, status):
+        self.result_future.set_result(SimpleNamespace(
+            status=status, result=SimpleNamespace(error_code=0)))
+
+    def accept_cancel(self):
+        self.cancel_future.set_result(SimpleNamespace(
+            return_code=0,
+            goals_canceling=[SimpleNamespace(goal_id=self.handle.goal_id)]))
+
+    def wait(self, future, timeout_s):
+        if future is self.result_future and self.terminal_status is not None:
+            self.complete_result(self.terminal_status)
+
+    def assert_unverified(self, on_frame=None):
+        with self.assertRaises(hardware.MotionStopUnverified) as caught:
+            self.plant._execute(self.points, on_frame)
+        self.assertIsInstance(caught.exception, RuntimeError)
+        self.assertNotIsInstance(caught.exception, hardware.MotionFailed)
+        self.assertIs(caught.exception.__cause__, self.original)
+        self.plant._client.send_goal_async.assert_called_once()
+        self.plant._require_fit_to_move.assert_not_called()
+
+    def test_accepted_cancel_awaits_terminal_result_and_preserves_abort(self):
+        self.accept_cancel()
+        with self.assertRaises(RuntimeError) as caught:
+            self.plant._execute(self.points)
+        self.assertIs(caught.exception, self.original)
+        self.assertTrue(self.result_future.done())
+        self.plant._wait.assert_any_call(self.cancel_future, 3.0)
+        self.plant._wait.assert_any_call(self.result_future, 3.0)
+        self.plant._client.send_goal_async.assert_called_once()
+
+    def test_already_terminal_race_preserves_original_without_cancel(self):
+        for status in (4, 5, 6):
+            with self.subTest(status=status):
+                self.setUp()
+                self.complete_result(status)
+                callback = Mock(side_effect=self.original)
+                with self.assertRaises(RuntimeError) as caught:
+                    self.plant._execute(self.points, callback)
+                self.assertIs(caught.exception, self.original)
+                self.handle.cancel_goal_async.assert_not_called()
+
+    def test_terminal_result_during_cancel_refusal_is_verified(self):
+        def refuse():
+            self.complete_result(4)
+            self.cancel_future.set_result(SimpleNamespace(
+                return_code=1, goals_canceling=[]))
+            return self.cancel_future
+
+        self.handle.cancel_goal_async.side_effect = refuse
+        with self.assertRaises(RuntimeError) as caught:
+            self.plant._execute(self.points)
+        self.assertIs(caught.exception, self.original)
+
+    def test_refused_missing_or_wrong_goal_cancel_is_fatal_without_retry(self):
+        for reply in (None, SimpleNamespace(return_code=1, goals_canceling=[]),
+                      SimpleNamespace(return_code=0, goals_canceling=[]),
+                      SimpleNamespace(return_code=0, goals_canceling=[
+                          SimpleNamespace(goal_id="other-goal")])):
+            with self.subTest(reply=reply):
+                self.setUp()
+                self.original = hardware.MotionFailed("trajectory deadline")
+                self.plant._spin_once.side_effect = self.original
+                self.cancel_future.set_result(reply)
+                self.assert_unverified()
+
+    def test_cancel_timeout_is_fatal_without_retry(self):
+        self.assert_unverified()
+
+    def test_accepted_cancel_without_terminal_result_is_fatal_without_retry(self):
+        self.accept_cancel()
+        self.terminal_status = None
+        self.assert_unverified()
+        self.plant._wait.assert_any_call(self.result_future, 3.0)
+
+    def test_nonterminal_or_malformed_result_is_fatal_without_retry(self):
+        for status in (0, 1, 2, 3, None):
+            with self.subTest(status=status):
+                self.setUp()
+                self.accept_cancel()
+                self.terminal_status = status
+                if status is None:
+                    self.result_future.set_result(None)
+                self.assert_unverified(Mock(side_effect=self.original))
+
+    def test_cancellation_exception_preserves_original_cause(self):
+        self.handle.cancel_goal_async.side_effect = ValueError("transport down")
+        self.assert_unverified()
+
+    def test_initial_capture_failure_cancels_and_verifies(self):
+        self.accept_cancel()
+        with self.assertRaises(RuntimeError) as caught:
+            self.plant._execute(self.points, Mock(side_effect=self.original))
+        self.assertIs(caught.exception, self.original)
+        self.handle.cancel_goal_async.assert_called_once()
+        self.assertTrue(self.result_future.done())
+
+    def test_monitor_runtime_abort_cancels_and_verifies(self):
+        self.accept_cancel()
+        self.plant.set_monitor(SimpleNamespace(
+            check=Mock(side_effect=self.original)))
+        self.plant._spin_once.side_effect = lambda _timeout: (
+            self.plant._check_monitor(frame()))
+        with self.assertRaises(RuntimeError) as caught:
+            self.plant._execute(self.points)
+        self.assertIs(caught.exception, self.original)
+        self.handle.cancel_goal_async.assert_called_once()
+        self.assertTrue(self.result_future.done())
+
+    def test_final_capture_failure_after_terminal_result_preserves_abort(self):
+        self.complete_result(4)
+        callback = Mock(side_effect=[None, self.original])
+        with self.assertRaises(RuntimeError) as caught:
+            self.plant._execute(self.points, callback)
+        self.assertIs(caught.exception, self.original)
+        self.handle.cancel_goal_async.assert_not_called()
+
+    def test_final_capture_failure_requires_verified_terminal_result(self):
+        self.result_future.set_result(SimpleNamespace(status=2))
+        self.accept_cancel()
+        callback = Mock(side_effect=[None, self.original])
+        self.assert_unverified(callback)
+
+    def test_result_acquisition_failure_is_fatal_but_still_requests_cancel(self):
+        self.accept_cancel()
+        self.handle.get_result_async.side_effect = self.original
+        self.assert_unverified()
+        self.handle.cancel_goal_async.assert_called_once()
+
+    def test_result_future_exception_is_fatal_without_retry(self):
+        self.accept_cancel()
+        self.result_future.set_exception(ValueError("result transport down"))
+        self.assert_unverified(Mock(side_effect=self.original))
+
+    def test_send_wait_exception_is_fatal_and_preserves_cause(self):
+        self.plant._wait.side_effect = self.original
+        self.assert_unverified()
+
+    def test_unknown_send_timeout_is_fatal_without_retry(self):
+        self.send_future = Future()
+        self.plant._client.send_goal_async.return_value = self.send_future
+        with self.assertRaises(hardware.MotionStopUnverified) as caught:
+            self.plant._execute(self.points)
+        self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+        self.plant._client.send_goal_async.assert_called_once()
+        self.plant._require_fit_to_move.assert_not_called()
+
+    def test_stop_before_goal_prevents_send_without_retry(self):
+        self.plant.set_stop_requested(lambda: True)
+
+        with self.assertRaisesRegex(RuntimeError, "^stop requested$") as caught:
+            self.plant._execute(self.points)
+
+        self.assertIs(type(caught.exception), RuntimeError)
+        self.plant._client.send_goal_async.assert_not_called()
+        self.plant._require_fit_to_move.assert_not_called()
+        self.handle.cancel_goal_async.assert_not_called()
+
+    def test_stop_during_initial_telemetry_wait_prevents_send(self):
+        stopped = False
+
+        def refresh(_seconds):
+            nonlocal stopped
+            stopped = True
+
+        self.plant.set_stop_requested(lambda: stopped)
+        self.plant.sample.side_effect = [None, frame()]
+        self.plant._spin_for = Mock(side_effect=refresh)
+
+        with self.assertRaisesRegex(RuntimeError, "^stop requested$"):
+            self.plant.move_to(np.zeros(JOINTS))
+
+        self.plant._spin_for.assert_called_once_with(hardware.TELEMETRY_REFRESH_S)
+        self.plant._client.send_goal_async.assert_not_called()
+
+    def test_stop_during_goal_construction_prevents_actual_send(self):
+        self.plant._goal.side_effect = lambda _points: (
+            self.plant.set_stop_requested(lambda: True))
+
+        with self.assertRaisesRegex(RuntimeError, "^stop requested$"):
+            self.plant._execute(self.points)
+
+        self.plant._client.send_goal_async.assert_not_called()
+
+    def test_stop_after_acceptance_cancels_and_waits_without_telemetry(self):
+        self.accept_cancel()
+
+        def accept(future, timeout_s):
+            if future is self.send_future:
+                self.plant.set_stop_requested(lambda: True)
+            self.wait(future, timeout_s)
+
+        self.plant._wait.side_effect = accept
+
+        with self.assertRaisesRegex(RuntimeError, "^stop requested$") as caught:
+            self.plant._execute(self.points)
+
+        self.assertIs(type(caught.exception), RuntimeError)
+        self.handle.cancel_goal_async.assert_called_once()
+        self.plant._wait.assert_any_call(self.cancel_future, 3.0)
+        self.plant._wait.assert_any_call(self.result_future, 3.0)
+        self.assertEqual(self.result_future.result().status, 5)
+        self.plant.sample.assert_not_called()
+        self.plant._spin_once.assert_not_called()
+        self.plant._client.send_goal_async.assert_called_once()
+        self.plant._require_fit_to_move.assert_not_called()
+
+    def test_stop_is_polled_each_iteration_without_telemetry_callback(self):
+        self.accept_cancel()
+        self.plant._spin_once.side_effect = None
+        self.plant.set_stop_requested(
+            lambda: self.plant._spin_once.call_count >= 3)
+
+        with self.assertRaisesRegex(RuntimeError, "^stop requested$") as caught:
+            self.plant._execute(self.points)
+
+        self.assertIs(type(caught.exception), RuntimeError)
+        self.assertEqual(self.plant._spin_once.call_count, 3)
+        self.plant.sample.assert_not_called()
+        self.handle.cancel_goal_async.assert_called_once()
+        self.plant._wait.assert_any_call(self.result_future, 3.0)
+        self.assertEqual(self.result_future.result().status, 5)
+        self.plant._client.send_goal_async.assert_called_once()
+        self.plant._require_fit_to_move.assert_not_called()
+
+    def test_stop_at_zero_duration_endpoints_is_not_missed(self):
+        for endpoint in ("before_initial", "initial", "final"):
+            with self.subTest(endpoint=endpoint):
+                self.setUp()
+                self.points = [(np.zeros(JOINTS), np.zeros(JOINTS), 0.0)]
+                self.complete_result(4)
+
+                def stop():
+                    self.plant.set_stop_requested(lambda: True)
+
+                def acquire():
+                    if endpoint == "before_initial":
+                        stop()
+                    return self.result_future
+
+                callback = Mock(side_effect=lambda *_args: stop())
+                if endpoint == "final":
+                    def final_capture(*_args):
+                        if callback.call_count == 2:
+                            stop()
+
+                    callback.side_effect = final_capture
+                self.handle.get_result_async.side_effect = acquire
+
+                with self.assertRaisesRegex(RuntimeError, "^stop requested$"):
+                    self.plant._execute(self.points, callback)
+
+                self.plant._spin_once.assert_not_called()
+                self.handle.cancel_goal_async.assert_not_called()
+                self.plant._client.send_goal_async.assert_called_once()
+                self.plant._require_fit_to_move.assert_not_called()
+
+    def test_requested_stop_without_terminal_confirmation_is_fatal(self):
+        self.accept_cancel()
+        self.terminal_status = None
+        self.plant._spin_once.side_effect = lambda _timeout: (
+            self.plant.set_stop_requested(lambda: True))
+
+        with self.assertRaises(hardware.MotionStopUnverified) as caught:
+            self.plant._execute(self.points)
+
+        self.assertIs(type(caught.exception.__cause__), RuntimeError)
+        self.assertEqual(str(caught.exception.__cause__), "stop requested")
+        self.handle.cancel_goal_async.assert_called_once()
+        self.plant._wait.assert_any_call(self.result_future, 3.0)
+        self.assertFalse(self.result_future.done())
+        self.plant._client.send_goal_async.assert_called_once()
+        self.plant._require_fit_to_move.assert_not_called()
+
+    def test_stop_defaults_false_for_new_and_legacy_plants_and_can_be_reset(self):
+        for mode in ("default", "legacy", "reset"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                if mode == "legacy":
+                    del self.plant._stop_requested
+                elif mode == "reset":
+                    self.plant.set_stop_requested(lambda: True)
+                    self.plant.set_stop_requested(None)
+                self.complete_result(4)
+
+                self.plant._execute(self.points)
+
+                self.plant._client.send_goal_async.assert_called_once()
+                self.handle.cancel_goal_async.assert_not_called()
 
 
 class FakeFuture:
@@ -497,23 +816,26 @@ class RefusedGoalTest(unittest.TestCase):
         self._move()
         self.assertEqual(self.plant._client.sent, 2)
 
-    def test_an_unanswered_goal_is_retried_too(self):
+    def test_an_unanswered_goal_is_fatal_without_retry(self):
         """A goal the controller never acknowledged is not a goal it refused,
         and the five-second wait expiring says nothing about the arm."""
         self.plant._client = self.Balky(self.result, silent=1)
-        self._move()
-        self.assertEqual(self.plant._client.sent, 2)
+        with self.assertRaises(hardware.MotionStopUnverified):
+            self._move()
+        self.assertEqual(self.plant._client.sent, 1)
 
     def test_the_two_failures_are_not_reported_as_the_same_thing(self):
         seen = []
-        for kwargs in ({"refusals": 9}, {"silent": 9}):
+        for kwargs, error_type in (
+                ({"refusals": 9}, hardware.MotionFailed),
+                ({"silent": 9}, hardware.MotionStopUnverified)):
             self.plant._client = self.Balky(self.result, **kwargs)
-            with self.assertRaises(hardware.MotionFailed) as caught:
+            with self.assertRaises(error_type) as caught:
                 self._move()
             seen.append(str(caught.exception))
         self.assertNotEqual(seen[0], seen[1], seen)
         self.assertIn("rejected", seen[0])
-        self.assertIn("did not answer", seen[1])
+        self.assertIn("acceptance is unknown", seen[1])
 
     def test_it_gives_up_after_the_configured_attempts(self):
         self.plant.config.motion_attempts = 3

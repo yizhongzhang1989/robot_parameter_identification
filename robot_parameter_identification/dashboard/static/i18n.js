@@ -139,6 +139,7 @@ const DICT = {
   'grav.poses': { en: 'training poses', zh: '训练位形数' },
   'grav.check': { en: 'held-out poses', zh: '留出验证位形数' },
   'grav.arc': { en: 'crossing arc (°)', zh: '穿越幅度（°）' },
+  'grav.transit_speed': { en: 'Transit speed (deg/s)', zh: '点间移动速度（deg/s）' },
   'grav.slow': { en: 'slow probe (°/s)', zh: '慢速探针（°/s）' },
   'grav.fast': { en: 'fast probe (°/s)', zh: '快速探针（°/s）' },
   'grav.rehearse': { en: 'Rehearse gravity', zh: '重力预演' },
@@ -231,7 +232,13 @@ const DICT = {
   },
   'gravtest.poses': { en: 'test poses', zh: '测试位姿数' },
   'gravtest.hold_seconds': { en: 'hold each (s)', zh: '每点保持（秒）' },
+  'gravtest.transit_speed': { en: 'Transit speed (deg/s)', zh: '保持点移动速度（deg/s）' },
   'gravtest.hold_start': { en: 'Check pose holding', zh: '开始保持检查' },
+  'gravtest.plan': { en: 'Plan', zh: '规划' },
+  'gravtest.plan_missing': {
+    en: 'No valid hold plan matches the selected pose count.',
+    zh: '没有与所选位姿数匹配的有效保持检查规划。',
+  },
   'gravtest.drag_title': { en: 'Hand-guided drag', zh: '任意位置手动拖动' },
   'gravtest.drag_hint': {
     en: 'Release position control and let the operator guide the arm while '
@@ -498,6 +505,8 @@ const DICT = {
 
   /* ---- jogging ---- */
   'jog.title': { en: 'Jog', zh: '点动' },
+  'jog.speed': { en: 'Jog speed (deg/s)', zh: '点动速度（deg/s）' },
+  'run.home_speed': { en: 'Home speed (deg/s)', zh: '回零速度（deg/s）' },
   'jog.hint': {
     en: 'Drives the same trajectory controller the campaign uses. Travel is '
       + 'the identification envelope, not the URDF\u2019s, and every pose is '

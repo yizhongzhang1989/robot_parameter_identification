@@ -277,29 +277,21 @@ class GravityValidationTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(made.snapshot()["state"], "idle")
 
-    def test_hold_set_requires_exact_ack_and_builds_bounded_command(self):
+    def test_hold_set_requires_exact_ack_and_a_reviewed_plan(self):
         with tempfile.TemporaryDirectory() as directory:
             made, processes = self.made(directory)
             refused = made.start_gravity_test(
                 GRAVITY_HOLD_TEST, {"acknowledgement": "not-ready"})
             self.assertFalse(refused["ok"])
+            self.assertIn("E-stop", refused["message"])
             answer = made.start_gravity_test(GRAVITY_HOLD_TEST, {
                 "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
                 "poses": 4, "seconds": 2,
             })
-            self.assertTrue(answer["ok"])
-            self.wait(made)
-            command = processes[0].command
-            self.assertEqual(command[:5], [
-                "ros2", "run", "rm_control", "gravity_compensation_test",
-                "hold-set"])
-            self.assertEqual(command[command.index("--poses") + 1], "4")
-            self.assertEqual(command[command.index("--seconds") + 1], "2.0")
-            self.assertEqual(command[command.index("--arm") + 1], "right")
-            result = made.snapshot()["result"]
-            self.assertEqual(result["result"], "PASS")
-            self.assertTrue(result["evidence"].endswith(
-                "/gravity_test_summary.json"))
+            self.assertFalse(answer["ok"])
+            self.assertIn("plan", answer["message"])
+            self.assertEqual(processes, [])
+            self.assertEqual(made.snapshot()["state"], "idle")
 
     def test_drag_is_mutually_exclusive_and_stop_sends_sigint(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -394,12 +386,11 @@ class GravityValidationTest(unittest.TestCase):
                         })
             self.assertEqual(processes, [])
 
-    def test_hold_and_drag_alternate_without_reusing_evidence(self):
+    def test_repeated_drag_runs_do_not_reuse_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             made, processes = self.made(directory)
             outputs = []
-            for mode in (GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST,
-                         GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST):
+            for mode in (GRAVITY_DRAG_TEST,) * 4:
                 answer = made.start_gravity_test(mode, {
                     "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
                 })
@@ -410,12 +401,8 @@ class GravityValidationTest(unittest.TestCase):
                 self.assertEqual(result["result"], "PASS")
                 self.assertEqual(result["mode"], mode)
             self.assertEqual(len(set(outputs)), 4)
-            self.assertEqual([process.command[3:5] for process in processes], [
-                ["gravity_compensation_test", "hold-set"],
-                ["manual_drag", "--arm"],
-                ["gravity_compensation_test", "hold-set"],
-                ["manual_drag", "--arm"],
-            ])
+            self.assertEqual([process.command[3:5] for process in processes],
+                             [["manual_drag", "--arm"]] * 4)
 
     def test_stop_preserves_failure_and_allows_another_test_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -428,7 +415,7 @@ class GravityValidationTest(unittest.TestCase):
             self.killpg.assert_called_once_with(processes[0].pid, signal.SIGINT)
             self.assertIsNone(processes[0].signal)
             self.assertEqual(made.snapshot()["result"]["result"], "FAIL")
-            self.assertTrue(made.start_gravity_test(GRAVITY_HOLD_TEST, options)["ok"])
+            self.assertTrue(made.start_gravity_test(GRAVITY_DRAG_TEST, options)["ok"])
             self.wait(made)
             self.assertEqual(len(processes), 2)
 
@@ -438,7 +425,7 @@ class GravityValidationTest(unittest.TestCase):
             routes = build_routes(made, None)
             self.assertIn("/api/gravity-test", routes)
             answer = routes["/api/gravity-test"][1]({
-                "mode": GRAVITY_HOLD_TEST,
+                "mode": GRAVITY_DRAG_TEST,
                 "options": {"acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT},
             })
             self.assertTrue(answer["ok"])
@@ -457,9 +444,33 @@ class GravityValidationTest(unittest.TestCase):
                 '"position_deg":[12.5]}\n',
                 'GRAVITY_TEST {"phase":"running","message":"topic-only"}\n',
             ])
-            made._run_gravity_test(GRAVITY_HOLD_TEST, process, summary)
+            made._run_gravity_test(GRAVITY_DRAG_TEST, process, summary)
             self.assertEqual(made.result["result"], "PASS")
             self.assertNotIn("sample", made.result)
+
+    def test_external_progress_uses_shared_scene_activity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, _processes = self.made(directory)
+            made._activity = GRAVITY_DRAG_TEST
+            made._state = RUNNING
+            target = [0.0] * 7
+            scenes = []
+
+            def output():
+                yield 'GRAVITY_TEST ' + json.dumps({
+                    "phase": "hold_set", "target_pose": 2, "pose_deg": target,
+                    "completed_pose_indices": [1],
+                }) + '\n'
+                scenes.append(made.scene_activity_payload())
+
+            summary = Path(directory) / "gravity_test_summary.json"
+            summary.write_text(json.dumps({"result": "PASS"}), encoding="utf-8")
+            process = self.Process([])
+            process.stdout = output()
+            made._run_gravity_test(GRAVITY_DRAG_TEST, process, summary)
+            self.assertEqual(scenes[0]["focus"]["index"], 2)
+            self.assertEqual(scenes[0]["focus"]["pose_deg"], target)
+            self.assertEqual(scenes[0]["completed"], {"hold_set": [1]})
 
     def test_activity_is_reserved_before_the_process_launcher_returns(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -480,7 +491,7 @@ class GravityValidationTest(unittest.TestCase):
             made.adopt_description(synthetic_urdf())
             answer = {}
             caller = threading.Thread(target=lambda: answer.update(
-                made.start_gravity_test(GRAVITY_HOLD_TEST, {
+                made.start_gravity_test(GRAVITY_DRAG_TEST, {
                     "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
                 })))
             caller.start()
@@ -503,9 +514,9 @@ class GravityValidationTest(unittest.TestCase):
             with mock.patch.object(
                     dashboard_service.time, "strftime",
                     return_value="20260905-120000"):
-                first = made.start_gravity_test(GRAVITY_HOLD_TEST, options)
+                first = made.start_gravity_test(GRAVITY_DRAG_TEST, options)
                 self.wait(made)
-                second = made.start_gravity_test(GRAVITY_HOLD_TEST, options)
+                second = made.start_gravity_test(GRAVITY_DRAG_TEST, options)
                 self.wait(made)
             self.assertTrue(first["ok"])
             self.assertTrue(second["ok"])
@@ -515,7 +526,7 @@ class GravityValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             made, _processes = self.made(
                 directory, result="PASS", exit_code=7)
-            answer = made.start_gravity_test(GRAVITY_HOLD_TEST, {
+            answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
                 "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
             })
             self.assertTrue(answer["ok"])
@@ -538,7 +549,7 @@ class GravityValidationTest(unittest.TestCase):
             self.assertEqual(made.snapshot()["state"], "idle")
 
     def test_stop_during_launch_uses_the_same_mode_specific_signal(self):
-        for mode in (GRAVITY_DRAG_TEST, GRAVITY_HOLD_TEST):
+        for mode in (GRAVITY_DRAG_TEST,):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 self.killpg.reset_mock()
                 made, processes = self.made(directory, gate=threading.Event())
@@ -567,13 +578,19 @@ class GravityValidationTest(unittest.TestCase):
     def test_stop_preserves_hold_and_other_activity_signaling(self):
         for mode in (GRAVITY_HOLD_TEST, GRAVITY_MODE):
             with self.subTest(mode=mode):
+                self.killpg.reset_mock()
                 made = service()
                 process = self.Process([])
+                self.owned_processes[process.pid] = process
                 made._external_process = process
                 made._activity = mode
                 self.assertTrue(made.stop()["ok"])
-                self.assertEqual(process.signal, signal.SIGINT)
-                self.killpg.assert_not_called()
+                if mode == GRAVITY_HOLD_TEST:
+                    self.killpg.assert_called_once_with(process.pid, signal.SIGINT)
+                    self.assertIsNone(process.signal)
+                else:
+                    self.assertEqual(process.signal, signal.SIGINT)
+                    self.killpg.assert_not_called()
 
     def test_unsupported_joint_names_cannot_target_a_realman_arm(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1063,6 +1080,20 @@ class HomingTest(unittest.TestCase):
         self.wait(made)
         self.assertIs(plant.opened_with.get("require_neutral_start"), False)
 
+    def test_homing_speed_reaches_plant_over_http(self):
+        made, plant = self.homing_service([5.0] * 7)
+        answer = build_routes(made)["/api/home"][1]({"transit_speed_deg_s": 15.0})
+        self.assertTrue(answer["ok"])
+        self.wait(made)
+        self.assertEqual(plant.opened_with["maximum_speed_deg_s"], 15.0)
+
+    def test_homing_invalid_speed_never_opens_plant(self):
+        made, plant = self.homing_service([5.0] * 7)
+        for speed in (0, -1, 61, "bad", None, float("nan"), float("inf")):
+            with self.subTest(speed=speed), self.assertRaises(ValueError):
+                made.home({"transit_speed_deg_s": speed})
+        self.assertFalse(plant.opened_with)
+
     def test_homing_keeps_the_hardware_envelope_active(self):
         made, plant = self.homing_service([40.0] * 7)
         made.home()
@@ -1143,6 +1174,22 @@ class JogTest(unittest.TestCase):
         _made, plant = self.started()
         self.assertFalse(plant.opened_with["require_neutral_start"])
         self.assertLessEqual(plant.opened_with["maximum_speed_deg_s"], 15.0)
+
+    def test_requested_jog_speed_reaches_plant_over_http(self):
+        made, plant = self.jog_service()
+        self.addCleanup(made.jog_stop)
+        answer = build_routes(made)["/api/jog"][1](
+            {"action": "start", "transit_speed_deg_s": 15.0})
+        self.assertTrue(answer["ok"])
+        self.assertTrue(self.settle(lambda: plant.opened_with))
+        self.assertEqual(plant.opened_with["maximum_speed_deg_s"], 15.0)
+
+    def test_jog_invalid_speed_never_opens_plant(self):
+        made, plant = self.jog_service()
+        for speed in (0, -1, 61, "bad", None, float("nan"), float("inf")):
+            with self.subTest(speed=speed), self.assertRaises(ValueError):
+                made.jog({"action": "start", "transit_speed_deg_s": speed})
+        self.assertFalse(plant.opened_with)
 
     def test_a_requested_pose_reaches_the_controller(self):
         made, plant = self.started()
@@ -1321,6 +1368,34 @@ class GravityModeTest(unittest.TestCase):
         self.assertEqual(len(speeds), 2)
         self.assertEqual(list(speeds), sorted(speeds))
 
+    def test_gravity_transit_speed_reaches_hardware_and_changes_signature(self):
+        made = service()
+        original = made._gravity_plan({})
+        faster = made._gravity_plan({"transit_speed_deg_s": 15.0})
+        self.assertEqual(original.gravity_probe_speeds_deg_s,
+                         faster.gravity_probe_speeds_deg_s)
+        self.assertNotEqual(made._gravity_signature(original),
+                            made._gravity_signature(faster))
+        with mock.patch.object(made, "bridge") as bridge:
+            made._build_plant(GRAVITY_MODE, faster)
+            self.assertEqual(bridge.hardware_plant.call_args.kwargs[
+                "maximum_speed_deg_s"], 15.0)
+
+    def test_gravity_rejects_invalid_transit_speed(self):
+        made = service()
+        for speed in (0, -1, 61, "bad", None, float("nan"), float("inf")):
+            with self.subTest(speed=speed), self.assertRaises(ValueError):
+                made._gravity_plan({"transit_speed_deg_s": speed})
+
+    def test_transit_speed_is_bounded_by_the_current_profile(self):
+        made = service()
+        with mock.patch.object(made, "profile") as profile:
+            profile.sustained_speed_deg_s = 12.0
+            self.assertEqual(made._motion_speed_limit(), 12.0)
+            self.assertEqual(made._motion_speed({"transit_speed_deg_s": 12}, 5), 12)
+            with self.assertRaisesRegex(ValueError, "12"):
+                made._motion_speed({"transit_speed_deg_s": 12.1}, 5)
+
     def test_a_probe_speed_above_the_envelope_is_clamped(self):
         plan = service()._gravity_plan(
             {"gravity_probe_speeds_deg_s": [0.5, 1e6]})
@@ -1477,12 +1552,14 @@ class StoredSettingsTest(unittest.TestCase):
             first = self.cell(directory)
             first.plan_preview(GRAVITY_MODE, {"static_poses": 21,
                                               "gravity_validation_poses": 5,
-                                              "gravity_probe_deg": 4.0})
+                                              "gravity_probe_deg": 4.0,
+                                              "transit_speed_deg_s": 15.0})
             again = self.cell(directory)
             defaults = again.gravity_defaults()
             self.assertEqual(defaults["static_poses"], 21)
             self.assertEqual(defaults["gravity_validation_poses"], 5)
             self.assertEqual(defaults["gravity_probe_deg"], 4.0)
+            self.assertEqual(defaults["transit_speed_deg_s"], 15.0)
 
     def test_one_edit_does_not_erase_the_others(self):
         # The whole point of one file: a writer that knows only about boxes
@@ -1552,6 +1629,21 @@ class StoredSettingsTest(unittest.TestCase):
 
 class PlanOnlyTest(unittest.TestCase):
     """Design the poses so a human can look before the arm moves."""
+
+    def test_replanning_changes_targets_but_rehearsal_keeps_the_selected_seed(self):
+        made = service()
+        options = {"static_poses": 6, "gravity_validation_poses": 3}
+        with mock.patch.object(dashboard_service.secrets, "randbelow", return_value=100):
+            first = made.plan_preview(GRAVITY_MODE, options)
+            selected = made._gravity_plan(options)
+            self.assertEqual(selected.seed, made._gravity_plan(options).seed)
+            made.gravity_armed = made._gravity_signature(selected)
+            made.rehearsal_passed = True
+            second = made.plan_preview(GRAVITY_MODE, options)
+        self.assertNotEqual(first["preview"]["groups"], second["preview"]["groups"])
+        self.assertNotEqual(selected.seed, made._gravity_plan(options).seed)
+        self.assertFalse(made.gravity_armed)
+        self.assertFalse(made.rehearsal_passed)
 
     def test_planning_publishes_poses_without_running_anything(self):
         made = service()

@@ -17,6 +17,7 @@ def build_routes(service, node=None) -> dict:
     """path -> (method, handler). Handlers take the decoded JSON body."""
     return {
         "/api/state": ("GET", lambda _body: service.snapshot()),
+        "/api/controller-state": ("GET", lambda _body: node.controller_state()),
         "/api/activity": ("GET", lambda _body: service.activity_payload()),
         "/api/telemetry": ("GET",
                            lambda query: service.telemetry_since(
@@ -61,7 +62,7 @@ def build_routes(service, node=None) -> dict:
                               lambda body: service.start_gravity_test(
                                   str(body.get("mode", "")),
                                   body.get("options") or {})),
-        "/api/home": ("POST", lambda _body: service.home()),
+        "/api/home": ("POST", lambda body: service.home(body)),
         "/api/jog": ("POST", lambda body: service.jog(body)),
         "/api/pause": ("POST", lambda _body: service.pause()),
         "/api/resume": ("POST", lambda _body: service.resume()),

@@ -330,6 +330,7 @@ class CampaignPlan:
     validation_speeds_deg_s: tuple[float, ...] = (3.5, 6.5)
     validation_trajectory_s: float = 12.0
     maximum_speed_deg_s: float = 10.0
+    transit_speed_deg_s: float = 10.0
     maximum_acceleration_deg_s2: float = 20.0
     position_margin_deg: float = 5.0
     temperature_ceiling_c: float = 45.0
@@ -628,6 +629,7 @@ def campaign_bounds(profile: RobotProfile) -> dict:
     return {
         **_STATIC_BOUNDS,
         "maximum_speed_deg_s": (1.0, speed),
+        "transit_speed_deg_s": (0.1, min(60.0, speed)),
         "maximum_acceleration_deg_s2": (2.0, ACCELERATION_PER_SPEED * speed),
         "temperature_ceiling_c": (30.0, profile.temperature_c),
     }

@@ -294,7 +294,16 @@ button.stop { background: rgba(224,179,65,.16); border-color: rgba(224,179,65,.4
 }
 .gravity-test-actions .field { min-width: 0; margin: 0; }
 .gravity-test-actions input { width: 100%; min-width: 0; }
-.gravity-test-actions button { grid-column: 1 / -1; width: 100%; }
+.gravity-test-run-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.gravity-test-run-actions button {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .gravity-test-result {
   margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--line);
 }
@@ -509,7 +518,7 @@ canvas { width: 100%; display: block; }
   #scene-status { max-width: calc(100% - 24px); top: 54px; }
 }
 
-@media (max-width: 600px) {
+@media (max-width: 760px) {
   body { overflow: auto; }
   #topbar {
     flex: none; height: auto; min-height: 46px;
@@ -525,12 +534,32 @@ canvas { width: 100%; display: block; }
   #layout {
     flex: 1 0 0; min-height: 520px; width: 100%; height: auto;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(260px, 40%) minmax(0, 1fr);
+    grid-template-rows: minmax(420px, 45%) minmax(0, 1fr);
   }
-  #stage { min-width: 0; min-height: 260px; }
+  #stage { min-width: 0; min-height: 420px; }
   #panel {
     min-width: 0; border-left: 0; border-top: 1px solid var(--line);
   }
-  #edit-box { max-width: calc(100% - 24px); }
-  #jointbars { max-width: calc(100% - 24px); }
+  #view-opts {
+    top: 8px; left: 8px; max-width: calc(50% - 12px);
+    max-height: 26%; padding: 6px; overflow-y: auto;
+  }
+  #view-opts label { font-size: 11px; overflow-wrap: anywhere; }
+  #edit-box {
+    top: 8px; right: 8px; width: 210px;
+    max-width: calc(50% - 12px); max-height: 26%; padding: 6px;
+    overflow-x: hidden; overflow-wrap: anywhere;
+  }
+  #edit-box .row { flex-wrap: wrap; }
+  #edit-box input, #edit-box select { min-width: 0; max-width: 100%; }
+  #edit-box > summary { position: sticky; top: -6px; background: var(--panel); }
+  #jointbars, #jointbars.expanded {
+    top: auto; bottom: 8px; left: 8px;
+    max-width: calc(100% - 16px); max-height: 30%;
+  }
+  #jointbars > .title {
+    position: sticky; top: -8px; z-index: 1;
+    background: var(--panel); flex-wrap: wrap;
+  }
+  #scene-status { top: 28%; max-width: calc(100% - 16px); }
 }

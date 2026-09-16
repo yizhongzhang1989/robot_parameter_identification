@@ -16,6 +16,7 @@ class ControllerInventory:
         self._pending = None
         self._requested_at = 0.0
         self._received_at = None
+        self._received_request_at = None
         self._items = []
         self._error = "waiting"
 
@@ -29,10 +30,13 @@ class ControllerInventory:
                         self._items = sorted([
                             {"name": str(item.name), "type": str(item.type),
                              "state": str(item.state),
-                             "claimed_interfaces": list(item.claimed_interfaces)}
+                             "claimed_interfaces": list(item.claimed_interfaces),
+                             "required_command_interfaces": list(
+                                 getattr(item, "required_command_interfaces", []))}
                             for item in response.controller
                         ], key=lambda item: item["name"])
                         self._received_at = now
+                        self._received_request_at = self._requested_at
                         self._error = ""
                     except Exception:  # noqa: BLE001
                         self._error = "query_failed"
@@ -62,6 +66,25 @@ class ControllerInventory:
                 "available": bool(available),
                 "age_s": None if age is None else round(age, 3),
                 "error": self._error or ("" if available else "stale"),
-                "items": [dict(item, claimed_interfaces=list(item["claimed_interfaces"]))
+                "requested_at_monotonic": self._received_request_at,
+                "received_at_monotonic": self._received_at,
+                "items": [dict(item, claimed_interfaces=list(item["claimed_interfaces"]),
+                               required_command_interfaces=list(
+                                   item["required_command_interfaces"]))
                           for item in self._items] if available else [],
             }
+
+    def fresh_snapshot(self, timeout_s=5.0):
+        started = self.clock()
+        waiter = threading.Event()
+        while self.clock() - started < timeout_s:
+            self.poll()
+            snapshot = self.snapshot()
+            requested_at = snapshot["requested_at_monotonic"]
+            if (snapshot["available"] and requested_at is not None and
+                    requested_at >= started):
+                return snapshot
+            if snapshot["error"] in ("query_failed", "timeout", "unavailable"):
+                raise RuntimeError(f"controller inventory query failed: {snapshot['error']}")
+            waiter.wait(0.01)
+        raise TimeoutError("controller inventory did not provide a post-request response")

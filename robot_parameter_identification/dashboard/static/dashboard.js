@@ -27,6 +27,7 @@ const state = { snapshot: null, selected: null, frames: [], unit: 'A',
                 // Set when the operator stops the flight by hand, so the run
                 // does not immediately start it again on the next poll.
                 flyOptOut: false, flyAuto: false, sceneActivityId: '',
+                sceneActivity: null,
                 localEvents: [], gravityStatus: null, gravityStatusKey: '',
                 polling: false,
                 // The envelope the server last confirmed, so a value being
@@ -96,7 +97,7 @@ window.__dash = {
   // The flier reports which transit it is on; the reviewer follows it so the
   // numbers under the canvas belong to the arm being watched.
   onFlying: (at, total) => {
-    if (at) showPose(at - 1);
+    if (at && !poseReviewLocked()) showPose(at - 1);
   },
 };
 
@@ -232,7 +233,9 @@ $('btn-optimal').addEventListener('click', () => post('/api/campaign', {
     reuse_friction: $('optimal-reuse-friction').checked,
   },
 }));
-$('btn-home').addEventListener('click', () => post('/api/home', {}));
+$('btn-home').addEventListener('click', () => post('/api/home', {
+  transit_speed_deg_s: parseFloat($('home-speed').value),
+}));
 $('btn-stop').addEventListener('click', () => post('/api/stop', {}));
 $('btn-sweep').addEventListener('click', () => post('/api/campaign', {
   mode: 'load_sweep',
@@ -247,7 +250,7 @@ $('btn-sweep').addEventListener('click', () => post('/api/campaign', {
  */
 
 const GRAVITY_FIELDS = ['grav-poses', 'grav-check', 'grav-arc',
-                        'grav-slow', 'grav-fast'];
+                        'grav-slow', 'grav-fast', 'grav-transit-speed'];
 const GRAVITY_TEST_ACKNOWLEDGEMENT = 'I_AM_HOLDING_ARM_AND_ESTOP_READY';
 const GRAVITY_HOLD_TEST = 'gravity_hold_test';
 const GRAVITY_DRAG_TEST = 'gravity_drag_test';
@@ -259,6 +262,7 @@ function gravityOptions() {
     gravity_validation_poses: parseInt($('grav-check').value, 10),
     gravity_probe_deg: num('grav-arc'),
     gravity_probe_speeds_deg_s: [num('grav-slow'), num('grav-fast')],
+    transit_speed_deg_s: num('grav-transit-speed'),
   };
 }
 
@@ -278,11 +282,39 @@ $('btn-grav-run').addEventListener('click', () => post('/api/campaign', {
 $('btn-grav-pause').addEventListener('click', () => post('/api/pause', {}));
 $('btn-grav-resume').addEventListener('click', () => post('/api/resume', {}));
 
+function holdPoseCount() {
+  return Number($('gravtest-poses').value);
+}
+
+function matchingHoldPlan(snapshot) {
+  const poses = holdPoseCount();
+  const plan = snapshot?.hold_plan;
+  return Number.isInteger(poses) && poses >= 1 && poses <= 20
+    && plan?.available === true && typeof plan.id === 'string'
+    && plan.id.length > 0 && plan.poses === poses;
+}
+
+function planBlocked(snapshot, mode) {
+  return !snapshot?.have_model || snapshot.state === 'running'
+    || snapshot.state === 'paused' || !!snapshot.jogging
+    || !!snapshot.planning || !!state.planPending
+    || (mode === GRAVITY_HOLD_TEST && !snapshot.gravity_test?.available);
+}
+
 async function startGravityTest(mode) {
+  if (mode === GRAVITY_HOLD_TEST) {
+    if (planBlocked(state.snapshot, mode)) return;
+    if (!matchingHoldPlan(state.snapshot)) {
+      publishLocalEvent(t('gravtest.plan_missing'), 'warning', mode);
+      return;
+    }
+  }
   if (!window.confirm(t('gravtest.confirm'))) return;
   const options = mode === GRAVITY_HOLD_TEST ? {
-    poses: parseInt($('gravtest-poses').value, 10),
+    poses: holdPoseCount(),
     seconds: parseFloat($('gravtest-hold-seconds').value),
+    transit_speed_deg_s: parseFloat($('gravtest-transit-speed').value),
+    plan_id: state.snapshot.hold_plan.id,
   } : {
     maximum_speed_deg_s: parseFloat($('gravtest-speed-stop').value),
   };
@@ -299,6 +331,10 @@ $('btn-gravtest-hold').addEventListener(
 $('btn-gravtest-drag').addEventListener(
   'click', () => startGravityTest(GRAVITY_DRAG_TEST));
 $('btn-gravtest-stop').addEventListener('click', () => post('/api/stop', {}));
+
+$('gravtest-poses').addEventListener('input', () => {
+  if (state.snapshot) renderGravity(state.snapshot);
+});
 
 $('btn-rescreen').addEventListener('click', () => post('/api/rescreen', {}));
 for (const id of GRAVITY_FIELDS) {
@@ -320,7 +356,7 @@ function gravityArmed(snapshot) {
 function gravityStatus(snapshot) {
   const armed = gravityArmed(snapshot);
   const astray = snapshot.astray || [];
-  const planning = !!snapshot.planning;
+  const planning = !!snapshot.planning && snapshot.progress?.target === 'gravity';
   let status;
   if (planning) {
     status = { message: t('grav.planning'), level: 'warning' };
@@ -338,7 +374,7 @@ function gravityStatus(snapshot) {
   } else if (snapshot.gravity_armed) {
     status = { message: t('grav.stale'), level: 'warning' };
   } else {
-    status = { message: t('grav.locked'), level: 'info' };
+    status = { message: t('grav.locked'), level: 'info', passive: true };
   }
 
   const options = gravityOptions();
@@ -357,16 +393,27 @@ function renderGravity(snapshot) {
   // Everything the screen says is conditional on the joints this dashboard
   // cannot drive being where the screen puts them, which is neutral.
   const astray = snapshot.astray || [];
-  const planning = !!snapshot.planning;
+  const planning = !!snapshot.planning || !!state.planPending;
+  const speedMax = Number(snapshot.motion_speed_max_deg_s);
+  for (const id of ['home-speed', 'jog-speed', 'grav-transit-speed',
+    'gravtest-transit-speed']) {
+    $(id).max = String(Number.isFinite(speedMax) && speedMax >= 0.1
+      ? Math.min(60, speedMax) : 60);
+    $(id).disabled = busy || planning;
+  }
   $('btn-grav-rehearse').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-plan').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-run').disabled = busy || planning || !armed || astray.length > 0;
   const gravityTest = snapshot.gravity_test || { available: false };
   const gravityTestReady = snapshot.have_model && gravityTest.available;
-  $('btn-gravtest-hold').disabled = busy || planning || !gravityTestReady;
+  const holdPlanned = matchingHoldPlan(snapshot);
+  $('btn-gravtest-plan').disabled = planBlocked(snapshot, GRAVITY_HOLD_TEST);
+  $('btn-gravtest-hold').disabled = busy || planning || !gravityTestReady
+    || !holdPlanned;
+  const holdPlanMissing = gravityTestReady && !busy && !planning && !holdPlanned;
   $('btn-gravtest-drag').disabled = busy || planning || !gravityTestReady;
   $('btn-gravtest-stop').disabled = snapshot.state !== 'running'
-    || snapshot.activity !== GRAVITY_DRAG_TEST;
+    || ![GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST].includes(snapshot.activity);
   const capability = $('gravtest-capability');
   const capabilityKey = gravityTest.reason_code
     ? `gravtest.${gravityTest.reason_code}` : '';
@@ -383,10 +430,18 @@ function renderGravity(snapshot) {
   state.gravityStatus = status;
   if (statusKey !== state.gravityStatusKey) {
     state.gravityStatusKey = statusKey;
-    if (!status.passive) {
+    const mode = snapshot.planning ? snapshot.progress?.target
+      : (snapshot.activity || snapshot.progress?.mode);
+    if (!status.passive && ['gravity', 'gravity_rehearsal'].includes(mode)) {
       publishLocalEvent(status.message, status.level, status.source);
     }
   }
+  const holdFinished = snapshot.progress?.mode === GRAVITY_HOLD_TEST
+    && ['complete', 'failed', 'stopped'].includes(snapshot.progress?.phase);
+  if (holdPlanMissing && !state.holdPlanMissing && !holdFinished) {
+    publishLocalEvent(t('gravtest.plan_missing'), 'warning', GRAVITY_HOLD_TEST);
+  }
+  state.holdPlanMissing = holdPlanMissing;
   $('btn-rescreen').classList.toggle('hidden', !astray.length);
   $('btn-rescreen').disabled = busy || planning;
 
@@ -565,14 +620,43 @@ $('space-reset').addEventListener('click', async () => {
 
 /* ---------------- reviewing the planned poses ---------------- */
 
-$('btn-grav-plan').addEventListener('click', async () => {
-  const answer = await post('/api/plan',
-                            { mode: 'gravity', options: gravityOptions() });
-  if (answer.ok) {
-    state.poseAt = 0;
-    setTimeout(() => showPose(0), 400);
+async function requestPlan(mode, options) {
+  if (planBlocked(state.snapshot, mode)) return;
+  if (mode === GRAVITY_HOLD_TEST
+      && (!Number.isInteger(options.poses) || options.poses < 1 || options.poses > 20)) return;
+  state.planPending = true;
+  state.snapshot.hold_plan = { available: false };
+  renderGravity(state.snapshot);
+  try {
+    const answer = await post('/api/plan', { mode, options });
+    if (answer.ok) {
+      state.snapshot.hold_plan = answer.hold_plan || { available: false };
+      state.poseAt = 0;
+      await refreshPlannedPoses(state.snapshot.preview_token, true);
+    }
+  } catch (error) {
+    publishLocalEvent(String(error), 'error', mode);
+  } finally {
+    state.planPending = false;
+    renderGravity(state.snapshot);
   }
-});
+}
+
+$('btn-grav-plan').addEventListener('click',
+  () => requestPlan('gravity', gravityOptions()));
+$('btn-gravtest-plan').addEventListener('click',
+  () => requestPlan(GRAVITY_HOLD_TEST, { poses: holdPoseCount() }));
+
+function poseReviewLocked() {
+  return !!state.sceneActivity?.id && !state.sceneActivity.tour?.autoplay;
+}
+
+function refreshPoseControls() {
+  const disabled = poseReviewLocked() || !state.plannedPoses.length;
+  for (const id of ['pose-prev', 'pose-next', 'pose-worst', 'pose-fly']) {
+    $(id).disabled = disabled;
+  }
+}
 
 /** Walk the drawn poses. The 3D view is the review; this only points at one. */
 function showPose(index) {
@@ -602,9 +686,14 @@ function showPose(index) {
     margin != null && margin <= 0.02 ? 'var(--warn)' : 'var(--muted)';
 }
 
-$('pose-prev').addEventListener('click', () => showPose(state.poseAt - 1));
-$('pose-next').addEventListener('click', () => showPose(state.poseAt + 1));
+$('pose-prev').addEventListener('click', () => {
+  if (!poseReviewLocked()) showPose(state.poseAt - 1);
+});
+$('pose-next').addEventListener('click', () => {
+  if (!poseReviewLocked()) showPose(state.poseAt + 1);
+});
 $('pose-fly').addEventListener('click', () => {
+  if (poseReviewLocked()) return;
   if (window.__viewer?.flying?.()) {
     state.flyOptOut = true;
     window.__viewer.stopFlying();
@@ -615,6 +704,7 @@ $('pose-fly').addEventListener('click', () => {
   }
 });
 $('pose-worst').addEventListener('click', () => {
+  if (poseReviewLocked()) return;
   const poses = state.plannedPoses;
   if (!poses.length) return;
   let worst = 0;
@@ -627,21 +717,24 @@ $('pose-worst').addEventListener('click', () => {
 });
 
 /** Keep the reviewer's list in step with what the canvas drew. */
-async function refreshPlannedPoses(token) {
-  if (token === state.previewToken) return;
+async function refreshPlannedPoses(token, force = false) {
+  if (!force && token === state.previewToken) return;
   state.previewToken = token;
+  const request = state.previewRequest = (state.previewRequest || 0) + 1;
   try {
     const data = await (await fetch('/api/preview', { cache: 'no-store' })).json();
+    if (request !== state.previewRequest) return;
     state.plannedPoses = (data.groups || []).flatMap(
       (group) => (group.poses || []).map(
         (pose) => ({ ...pose, phase: group.phase })));
   } catch (error) {
+    if (request !== state.previewRequest) return;
     state.plannedPoses = [];
+    state.previewToken = -1;
   }
-  for (const id of ['pose-prev', 'pose-next', 'pose-worst', 'pose-fly']) {
-    $(id).disabled = !state.plannedPoses.length;
-  }
-  showPose(state.poseAt);
+  refreshPoseControls();
+  if (poseReviewLocked()) renderSceneActivity(state.sceneActivity);
+  else showPose(state.poseAt);
 }
 
 /* ---------------- collapsible panel groups ---------------- */
@@ -844,8 +937,9 @@ function renderActivity(snapshot) {
   const active = snapshot.planning || feed.state === 'running'
     || feed.state === 'paused' || feed.state === 'jogging';
   const mode = feed.activity || progress.mode || '';
-  const gravityIdentification = snapshot.planning || mode === 'gravity'
-    || mode === 'gravity_rehearsal';
+  const gravityIdentification = snapshot.planning
+    ? progress.target === 'gravity'
+    : mode === 'gravity' || mode === 'gravity_rehearsal';
   const gravityCurrent = gravityIdentification ? state.gravityStatus : null;
     const current = gravityCurrent && (snapshot.planning
       || gravityCurrent.level === 'error'
@@ -870,6 +964,8 @@ function renderActivity(snapshot) {
 
 /** Apply the mode-neutral activity contract beside the 3D canvas. */
 function renderSceneActivity(activity) {
+  state.sceneActivity = activity;
+  refreshPoseControls();
   const progress = activity.progress || {};
   const active = !!activity.id;
   $('scene-status').classList.toggle('hidden', !active);
@@ -886,9 +982,15 @@ function renderSceneActivity(activity) {
     state.flyAuto = true;
     window.__viewer?.fly?.();
   }
-  if (!autoplay && state.flyAuto) {
+  if (!autoplay && (state.flyAuto
+      || (poseReviewLocked() && window.__viewer?.flying?.()))) {
     state.flyAuto = false;
     window.__viewer?.stopFlying?.();
+  }
+  if (activity.focus) {
+    const index = state.plannedPoses.findIndex((pose) =>
+      pose.phase === activity.focus.phase && pose.index === activity.focus.index);
+    if (index >= 0) showPose(index);
   }
   $('pose-fly').textContent = window.__viewer?.flying?.()
     ? t('inspect.land') : t('inspect.fly');
@@ -933,6 +1035,7 @@ function seedGravityFields(snapshot) {
   set('grav-poses', defaults.static_poses);
   set('grav-check', defaults.gravity_validation_poses);
   set('grav-arc', defaults.gravity_probe_deg);
+  set('grav-transit-speed', defaults.transit_speed_deg_s);
   const speeds = defaults.gravity_probe_speeds_deg_s || [];
   set('grav-slow', speeds[0]);
   set('grav-fast', speeds[speeds.length - 1]);
@@ -1269,7 +1372,9 @@ $('jog-sliders').addEventListener('change', async (event) => {
 
 $('btn-jog').addEventListener('click', async () => {
   const jogging = !!state.snapshot?.jogging;
-  await post('/api/jog', { action: jogging ? 'stop' : 'start' });
+  await post('/api/jog', jogging ? { action: 'stop' } : {
+    action: 'start', transit_speed_deg_s: parseFloat($('jog-speed').value),
+  });
 });
 
 $('btn-jog-zero').addEventListener('click', async () => {

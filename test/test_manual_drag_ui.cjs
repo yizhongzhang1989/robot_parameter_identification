@@ -41,7 +41,7 @@ vm.runInContext(`
   const GRAVITY_HOLD_TEST = 'gravity_hold_test';
   const GRAVITY_DRAG_TEST = 'gravity_drag_test';
   const GRAVITY_TEST_ACKNOWLEDGEMENT = 'I_AM_HOLDING_ARM_AND_ESTOP_READY';
-  ${source.slice(source.indexOf('async function startGravityTest('),
+  ${source.slice(source.indexOf('function holdPoseCount('),
     source.indexOf("$('btn-rescreen').addEventListener"))}
   ${source.slice(source.indexOf('function renderGravity(snapshot)'),
     source.indexOf('function renderGravityTestResult(snapshot)'))}
@@ -66,9 +66,14 @@ async function main() {
   confirmed = true;
   element('gravtest-poses').value = '4';
   element('gravtest-hold-seconds').value = '2';
+  element('gravtest-transit-speed').value = '5';
+  context.state.snapshot = {
+    state: 'idle', have_model: true, gravity_test: { available: true },
+    hold_plan: { available: true, id: 'hold-plan-4', poses: 4 },
+  };
   await element('btn-gravtest-hold').handlers.click();
   assert.deepEqual(requests.pop().body.options, {
-    poses: 4, seconds: 2,
+    poses: 4, seconds: 2, transit_speed_deg_s: 5, plan_id: 'hold-plan-4',
     acknowledgement: 'I_AM_HOLDING_ARM_AND_ESTOP_READY',
   });
 
@@ -77,7 +82,8 @@ async function main() {
       context.snapshot = { state, activity, have_model: false, planning: true };
       vm.runInContext('renderGravity(snapshot)', context);
       assert.equal(element('btn-gravtest-stop').disabled,
-        !(state === 'running' && activity === 'gravity_drag_test'),
+        !(state === 'running'
+          && ['gravity_hold_test', 'gravity_drag_test'].includes(activity)),
         `${state}/${activity}`);
     }
   }

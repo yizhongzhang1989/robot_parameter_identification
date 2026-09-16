@@ -46,6 +46,35 @@ class ControllerInventoryTest(unittest.TestCase):
         self.assertTrue(self.inventory.snapshot()["available"])
         self.assertEqual(self.inventory.snapshot()["items"], [])
 
+    def test_fresh_snapshot_rejects_earlier_request_and_queries_again(self):
+        self.inventory.poll()
+        old = self.future
+        self.now = 1.0
+        old.set_result(SimpleNamespace(controller=[SimpleNamespace(
+            name="old", type="example/Controller", state="inactive", claimed_interfaces=[],
+            required_command_interfaces=[])]))
+
+        def answer(_request):
+            self.now += 0.01
+            future = Future()
+            future.set_result(SimpleNamespace(controller=[SimpleNamespace(
+                name="new", type="example/Controller", state="active",
+                claimed_interfaces=["joint/position"],
+                required_command_interfaces=["joint/position"])]))
+            return future
+
+        self.client.call_async.side_effect = answer
+        snapshot = self.inventory.fresh_snapshot()
+        self.assertEqual(snapshot["items"][0]["name"], "new")
+        self.assertGreaterEqual(snapshot["requested_at_monotonic"], 1.0)
+        self.assertEqual(snapshot["items"][0]["required_command_interfaces"], ["joint/position"])
+        self.assertGreaterEqual(self.client.call_async.call_count, 2)
+
+    def test_fresh_snapshot_fails_when_service_is_unavailable(self):
+        self.client.service_is_ready.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            self.inventory.fresh_snapshot()
+
     def test_connection_exposes_inventory_and_no_bridge_is_unavailable(self):
         from robot_parameter_identification.dashboard.service import (
             DashboardConfig, IdentificationService)

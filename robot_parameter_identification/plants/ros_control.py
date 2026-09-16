@@ -35,6 +35,9 @@ MINIMUM_TRAVERSE_SPEED_DEG_S = 1e-3
 # Below this the servo's own speed ripple is a large share of the demand, so
 # the window has to be long enough to average it.
 CRAWL_SPEED_DEG_S = 0.1
+GOAL_STATUS_SUCCEEDED = 4
+GOAL_STATUS_CANCELED = 5
+GOAL_STATUS_ABORTED = 6
 
 
 def differentiate(times_s, values, window: int = 5) -> np.ndarray:
@@ -198,6 +201,10 @@ class TelemetryUnavailable(RuntimeError):
     """Raised when the arm is not publishing usable joint state."""
 
 
+class MotionStopUnverified(RuntimeError):
+    """Motion may still be active; do not retry or resume without operator restart."""
+
+
 class HardwarePlant:
     """Campaign plant backed by the joint trajectory controller.
 
@@ -235,6 +242,7 @@ class HardwarePlant:
         self._monitor_trip: str | None = None
         self._monitor_trip_detail: dict = {}
         self._pause_requested = lambda: False
+        self._stop_requested = lambda: False
 
     def set_monitor(self, monitor) -> None:
         """Watch every raw frame and latch the first safety violation."""
@@ -245,6 +253,15 @@ class HardwarePlant:
     def set_pause_requested(self, requested) -> None:
         """Check for a cooperative pause only between controller goals."""
         self._pause_requested = requested or (lambda: False)
+
+    def set_stop_requested(self, callback) -> None:
+        """Check for a stop before sending and while awaiting a controller goal."""
+        self._stop_requested = callback or (lambda: False)
+
+    def _raise_if_stop_requested(self) -> None:
+        requested = getattr(self, "_stop_requested", None)
+        if requested is not None and requested():
+            raise RuntimeError("stop requested")
 
     def raw_frame_checkpoint(self) -> int:
         """Mark the raw stream before one all-or-nothing pose measurement."""
@@ -622,22 +639,28 @@ class HardwarePlant:
 
     def _attempt(self, points, on_frame=None):
         """Send one trajectory and pump telemetry until the controller is done."""
+        self._raise_if_stop_requested()
         if self._pause_requested():
             raise MotionPaused("pause requested before the next trajectory")
         self._raise_if_monitor_tripped()
         goal = self._goal(points)
         duration = points[-1][2]
+        self._raise_if_stop_requested()
         send_future = self._client.send_goal_async(goal)
-        self._wait(send_future, 5.0)
-        handle = send_future.result()
-        if handle is None:
-            # Not the same thing as a refusal, and saying so matters: the
-            # controller may well be running the goal it never acknowledged.
-            raise MotionFailed("the controller did not answer the goal in 5 s")
+        try:
+            self._wait(send_future, 5.0)
+            if not send_future.done():
+                raise TimeoutError("the controller did not answer the goal in 5 s")
+            handle = send_future.result()
+            if handle is None:
+                raise RuntimeError("the controller returned no goal handle")
+        except BaseException as failure:
+            raise MotionStopUnverified(
+                "goal acceptance is unknown; motion stop cannot be verified") from failure
         if not handle.accepted:
             raise MotionFailed("the controller rejected the trajectory")
 
-        result_future = handle.get_result_async()
+        result_future = None
         started = time.monotonic()
         period = 1.0 / max(self.config.stream_rate_hz, 1.0)
         next_sample = started
@@ -651,10 +674,14 @@ class HardwarePlant:
 
         # Sample the endpoints explicitly: a short or already-finished goal
         # would otherwise skip the wait loop and silently record nothing.
-        capture(started)
         try:
+            result_future = handle.get_result_async()
+            self._raise_if_stop_requested()
+            capture(started)
             while not result_future.done():
+                self._raise_if_stop_requested()
                 self._spin_once(0.01)
+                self._raise_if_stop_requested()
                 self._raise_if_monitor_tripped()
                 now = time.monotonic()
                 if now >= next_sample:
@@ -662,25 +689,89 @@ class HardwarePlant:
                     capture(now)
                 if now - started > duration + self.config.goal_timeout_margin_s:
                     raise MotionFailed("the trajectory overran its deadline")
-        except BaseException:
-            cancel = handle.cancel_goal_async()
-            self._wait(cancel, 3.0)
+            self._raise_if_stop_requested()
+            capture(time.monotonic())
+            self._raise_if_stop_requested()
+            self._raise_if_monitor_tripped()
+            wrapped = result_future.result()
+            if wrapped is None or (
+                    wrapped.result.error_code
+                    != self._action_type.Result.SUCCESSFUL):
+                raise MotionFailed("the trajectory did not complete successfully")
+        except BaseException as failure:
+            try:
+                self._cancel_and_verify(handle, result_future)
+            except BaseException as verification_failure:
+                raise MotionStopUnverified(
+                    f"motion stop could not be verified: {verification_failure}") from failure
             raise
-        capture(time.monotonic())
-        self._raise_if_monitor_tripped()
-        wrapped = result_future.result()
-        if wrapped is None or (
-                wrapped.result.error_code
-                != self._action_type.Result.SUCCESSFUL):
-            raise MotionFailed("the trajectory did not complete successfully")
         if self._pause_requested():
             raise MotionPaused("pause requested after the current trajectory")
+
+    def _cancel_and_verify(self, handle, result_future) -> None:
+        def terminal() -> bool:
+            if result_future is None or not result_future.done():
+                return False
+            try:
+                wrapped = result_future.result()
+            except BaseException:
+                return False
+            return getattr(wrapped, "status", None) in (
+                GOAL_STATUS_SUCCEEDED, GOAL_STATUS_CANCELED, GOAL_STATUS_ABORTED)
+
+        if terminal():
+            return
+        try:
+            cancel = handle.cancel_goal_async()
+            self._wait(cancel, 3.0)
+            if terminal():
+                return
+            if not cancel.done():
+                raise RuntimeError("cancellation response timed out")
+            response = cancel.result()
+            if (getattr(response, "return_code", None) != 0 or not any(
+                    goal.goal_id == handle.goal_id
+                    for goal in (getattr(response, "goals_canceling", None) or []))):
+                raise RuntimeError("cancellation was not accepted for this goal")
+        except BaseException:
+            if terminal():
+                return
+            raise
+        if result_future is not None and not result_future.done():
+            self._wait(result_future, 3.0)
+        if not terminal():
+            raise RuntimeError("the goal has no confirmed terminal result")
 
     def move_to(self, pose_deg) -> None:
         """Drive there and stop. Nothing is collected, so a jog costs nothing."""
         target = np.asarray(pose_deg, dtype=float)
         duration = self._duration_for(target, self.config.maximum_speed_deg_s)
         self._execute([(target, np.zeros(self.joint_count), duration)])
+
+    def wait_for_position(self, pose_deg, tolerance_deg=1.0, timeout_s=1.0) -> dict:
+        """Confirm arrival from telemetry received after the trajectory result."""
+        target = np.asarray(pose_deg, dtype=float)
+        if (target.shape != (self.joint_count,) or not np.isfinite(target).all()
+                or not math.isfinite(tolerance_deg) or tolerance_deg <= 0
+                or not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError("arrival target, tolerance and timeout must be finite and valid")
+        started = time.monotonic()
+        while time.monotonic() - started < timeout_s:
+            self._raise_if_stop_requested()
+            self._raise_if_monitor_tripped()
+            self._spin_once(0.01)
+            self._raise_if_stop_requested()
+            self._raise_if_monitor_tripped()
+            with self._lock:
+                sample_at = self._latest_at
+            if sample_at < started:
+                continue
+            frame = self.sample(maximum_age_s=0.05)
+            actual = np.asarray((frame or {}).get("position_deg"), dtype=float)
+            if (actual.shape == target.shape and np.isfinite(actual).all()
+                    and np.max(np.abs(actual - target)) <= tolerance_deg):
+                return frame
+        raise MotionFailed("hold target was not reached in fresh post-trajectory telemetry")
 
     def hold_pose(self, pose_deg, phase: str = "A_gravity") -> dict:
         """Move there, let the servo settle, and average a few frames at rest."""

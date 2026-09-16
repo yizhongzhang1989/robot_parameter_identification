@@ -16,8 +16,10 @@ import math
 import os
 import platform
 import re
+import secrets
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -38,6 +40,7 @@ from ..model import ModelComponents
 from .. import obstacles as obstacles_module
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
+from . import hold_plan as hold_plan_module
 
 IDLE, RUNNING, PAUSED, JOGGING = "idle", "running", "paused", "jogging"
 GRAVITY_HOLD_TEST = "gravity_hold_test"
@@ -328,11 +331,15 @@ class IdentificationService:
         self.gravity_armed = ""
         # The gravity card's last committed numbers, kept across restarts.
         self.gravity_options: dict = {}
+        self._gravity_seed: int | None = None
         # What the config file held, so the parts that need a model can wait
         # for one and the parts that do not are in force before the first plan.
         self._stored: dict = {}
         self.preview: dict = {"available": False}
         self.preview_token = 0
+        self._hold_plan: dict = {}
+        self._hold_recovery_required = False
+        self._hold_current_started = False
         # Poses the phases of a running campaign have designed so far.
         self._designed: dict = {}
         self._completed_poses: dict[str, list[int]] = {}
@@ -679,10 +686,10 @@ class IdentificationService:
         if self.profile is None:
             return {"ok": False, "message": "no robot profile loaded"}
         self._require_idle("a run is going; wait for it to finish")
-        if mode != GRAVITY_MODE:
+        if mode not in (GRAVITY_MODE, GRAVITY_HOLD_TEST):
             return {"ok": False, "message": f"cannot preview {mode!r}"}
         with self._lock:
-            if self.planning:
+            if self.planning or self._state != IDLE:
                 return {"ok": False, "message": "already planning"}
             previous_progress = dict(self.progress)
             self.planning = True
@@ -690,7 +697,9 @@ class IdentificationService:
                              "target": mode}
         self.publish_event("designing and screening poses", source="planner")
         try:
-            answer = self._plan_gravity(dict(options or {}))
+            answer = (self._plan_hold(dict(options or {}))
+                      if mode == GRAVITY_HOLD_TEST else
+                      self._plan_gravity(dict(options or {})))
             with self._lock:
                 self.progress = previous_progress
             return answer
@@ -706,6 +715,12 @@ class IdentificationService:
                 self.planning = False
 
     def _plan_gravity(self, options: dict) -> dict:
+        with self._lock:
+            previous_seed = (self._gravity_seed if self._gravity_seed is not None
+                             else self.plan.seed)
+            self._gravity_seed = (previous_seed + 1 + secrets.randbelow(2**31 - 1)) % 2**31
+            self.gravity_armed = ""
+            self.rehearsal_passed = False
         plan = self._gravity_plan(options)
         self._remember_gravity(plan)
         limits = plan.design_limits(self.arm)
@@ -745,6 +760,93 @@ class IdentificationService:
 
     def have_model(self) -> bool:
         return self.arm is not None
+
+    def _hold_context(self) -> str:
+        payload = {
+            "urdf": self.urdf_text, "range": self.jog_range_deg(),
+            "obstacles": self.scene.as_list() if self.scene else [],
+            "margin": self.config.safety_margin_m,
+            "reference": self.screen_reference,
+            "joints": list(self.arm.joint_names) if self.arm else [],
+            "source": self.config.gravity_test_source,
+            "commands": self.config.commands.follow_joint_trajectory_action,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _hold_position(self) -> list:
+        sample = self.latest_sample()
+        health = self.connection()
+        if not sample or not health.get("telemetry_ok"):
+            raise ValueError("fresh joint telemetry is required for a hold plan")
+        pose = np.asarray(sample.get("position_deg"), dtype=float)
+        if pose.shape != (7,) or not np.isfinite(pose).all():
+            raise ValueError("hold position requires seven finite joint angles")
+        return pose.tolist()
+
+    def _hold_path_clear(self, start, target) -> bool:
+        limits = np.asarray(self.jog_range_deg(), dtype=float)
+        if self.scene is None or limits.shape != (7, 2):
+            return False
+        for fraction in np.linspace(0.0, 1.0, 400):
+            pose = np.asarray(start) + (np.asarray(target) - start) * fraction
+            if (np.any(pose < limits[:, 0]) or np.any(pose > limits[:, 1])
+                    or not self.scene.collision_free(pose)):
+                return False
+        return True
+
+    def hold_plan_payload(self) -> dict:
+        """Describe the plan permission without exposing mutable execution targets."""
+        plan = self._hold_plan
+        available = bool(plan and plan["context"] == self._hold_context()
+                         and not self.screen_drift())
+        return {"available": available, "id": plan.get("id", ""),
+                "poses": plan.get("count", 0)}
+
+    def _plan_hold(self, options: dict) -> dict:
+        capability = self.gravity_test_capability()
+        if not capability["available"]:
+            raise ValueError(capability["reason"])
+        if self.scene is None or self.screen_drift():
+            raise ValueError("refresh the collision scene before planning holds")
+        count = options.get("poses", 5)
+        context = self._hold_context()
+        start = self._hold_position()
+        limits = np.asarray(self.jog_range_deg())
+
+        def clear(pose):
+            return bool(np.all(pose >= limits[:, 0]) and
+                        np.all(pose <= limits[:, 1]) and
+                        self.scene.collision_free(pose))
+
+        with self._lock:
+            previous = self._hold_plan
+            self._hold_plan = {}
+        for attempt in range(8):
+            plan = hold_plan_module.build_hold_plan(
+                str(self.config.gravity_test_source or ""), list(self.arm.joint_names),
+                start, count, clear)
+            if plan["poses_deg"] != previous.get("poses_deg"):
+                break
+        else:
+            raise ValueError("could not find a different hold pose set; reduce the pose count "
+                             "or use a model with more recorded poses")
+        if context != self._hold_context() or self.screen_drift():
+            raise ValueError("scene changed during planning; plan again")
+        if np.max(np.abs(np.asarray(self._hold_position()) - start)) > 1.0:
+            raise ValueError("arm moved during planning; plan again")
+        plan["context"] = context
+        plan["id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+        preview = self._build_preview("plan", {"phases": [
+            {"phase": "hold_set", "detail": {"poses_deg": plan["poses_deg"]}}]})
+        if not preview.get("available"):
+            raise ValueError("hold preview is unavailable")
+        with self._lock:
+            self._hold_plan = plan
+            self.preview = preview
+            self.preview_token += 1
+            self._completed_poses = {}
+        return {"ok": True, "preview": self.preview_payload(),
+                "hold_plan": self.hold_plan_payload()}
 
     def kinematics(self, payload: dict) -> dict:
         """Link poses along the straight joint-space line between two poses.
@@ -1188,19 +1290,11 @@ class IdentificationService:
             # skeletons once instead of on every poll.
             "preview_token": self.preview_token,
         }
-        # Which planned pose the run is on, so the canvas can pick it out of
-        # the tour it is already drawing.
-        visiting = self.progress.get("pose_deg")
-        target_index = int(self.progress.get("target_pose")
-                   or self.progress.get("pose") or 0)
-        target_complete = (self.progress.get("target_pose") is not None
-                   and self.progress.get("completed_pose")
-                   == self.progress.get("target_pose"))
-        if visiting is not None and not target_complete:
+        focus = payload["scene_activity"]["focus"]
+        if focus is not None:
             payload["moving"] = {
-                "pose_deg": list(visiting),
-                "phase": str(self.progress.get("phase") or ""),
-            "index": target_index,
+                "pose_deg": list(focus["pose_deg"]),
+                "phase": focus["phase"], "index": focus["index"],
             }
         if self.plan is not None and getattr(self.plan, "workspace_limit_deg", None):
             payload["workspace_limit_deg"] = list(self.plan.workspace_limit_deg)
@@ -1303,7 +1397,7 @@ class IdentificationService:
             return {"ok": False, "message": "no robot profile loaded"}
         options = dict(options or {})
         with self._lock:
-            if self._state != IDLE:
+            if self._state != IDLE or self.planning:
                 return {"ok": False, "message": f"{self._activity} is running"}
             if mode == GRAVITY_MODE:
                 wanted = self._gravity_signature(self._gravity_plan(options))
@@ -1368,7 +1462,7 @@ class IdentificationService:
             activity = self._activity
         if process is not None and process.poll() is None:
             try:
-                if activity == GRAVITY_DRAG_TEST:
+                if activity in (GRAVITY_DRAG_TEST, GRAVITY_HOLD_TEST):
                     os.killpg(process.pid, signal.SIGINT)
                 else:
                     process.send_signal(signal.SIGINT)
@@ -1412,6 +1506,19 @@ class IdentificationService:
             "reason": "gravity validation requires one complete RealMan arm",
         }
 
+    def _motion_speed_limit(self) -> float:
+        return min(60.0, float(self.profile.sustained_speed_deg_s)) if self.profile else 0.0
+
+    def _motion_speed(self, options: dict, default: float) -> float:
+        ceiling = self._motion_speed_limit()
+        try:
+            speed = float(options.get("transit_speed_deg_s", default))
+        except (TypeError, ValueError):
+            raise ValueError("transit_speed_deg_s is not numeric") from None
+        if not math.isfinite(speed) or not 0.1 <= speed <= ceiling:
+            raise ValueError(f"transit_speed_deg_s must be in [0.1, {ceiling:g}]")
+        return speed
+
     def start_gravity_test(self, mode: str, options: dict | None = None) -> dict:
         """Start one standalone, guard-owned gravity validation activity."""
         options = dict(options or {})
@@ -1443,15 +1550,15 @@ class IdentificationService:
         if mode == GRAVITY_HOLD_TEST:
             poses = bounded("poses", 5, 1, 20, integer=True)
             seconds = bounded("seconds", 3.0, 0.5, 10.0)
-            normalized = {"arm": arm, "poses": poses, "seconds": seconds}
-        else:
-            speed = bounded("maximum_speed_deg_s", 120.0, 1.0, 120.0)
-            normalized = {"arm": arm, "maximum_speed_deg_s": speed}
+            speed = self._motion_speed(options, 5.0)
+            return self._start_planned_hold(options.get("plan_id"), poses, seconds, speed)
+        speed = bounded("maximum_speed_deg_s", 120.0, 1.0, 120.0)
+        normalized = {"arm": arm, "maximum_speed_deg_s": speed}
         if source:
             normalized["source"] = source
 
         with self._lock:
-            if self._state != IDLE:
+            if self._state != IDLE or self.planning:
                 return {"ok": False, "message": f"{self._activity} is running"}
             # Reserve the one activity slot before mkdir/Popen. The HTTP
             # server is threaded, so checking and claiming in separate lock
@@ -1482,23 +1589,14 @@ class IdentificationService:
                 raise OSError("could not allocate a gravity-test output directory")
             status_file = folder / "status.json"
             summary_file = folder / "gravity_test_summary.json"
-            if mode == GRAVITY_HOLD_TEST:
-                command = [
-                    "ros2", "run", "rm_control", "gravity_compensation_test",
-                    "hold-set", "--arm", arm,
-                    "--poses", str(poses), "--seconds", str(seconds),
-                    "--output-dir", str(folder), "--status-file", str(status_file),
-                    "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
-                ]
-            else:
-                output = folder / "drag.json"
-                command = [
-                    "ros2", "run", "rm_control", "manual_drag",
-                    "--arm", arm,
-                    "--maximum-speed-deg-s", str(speed),
-                    "--output", str(output), "--status-file", str(status_file),
-                    "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
-                ]
+            output = folder / "drag.json"
+            command = [
+                "ros2", "run", "rm_control", "manual_drag",
+                "--arm", arm,
+                "--maximum-speed-deg-s", str(speed),
+                "--output", str(output), "--status-file", str(status_file),
+                "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
+            ]
             if source:
                 command.extend(["--source", source])
             process = self._process_launcher(
@@ -1542,6 +1640,152 @@ class IdentificationService:
         return {"ok": True, "message": f"{mode} started",
                 "output": str(folder)}
 
+    def _start_planned_hold(self, plan_id, poses, seconds, speed=5.0) -> dict:
+        with self._lock:
+            if self._state != IDLE or self.planning:
+                return {"ok": False, "message": "another activity is running"}
+            permission = self.hold_plan_payload()
+            if (not permission["available"] or not plan_id
+                    or permission["id"] != plan_id or permission["poses"] != poses
+                    or not hold_plan_module.source_is_current(self._hold_plan)):
+                return {"ok": False, "message": "plan the hold poses again before execution"}
+            plan = json.loads(json.dumps(self._hold_plan))
+            try:
+                position = self._hold_position()
+                if np.max(np.abs(np.asarray(position) - plan["start_deg"])) > 1.0:
+                    raise ValueError("arm moved since planning; plan again")
+            except ValueError as error:
+                return {"ok": False, "message": str(error)}
+            self._state, self._activity = RUNNING, GRAVITY_HOLD_TEST
+            self._hold_current_started = False
+            self._started_at = time.monotonic()
+            self._abort.clear()
+            self._completed_poses = {}
+            self._options = {"poses": poses, "seconds": seconds, "plan_id": plan_id,
+                             "transit_speed_deg_s": speed}
+            self.result = None
+            self.progress = {"mode": GRAVITY_HOLD_TEST, "phase": "starting"}
+            self._worker = threading.Thread(
+                target=self._run_planned_hold, args=(plan, seconds), daemon=True,
+                name="identification-planned-hold")
+            self._worker.start()
+        return {"ok": True, "message": "planned hold started"}
+
+    def _run_hold_child(self, command, timeout_s):
+        with self._lock:
+            if self._abort.is_set():
+                raise RuntimeError("hold stopped before child launch")
+            endpoint = getattr(self.bridge, "controller_state_url", None)
+            endpoint = endpoint() if callable(endpoint) else None
+            if isinstance(endpoint, str) and endpoint:
+                command = [*command, "--controller-state-url", endpoint]
+            process = self._process_launcher(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True)
+            self._external_process = process
+            self._hold_current_started = True
+        deadline = time.monotonic() + timeout_s
+        interrupted = False
+        while True:
+            if not interrupted and (self._abort.is_set() or self.screen_drift()
+                                    or time.monotonic() >= deadline):
+                self.stop()
+                interrupted = True
+            try:
+                stdout, stderr = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        with self._lock:
+            self._external_process = None
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    def _move_hold_target(self, pose) -> dict:
+        from ..plants.ros_control import MotionStopUnverified
+
+        if self._abort.is_set():
+            raise RuntimeError("hold stopped before motion")
+        context = self._hold_context()
+        plant = self.bridge.hardware_plant(
+            self.profile, self.scene, require_neutral_start=False,
+            maximum_speed_deg_s=self._motion_speed(self._options, 5.0))
+        try:
+            plant.set_monitor(self._monitor())
+            plant.set_stop_requested(
+                lambda: self._abort.is_set() or bool(self.screen_drift())
+                or self._hold_context() != context
+                or not self.connection().get("telemetry_ok"))
+            if not self._hold_path_clear(self._hold_position(), pose):
+                raise ValueError("hold transit changed before motion")
+            plant.move_to(pose)
+            sample = plant.wait_for_position(pose, tolerance_deg=1.0, timeout_s=1.0)
+            actual = np.asarray((sample or {}).get("position_deg"), dtype=float)
+            if actual.shape != (7,) or not np.isfinite(actual).all():
+                raise ValueError("move returned no fresh position telemetry")
+            error = float(np.max(np.abs(actual - pose)))
+            return {"ok": error <= 1.0, "error_deg": error,
+                    "ros_deg": actual.tolist(),
+                    "reason": "" if error <= 1.0 else "hold target was not reached"}
+        except MotionStopUnverified:
+            self._hold_recovery_required = True
+            raise
+        finally:
+            self._release(plant)
+
+    def _run_planned_hold(self, plan, seconds) -> None:
+        folder = None
+        try:
+            root = Path(self.config.output_directory)
+            root.mkdir(parents=True, exist_ok=True)
+            folder = Path(tempfile.mkdtemp(prefix="gravity_hold_test-", dir=root))
+            (folder / "plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+            preview = self._build_preview("running", {"phases": [
+                {"phase": "hold_set", "detail": {"poses_deg": plan["poses_deg"]}}]})
+            with self._lock:
+                self.preview = preview
+                self.preview_token += 1
+
+            def progress(phase, detail):
+                if plan["context"] != self._hold_context() or self.screen_drift():
+                    raise ValueError("collision scene changed; hold stopped")
+                if detail.get("stage") == "moving":
+                    if not self._hold_path_clear(self._hold_position(), detail["pose_deg"]):
+                        raise ValueError("hold transit is no longer clear")
+                self._on_progress(phase, detail)
+
+            result = hold_plan_module.execute_hold_plan(
+                plan, seconds, folder, self._abort, progress, self._run_hold_child,
+                move=self._move_hold_target)
+            if self._hold_current_started and not result.get("stop_verified"):
+                self._hold_recovery_required = True
+            result.update(mode=GRAVITY_HOLD_TEST, plan_id=plan["id"],
+                          transit_speed_deg_s=self._options["transit_speed_deg_s"])
+            summary = folder / "gravity_test_summary.json"
+            summary.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            result["evidence"] = "/runs/" + summary.relative_to(root).as_posix()
+            with self._lock:
+                self.result = result
+                self.progress = {"mode": GRAVITY_HOLD_TEST,
+                                 "phase": "complete" if result["result"] == "PASS" else "failed",
+                                 "result": result["result"], "output": str(folder),
+                                 "error": result.get("reason", "")}
+        except Exception as error:
+            with self._lock:
+                if self._hold_current_started:
+                    self._hold_recovery_required = True
+                self.result = {"mode": GRAVITY_HOLD_TEST, "result": "FAIL", "reason": str(error)}
+                self.progress = {"mode": GRAVITY_HOLD_TEST, "phase": "failed", "error": str(error)}
+        finally:
+            with self._lock:
+                if self._hold_recovery_required:
+                    self._state = PAUSED
+                    self.progress["error"] = (
+                        "stop or recovery was not confirmed; operator recovery required")
+                else:
+                    self._state, self._activity = IDLE, ""
+                self._worker = None
+                self._hold_plan = {}
+
     def _run_gravity_test(self, mode: str, process, summary_file: Path) -> None:
         try:
             output = getattr(process, "stdout", None)
@@ -1555,8 +1799,7 @@ class IdentificationService:
                             progress = json.loads(text[len("GRAVITY_TEST "):])
                         except json.JSONDecodeError:
                             progress = {"phase": "running", "message": text}
-                        with self._lock:
-                            self.progress = dict(progress)
+                        self._on_progress(str(progress.get("phase", "running")), progress)
                     else:
                         self.publish_event(text[-500:], source=mode)
             exit_code = process.wait()
@@ -1707,7 +1950,7 @@ class IdentificationService:
             f"resumed; restarting pose {pose}/{poses}", source=GRAVITY_MODE)
         return True
 
-    def home(self) -> dict:
+    def home(self, options: dict | None = None) -> dict:
         """Drive every joint back to neutral.
 
         A campaign leaves the arm wherever validation ended, and the hardware
@@ -1718,11 +1961,13 @@ class IdentificationService:
             return {"ok": False, "message": "no /robot_description yet"}
         if self.profile is None:
             return {"ok": False, "message": "no robot profile loaded"}
+        speed = self._motion_speed(options or {}, HOMING_SPEED_DEG_S)
         with self._lock:
-            if self._state != IDLE:
+            if self._state != IDLE or self.planning:
                 return {"ok": False, "message": f"{self._activity} is running"}
             self._state = RUNNING
             self._activity = "homing"
+            self._options = {"transit_speed_deg_s": speed}
             self._abort.clear()
             self._started_at = time.monotonic()
             self.progress = {"mode": "homing", "phase": "starting"}
@@ -1741,7 +1986,7 @@ class IdentificationService:
             plant = self.bridge.hardware_plant(
                 self.profile, self.scene,
                 require_neutral_start=False,
-                maximum_speed_deg_s=HOMING_SPEED_DEG_S)
+                maximum_speed_deg_s=self._motion_speed(self._options, HOMING_SPEED_DEG_S))
             setter = getattr(plant, "set_monitor", None)
             if setter is not None:
                 setter(self._monitor())
@@ -1782,14 +2027,14 @@ class IdentificationService:
         """One endpoint for the three things a slider does."""
         action = str((body or {}).get("action") or "").strip()
         if action == "start":
-            return self.jog_start()
+            return self.jog_start(body)
         if action == "stop":
             return self.jog_stop()
         if action == "move":
             return self.jog_to((body or {}).get("position_deg"))
         return {"ok": False, "message": f"unknown jog action {action!r}"}
 
-    def jog_start(self) -> dict:
+    def jog_start(self, options: dict | None = None) -> dict:
         """Hold a plant open for the session rather than one per slider release.
 
         Opening one costs an action handshake and a spin for state -- seconds,
@@ -1801,13 +2046,15 @@ class IdentificationService:
             return {"ok": False, "message": "no robot profile loaded"}
         if self.bridge is None:
             return {"ok": False, "message": "no ROS bridge; cannot drive hardware"}
+        speed = self._motion_speed(options or {}, JOG_SPEED_DEG_S)
         with self._lock:
             if self._state == JOGGING:
                 return {"ok": True, "message": "already jogging"}
-            if self._state != IDLE:
+            if self._state != IDLE or self.planning:
                 return {"ok": False, "message": f"{self._activity} is running"}
             self._state = JOGGING
             self._activity = "jogging"
+            self._options = {"transit_speed_deg_s": speed}
             self._abort.clear()
             self._jog_target = None
             self._started_at = time.monotonic()
@@ -1886,13 +2133,14 @@ class IdentificationService:
     def _run_jog(self) -> None:
         plant = None
         try:
+            speed = self._motion_speed(self._options, JOG_SPEED_DEG_S)
             plant = self.bridge.hardware_plant(
                 self.profile, self.scene, require_neutral_start=False,
-                maximum_speed_deg_s=JOG_SPEED_DEG_S)
+                maximum_speed_deg_s=speed)
             setter = getattr(plant, "set_monitor", None)
             if setter is not None:
                 setter(self._monitor())
-            self.note(f"jogging enabled at {JOG_SPEED_DEG_S:g} deg/s")
+            self.note(f"jogging enabled at {speed:g} deg/s")
             self._on_progress("jogging", {})
             while not self._abort.is_set():
                 with self._lock:
@@ -2009,6 +2257,9 @@ class IdentificationService:
     def _gravity_plan(self, options: dict):
         """The gravity card's numbers, bounded, on a copy of the plan."""
         plan = replace(self.plan)
+        if self._gravity_seed is not None:
+            plan.seed = self._gravity_seed
+        plan.transit_speed_deg_s = self._motion_speed(options, plan.transit_speed_deg_s)
         plan.gravity_probe_speeds_deg_s = DEFAULT_GRAVITY_PROBE_SPEEDS
         plan.start_deg = self._standing_deg()
         self._apply_options(plan, GRAVITY_OPTIONS, options)
@@ -2038,6 +2289,7 @@ class IdentificationService:
         """
         return json.dumps({
             "static_poses": plan.static_poses,
+            "transit_speed_deg_s": plan.transit_speed_deg_s,
             "static_candidates": plan.static_candidates,
             "gravity_validation_poses": plan.gravity_validation_poses,
             "gravity_probe_deg": plan.gravity_probe_deg,
@@ -2374,6 +2626,7 @@ class IdentificationService:
             return {}
         defaults = {
             "static_poses": plan.static_poses,
+            "transit_speed_deg_s": plan.transit_speed_deg_s,
             "gravity_validation_poses": plan.gravity_validation_poses,
             "gravity_probe_deg": plan.gravity_probe_deg,
             "gravity_probe_speeds_deg_s": list(
@@ -2391,6 +2644,7 @@ class IdentificationService:
         """
         wanted = {
             "static_poses": plan.static_poses,
+            "transit_speed_deg_s": plan.transit_speed_deg_s,
             "gravity_validation_poses": plan.gravity_validation_poses,
             "gravity_probe_deg": plan.gravity_probe_deg,
             "gravity_probe_speeds_deg_s": list(plan.gravity_probe_speeds_deg_s),
@@ -2951,9 +3205,12 @@ class IdentificationService:
         if mode in HARDWARE_MODES:
             if self.bridge is None:
                 raise RuntimeError("no ROS bridge; cannot drive hardware")
+            options = {"expected_start_deg": tuple(getattr(plan, "start_deg", ()) or ())}
+            if mode == GRAVITY_MODE and plan is not None:
+                options["maximum_speed_deg_s"] = self._motion_speed(
+                    {"transit_speed_deg_s": plan.transit_speed_deg_s}, 10.0)
             return self.bridge.hardware_plant(
-                self.profile, self.scene,
-                expected_start_deg=tuple(getattr(plan, "start_deg", ()) or ()))
+                self.profile, self.scene, **options)
         from ..plants.analytic import AnalyticPlant  # noqa: PLC0415
 
         injected = self._rehearsal_friction()
@@ -3103,7 +3360,43 @@ class IdentificationService:
 
     # -- snapshot --------------------------------------------------------
 
+    def _reconcile_hold_recovery(self) -> None:
+        with self._lock:
+            if (not self._hold_recovery_required or self._state != PAUSED
+                    or self._activity != GRAVITY_HOLD_TEST or self._worker is not None
+                    or self.planning):
+                return
+            if (self._external_process is not None
+                    and self._external_process.poll() is None):
+                return
+            reader = getattr(self.bridge, "recovery_status", None)
+            if not callable(reader):
+                return
+            records = (self.result or {}).get("records") or []
+            motion_completed = bool(records) and all(
+                isinstance(record, dict) and isinstance(record.get("move"), dict)
+                and record["move"].get("ok") is True for record in records)
+            try:
+                evidence = reader(require_goal_status=not motion_completed)
+            except Exception:
+                return
+            if not isinstance(evidence, dict) or evidence.get("ready") is not True:
+                return
+            self._hold_recovery_required = False
+            self._hold_current_started = False
+            self._external_process = None
+            self._hold_plan = {}
+            self.gravity_armed = ""
+            self.rehearsal_passed = False
+            self._state, self._activity = IDLE, ""
+            self.progress = {**self.progress, "recovery_verified": True,
+                             "error": (self.result or {}).get("reason", "")}
+            self.publish_event(
+                "robot recovery verified; previous run remains failed; ready for a new task",
+                source=GRAVITY_HOLD_TEST)
+
     def snapshot(self) -> dict:
+        self._reconcile_hold_recovery()
         with self._lock:
             return {
                 "state": self._state,
@@ -3132,7 +3425,9 @@ class IdentificationService:
                 "rehearsal_passed": self.rehearsal_passed,
                 "gravity_armed": bool(self.gravity_armed),
                 "gravity_defaults": self.gravity_defaults(),
+                "motion_speed_max_deg_s": self._motion_speed_limit(),
                 "gravity_test": self.gravity_test_capability(),
+                "hold_plan": self.hold_plan_payload(),
                 "workspace": self.workspace_payload(),
                 "preview_token": self.preview_token,
                 "planning": self.planning,
@@ -3158,5 +3453,5 @@ class IdentificationService:
             raise RuntimeError("no model yet; waiting for /robot_description")
 
     def _require_idle(self, message: str) -> None:
-        if self._state != IDLE:
+        if self._state != IDLE or self.planning:
             raise RuntimeError(message)

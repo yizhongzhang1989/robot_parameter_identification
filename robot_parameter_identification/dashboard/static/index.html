@@ -140,6 +140,9 @@
     <summary data-i18n="group.control">Overall control</summary>
 
     <div class="card">
+      <label class="field"><span data-i18n="run.home_speed">Home speed (deg/s)</span>
+        <input id="home-speed" type="number" min="0.1" max="60" step="0.1" value="10"/>
+      </label>
       <div class="row">
         <button id="btn-home" class="danger" disabled
                 data-i18n="run.home">Home</button>
@@ -152,6 +155,9 @@
         controller the campaign uses. Travel is the identification envelope,
         not the URDF's, and every pose is screened against the obstacle scene
         before the arm is asked to go there.</p>
+      <label class="field"><span data-i18n="jog.speed">Jog speed (deg/s)</span>
+        <input id="jog-speed" type="number" min="0.1" max="60" step="0.1" value="10"/>
+      </label>
       <div class="row">
         <button id="btn-jog" class="danger" disabled
                 data-i18n="jog.enable">Enable jogging</button>
@@ -237,6 +243,9 @@
         <label class="field"><span data-i18n="grav.fast">fast probe (°/s)</span>
           <input id="grav-fast" type="number" min="0.05" max="20" step="0.1" value="3"/>
         </label>
+        <label class="field"><span data-i18n="grav.transit_speed">Transit speed (deg/s)</span>
+          <input id="grav-transit-speed" type="number" min="0.1" max="60" step="0.1" value="10"/>
+        </label>
       </div>
       <div class="row">
         <button id="btn-grav-plan" data-i18n="grav.plan">Plan poses</button>
@@ -273,6 +282,13 @@
             <label class="field"><span data-i18n="gravtest.hold_seconds">hold each (s)</span>
               <input id="gravtest-hold-seconds" type="number" min="0.5" max="10" step="0.5" value="3"/>
             </label>
+            <label class="field"><span data-i18n="gravtest.transit_speed">Transit speed (deg/s)</span>
+              <input id="gravtest-transit-speed" type="number" min="0.1" max="60" step="0.1" value="5"/>
+            </label>
+          </div>
+          <div class="gravity-test-run-actions">
+            <button id="btn-gravtest-plan" disabled
+                    data-i18n="gravtest.plan">Plan</button>
             <button id="btn-gravtest-hold" class="danger" disabled
                     data-i18n="gravtest.hold_start">Check pose holding</button>
           </div>
@@ -287,6 +303,8 @@
             <label class="field"><span data-i18n="gravtest.speed_stop">speed stop (°/s)</span>
               <input id="gravtest-speed-stop" type="number" min="1" max="120" step="1" value="120"/>
             </label>
+          </div>
+          <div class="gravity-test-run-actions">
             <button id="btn-gravtest-drag" class="danger" disabled
                     data-i18n="gravtest.drag_start">Start hand guiding</button>
             <button id="btn-gravtest-stop" class="stop" disabled

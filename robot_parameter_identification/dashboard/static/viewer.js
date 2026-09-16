@@ -84,6 +84,8 @@ const state = {
   showGhost: true,
   showGravity: false,
   meshCache: new Map(),
+  modelReady: false,
+  modelFramed: false,
 };
 
 window.__viewer = {
@@ -102,12 +104,87 @@ window.__viewer = {
 
 /* ---------------- sizing ---------------- */
 
+function fitBounds(camera, orbit, bounds, padding) {
+  if (bounds.isEmpty()) return false;
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = bounds.getSize(new THREE.Vector3()).length();
+  if (!Number.isFinite(size)) return false;
+  const direction = camera.position.clone().sub(orbit.target).normalize();
+  if (direction.lengthSq() === 0) direction.set(1, -1, 1).normalize();
+  camera.lookAt(camera.position.clone().sub(direction));
+  const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+  const tanVertical = Math.tan(THREE.MathUtils.degToRad(camera.getEffectiveFOV()) / 2);
+  const tanHorizontal = tanVertical * camera.aspect;
+  const halfWidth = 1 - padding.left - padding.right;
+  const halfHeight = 1 - padding.top - padding.bottom;
+  const centerX = padding.left - padding.right;
+  const centerY = padding.bottom - padding.top;
+  let distance = Math.max(size * 0.1, 0.1);
+  for (const horizontal of [bounds.min.x, bounds.max.x]) {
+    for (const vertical of [bounds.min.y, bounds.max.y]) {
+      for (const depth of [bounds.min.z, bounds.max.z]) {
+        const offset = new THREE.Vector3(horizontal, vertical, depth).sub(center);
+        const along = offset.dot(direction);
+        distance = Math.max(distance,
+          along + Math.abs(offset.dot(right) + centerX * along * tanHorizontal)
+            / (halfWidth * tanHorizontal),
+          along + Math.abs(offset.dot(up) + centerY * along * tanVertical)
+            / (halfHeight * tanVertical),
+          along + 0.1);
+      }
+    }
+  }
+  orbit.target.copy(center)
+    .addScaledVector(right, -centerX * distance * tanHorizontal)
+    .addScaledVector(up, -centerY * distance * tanVertical);
+  camera.position.copy(orbit.target).addScaledVector(direction, distance);
+  camera.near = Math.max(0.001, (distance - size / 2) * 0.1);
+  camera.far = Math.max(100, distance + size * 2);
+  camera.updateProjectionMatrix();
+  camera.lookAt(orbit.target);
+  return true;
+}
+
+function fitScene() {
+  const bounds = new THREE.Box3();
+  if (state.modelReady) {
+    for (const [name, node] of state.linkNodes) {
+      if (state.frames[name]) bounds.expandByObject(node, true);
+    }
+  }
+  const hasModelBounds = !bounds.isEmpty();
+  for (const { line, tip } of state.ghostNodes) {
+    bounds.expandByObject(line, true);
+    bounds.expandByObject(tip, true);
+  }
+  const rect = host.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+  const padding = { left: 0.08, right: 0.08, top: 0.08, bottom: 0.08 };
+  for (const id of ['view-opts', 'edit-box', 'scene-status', 'jointbars']) {
+    const overlay = document.getElementById(id);
+    if (!overlay || !overlay.getClientRects().length) continue;
+    const box = overlay.getBoundingClientRect();
+    if (id === 'jointbars') {
+      padding.bottom = Math.max(padding.bottom,
+        Math.min(0.34, (rect.bottom - box.top + 12) / rect.height));
+    } else {
+      padding.top = Math.max(padding.top,
+        Math.min(0.3, (box.bottom - rect.top + 12) / rect.height));
+    }
+  }
+  const fitted = fitBounds(camera, orbit, bounds, padding);
+  if (fitted && hasModelBounds) state.modelFramed = true;
+  return fitted;
+}
+
 function resize() {
   const w = host.clientWidth || 1;
   const h = host.clientHeight || 1;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  fitScene();
 }
 new ResizeObserver(resize).observe(host);
 resize();
@@ -139,6 +216,8 @@ function loadMesh(url) {
 }
 
 async function buildLinks(visuals) {
+  state.modelReady = false;
+  state.modelFramed = false;
   linkGroup.clear();
   state.linkNodes.clear();
   for (const visual of visuals) {
@@ -158,6 +237,7 @@ async function buildLinks(visuals) {
     linkGroup.add(node);
     state.linkNodes.set(visual.link, node);
   }
+  state.modelReady = true;
   document.getElementById('loading')?.classList.add('hidden');
 }
 
@@ -459,6 +539,7 @@ async function loadPreview() {
     }
   }
   state.flyFrom = 0;
+  fitScene();
   // The previous loop is unwound by now; starting here rather than leaving it
   // to the next poll keeps the gap to one frame instead of four hundred ms.
   if (wasFlying && state.ghostNodes.length > 1) flyTour();
@@ -621,6 +702,7 @@ async function poll() {
       document.getElementById('loading')?.classList.add('hidden');
     }
     syncFrames(data.link_tf);
+    if (!state.modelFramed) fitScene();
     const links = data.gravity?.links || [];
     // Rebuilt only when the masses themselves change, not every poll: the
     // markers are static geometry, it is the kinematics under them that moves.

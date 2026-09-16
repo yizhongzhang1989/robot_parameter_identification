@@ -29,6 +29,7 @@ from ..interfaces import (CommandSpec, EFFORT_SOURCES, SignalMap,
 from ..profile import RobotProfile
 from .http_server import DashboardServer
 from .controllers import ControllerInventory
+from .recovery import RecoveryMonitor
 from .service import DashboardConfig, IdentificationService
 
 MESH_TYPES = {".stl": "model/stl", ".dae": "model/vnd.collada+xml",
@@ -104,6 +105,7 @@ class DashboardNode(Node):
         self.service = IdentificationService(config, bridge=self,
                                              profile=profile)
         self._lock = threading.Lock()
+        self._recovery = RecoveryMonitor()
         self._sample: dict | None = None
         self._sample_at = 0.0
         self._sample_source = ""
@@ -123,6 +125,7 @@ class DashboardNode(Node):
                                  self._on_description, DESCRIPTION_QOS)
         self._subscribe_telemetry(telemetry)
         self._subscribe_controller_state(commands)
+        self._subscribe_recovery_status(commands)
         from controller_manager_msgs.srv import ListControllers
 
         manager = commands.controller_manager.rstrip("/")
@@ -197,6 +200,25 @@ class DashboardNode(Node):
         names = [str(entry) for entry in message.joint_names]
         if names:
             self.service.adopt_driven_joints(names)
+
+    def _subscribe_recovery_status(self, commands: CommandSpec) -> None:
+        from action_msgs.msg import GoalStatusArray
+
+        self._recovery_action = commands.follow_joint_trajectory_action
+        self.create_subscription(
+            GoalStatusArray, self._recovery_action.rstrip("/") + "/_action/status",
+            self._on_recovery_action_status, DESCRIPTION_QOS)
+
+    def _on_recovery_action_status(self, message) -> None:
+        self._recovery.action_status(
+            self._recovery_action, [entry.status for entry in message.status_list])
+
+    def recovery_status(self, *, require_goal_status=True) -> dict:
+        """Passive evidence only; never switch controllers or command the robot."""
+        return self._recovery.status(
+            list(self.service.driven_joints),
+            self.service.config.commands.follow_joint_trajectory_action,
+            self._controllers.snapshot(), require_goal_status=require_goal_status)
 
     # -- telemetry -------------------------------------------------------
 
@@ -277,6 +299,10 @@ class DashboardNode(Node):
         signals = self._spec.signals
         wanted = self._joint_names()
         by_name = _by_joint(message)
+        self._recovery.observe(
+            by_name, list(self.service.driven_joints),
+            self.service.config.commands.follow_joint_trajectory_action,
+            self._controllers.snapshot())
         self._note_everything_else(
             {name: values.get(signals.position)
              for name, values in by_name.items()}, wanted)
@@ -437,6 +463,12 @@ class DashboardNode(Node):
             if time.monotonic() - self._sample_at > self._spec.stale_after_s:
                 return None
             return dict(self._sample)
+
+    def controller_state_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.port}/api/controller-state"
+
+    def controller_state(self) -> dict:
+        return self._controllers.fresh_snapshot(timeout_s=4.0)
 
     def health(self) -> dict:
         with self._lock:
