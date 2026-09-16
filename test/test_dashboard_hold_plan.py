@@ -45,6 +45,7 @@ class HoldPlanServiceTest(unittest.TestCase):
                             gravity_test_source=str(self.output / "model")),
             bridge=self.bridge,
             profile=test_profile(), process_launcher=self.launch)
+        self.service.system["dashboard"]["hold_test"]["transit_speed_deg_s"] = 5.0
         self.service.adopt_description(synthetic_urdf())
         patches = ExitStack()
         self.addCleanup(patches.close)
@@ -59,7 +60,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         }
         self.builder = patches.enter_context(mock.patch.object(
             dashboard_service.hold_plan_module, "build_hold_plan",
-            side_effect=lambda *_args: copy.deepcopy(self.plan)))
+            side_effect=lambda *_args, **_kwargs: copy.deepcopy(self.plan)))
         self.current_source = patches.enter_context(mock.patch.object(
             dashboard_service.hold_plan_module, "source_is_current",
             return_value=True))
@@ -217,7 +218,8 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.assertTrue(callable(progress))
         self.assertEqual(child, self.service._run_hold_child)
         self.assertEqual(self.executor.call_args.kwargs,
-                         {"move": self.service._move_hold_target})
+                         {"move": self.service._move_hold_target,
+                          "system_config": self.service.system})
         self.assertEqual(json.loads((folder / "plan.json").read_text()), frozen)
         result = self.service.snapshot()["result"]
         self.assertEqual(result["plan_id"], frozen["id"])
@@ -327,7 +329,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.launch.assert_not_called()
 
     def test_planning_reserves_activity_and_releases_it_on_failure(self):
-        def blocked_builder(*_args):
+        def blocked_builder(*_args, **_kwargs):
             self.assertTrue(self.service.planning)
             self.assertFalse(self.service.start("rehearsal")["ok"])
             self.assertFalse(self.service.home()["ok"])
@@ -346,7 +348,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.executor.assert_not_called()
         self.launch.assert_not_called()
         self.bridge.hardware_plant.assert_not_called()
-        self.builder.side_effect = lambda *_args: copy.deepcopy(self.plan)
+        self.builder.side_effect = lambda *_args, **_kwargs: copy.deepcopy(self.plan)
         self.preview()
 
     def test_move_uses_capped_bridge_plant_exact_target_and_releases_it(self):
@@ -472,8 +474,9 @@ class HoldPlanServiceTest(unittest.TestCase):
             DEFAULT_CORRIDOR_DEG=2.0, MAXIMUM_TEMPERATURE_C=40.0,
             ACKNOWLEDGEMENT="synthetic-ack"))
 
-        def execute(*args, move):
-            return self.real_executor(*args, move=move, backend=backend)
+        def execute(*args, move, system_config):
+            return self.real_executor(*args, move=move, backend=backend,
+                                      system_config=system_config)
 
         self.executor.side_effect = execute
         with mock.patch.object(self.service, "_run_hold_child") as child:
@@ -662,7 +665,7 @@ class HoldPlanServiceTest(unittest.TestCase):
             with self.subTest(changed=changed):
                 self.bridge.latest_sample.return_value = {"position_deg": [0.0] * 7}
 
-                def change_during_build(*_args):
+                def change_during_build(*_args, **_kwargs):
                     if changed == "context":
                         self.service.config.safety_margin_m += 0.01
                     else:
@@ -702,7 +705,7 @@ class HoldPlanServiceTest(unittest.TestCase):
             with self.subTest(changed=changed), ExitStack() as patches:
                 self.preview()
 
-                def execute(plan, _seconds, _folder, _abort, progress, child, *, move):
+                def execute(plan, _seconds, _folder, _abort, progress, child, *, move, system_config):
                     if changed == "context":
                         self.service.config.safety_margin_m += 0.01
                     elif changed == "other_arm":
@@ -755,7 +758,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         scenes = []
         views = []
 
-        def execute(plan, _seconds, _folder, _abort, progress, _child, *, move):
+        def execute(plan, _seconds, _folder, _abort, progress, _child, *, move, system_config):
             for index, pose in enumerate(plan["poses_deg"], 1):
                 for stage in ("moving", "holding"):
                     progress("hold_set", {"target_pose": index, "pose_deg": pose,
@@ -800,7 +803,7 @@ class HoldPlanServiceTest(unittest.TestCase):
     def test_stop_reaches_plan_executor_and_releases_activity_for_replanning(self):
         entered = threading.Event()
 
-        def execute(_plan, _seconds, _folder, abort, _progress, _child, *, move):
+        def execute(_plan, _seconds, _folder, abort, _progress, _child, *, move, system_config):
             entered.set()
             if not abort.wait(2.0):
                 raise AssertionError("Stop did not reach hold executor")

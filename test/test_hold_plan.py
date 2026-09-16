@@ -139,6 +139,28 @@ class HoldPlanTest(unittest.TestCase):
         self.assertNotEqual(first["seed"], second["seed"])
         self.assertNotEqual(first["poses_deg"], second["poses_deg"])
 
+    def test_configured_wider_ranges_reach_every_hold_child_snapshot(self):
+        from robot_parameter_identification.system_config import load_system_config, system_defaults
+
+        settings = system_defaults()
+        settings["ranges"]["hold_test"]["poses"]["max"] = 24
+        settings["ranges"]["hold_test"]["seconds"]["max"] = 15.0
+        self.candidates = np.array([[value] * 7 for value in np.linspace(-10, 10, 25)])
+        plan = self.build(count=21, system_config=settings)
+        result = self.execute(plan, seconds=12.0, system_config=settings)
+        self.assertEqual(result["result"], "PASS", result["reason"])
+        self.assertEqual(len(self.commands), 21)
+        snapshots = set()
+        for command, timeout_s in self.commands:
+            snapshots.add(command[command.index("--system-config") + 1])
+            self.assertEqual(float(command[command.index("--seconds") + 1]), 12.0)
+            self.assertEqual(timeout_s, 12.0 + settings["dashboard"]["hold_test"]["child_timeout_margin_s"])
+        self.assertEqual(snapshots, {result["system_config"]})
+        saved = load_system_config(result["system_config"]).values
+        self.assertEqual(saved, settings)
+        settings["ranges"]["hold_test"]["seconds"]["max"] = 30.0
+        self.assertEqual(load_system_config(result["system_config"]).values, saved)
+
     def test_import_adapter_and_arm_model_never_run_commands_or_sockets(self):
         import sys
 

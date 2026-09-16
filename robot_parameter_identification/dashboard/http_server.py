@@ -16,6 +16,7 @@ MAX_BODY = 4 << 20
 def build_routes(service, node=None) -> dict:
     """path -> (method, handler). Handlers take the decoded JSON body."""
     return {
+        "/api/system-config": ("GET", lambda _body: service.system_config_payload()),
         "/api/state": ("GET", lambda _body: service.snapshot()),
         "/api/controller-state": ("GET", lambda _body: node.controller_state()),
         "/api/activity": ("GET", lambda _body: service.activity_payload()),

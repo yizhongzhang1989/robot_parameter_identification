@@ -11,6 +11,9 @@ import threading
 
 import numpy as np
 
+from robot_parameter_identification.system_config import (
+    checked_value, system_defaults, write_system_config_snapshot,
+)
 
 RIGHT_JOINTS = [f"right_arm_joint{index}" for index in range(1, 8)]
 _IMPORT_LOCK = threading.RLock()
@@ -143,14 +146,16 @@ def _validate_source(payload, names):
 
 
 def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
-                    collision_free, *, backend=None) -> dict:
+                    collision_free, *, backend=None, system_config=None) -> dict:
     """Select a fixed preview; collision_free must screen the fresh scene in degrees.
 
     Invalid sources, insufficient admissible poses, or blocked transits raise
     ValueError. The caller owns scene freshness and must replan after changes.
     """
-    if type(count) is not int or not 1 <= count <= 20:
-        raise ValueError("count must be an integer in [1, 20]")
+    settings = system_defaults() if system_config is None else system_config
+    if type(count) is not int:
+        raise ValueError("count must be an integer")
+    checked_value(count, settings, "hold_test.poses", integer=True)
     if not callable(collision_free):
         raise ValueError("a fresh scene collision guard is required")
     names = list(joint_names)
@@ -200,7 +205,7 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
 
 
 def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
-                      run_child, *, move, backend=None) -> dict:
+                      run_child, *, move, backend=None, system_config=None) -> dict:
     """Execute copied targets through service-owned moves and hold children.
 
     abort is a zero-argument predicate (or threading.Event). on_progress takes
@@ -213,13 +218,14 @@ def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
     summary = {"result": "FAIL", "records": [], "reason": "",
                "restore_errors": [], "stop_verified": False}
     try:
+        settings = system_defaults() if system_config is None else system_config
         plan = json.loads(json.dumps(plan, allow_nan=False))
         if not source_is_current(plan):
             raise ValueError("source changed or is unavailable; rebuild the preview")
-        if not math.isfinite(seconds) or not 0.5 <= seconds <= 10.0:
-            raise ValueError("seconds must be in [0.5, 10]")
+        checked_value(seconds, settings, "hold_test.seconds")
+        checked_value(plan["count"], settings, "hold_test.poses", integer=True)
         if (plan["joint_names"] != RIGHT_JOINTS or type(plan["count"]) is not int or
-                not 1 <= plan["count"] <= 20 or len(plan["poses_deg"]) != plan["count"] or
+            len(plan["poses_deg"]) != plan["count"] or
                 len(plan["predicted_current_a"]) != plan["count"]):
             raise ValueError("invalid hold plan structure")
         _vector(plan["start_deg"], "start_deg")
@@ -227,13 +233,18 @@ def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
         for current in plan["predicted_current_a"]:
             _vector(current, "predicted current")
         backend = backend if backend is not None else _load_backend()
-        corridor = 5.0
-        temperature = min(40.0, backend.current.MAXIMUM_TEMPERATURE_C)
+        defaults = settings["dashboard"]["hold_test"]
+        corridor = checked_value(defaults["corridor_deg"], settings, "hold_test.corridor_deg")
+        temperature = checked_value(defaults["temperature_c"], settings, "hold_test.temperature_c")
         output = Path(output_directory).expanduser().resolve()
         reports = [output / f"hold_{index:02d}.json" for index in range(1, len(poses) + 1)]
         if any(report.exists() for report in reports):
             raise ValueError("hold report paths already exist; use a fresh output directory")
         output.mkdir(parents=True, exist_ok=True)
+        snapshot = (write_system_config_snapshot(output, settings)
+                    if system_config is not None else None)
+        if snapshot is not None:
+            summary["system_config"] = str(snapshot)
 
         def check_abort():
             if (abort() if callable(abort) else abort.is_set()):
@@ -263,12 +274,15 @@ def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
                 raise ValueError("source changed before hold")
             progress({"target_pose": index, "pose_deg": pose.copy(), "stage": "holding"})
             check_abort()
-            held = run_child([
+            command = [
                 "ros2", "run", "rm_control", "hold_check",
                 "--output", str(report_path), "--seconds", str(seconds),
                 "--corridor-deg", str(corridor), "--temperature-c", str(temperature),
                 "--source", plan["source"], "--arm", "right",
-                "--ack", backend.current.ACKNOWLEDGEMENT], seconds + 300.0)
+                "--ack", backend.current.ACKNOWLEDGEMENT]
+            if snapshot is not None:
+                command.extend(["--system-config", str(snapshot)])
+            held = run_child(command, seconds + defaults["child_timeout_margin_s"])
             record["hold_returncode"] = held.returncode
             stopped = abort() if callable(abort) else abort.is_set()
             report = json.loads(report_path.read_text("utf-8"))

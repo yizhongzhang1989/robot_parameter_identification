@@ -1,0 +1,378 @@
+# 系统默认配置模板：定义启动、实验和面板的默认值，不存储标定得到的模型系数。
+# 启动时用 system_config:=/绝对路径/文件.yaml 选择配置；文件缺失时从本模板生成。
+# 未显式指定时使用 $XDG_CONFIG_HOME/robot_parameter_identification/system_config.yaml，
+# 未设置 XDG_CONFIG_HOME 时使用 ~/.config/robot_parameter_identification/system_config.yaml。
+# 已生成的用户配置不会自动被模板覆盖；要调整当前系统，请修改实际选中的配置文件并重启面板。
+# 启动值优先级：显式命令行参数 > 选中的系统配置 > 本模板。
+# 实验值优先级：本次操作输入 > config_file_path 中保存的实验设置 > 系统默认值。
+# 相对路径按启动进程的工作目录解析，不相对于本 YAML；跨机器部署建议用绝对路径。
+# ranges 中的文件值优先于代码软件默认范围；URDF、显式 profile 和硬件保护仍独立生效。
+
+schema_version: 1  # 配置结构版本，用于兼容性校验；不要把它当作用户自行递增的修订号。
+
+# 软件可配置范围：文件中的 min/max 优先于程序出厂值，面板和执行校验共用。
+# 修改软件范围不会修改机器人 URDF、显式机器人档案或外部控制程序的实际能力。
+# min/max 的单位与参数一致；整数参数的端点必须为整数。下限不得大于上限。
+ranges:
+  motion:
+    transit_speed_deg_s: {min: 0.1, max: 60.0}  # 回零、点动、姿态间转移速度（度/秒）。
+  gravity:
+    probe_speed_deg_s: {min: 0.05, max: 20.0}  # 重力正反向探测速度（度/秒）。
+  hold_test:
+    poses: {min: 1, max: 20}  # 保持验证姿态数量（个），还需存在足够可用姿态。
+    seconds: {min: 0.5, max: 10.0}  # 每个姿态保持时长（秒）。
+    corridor_deg: {min: 0.1, max: 5.0}  # 保持过程中允许偏离起始姿态的角度（度）。
+    temperature_c: {min: 1.0, max: 40.0}  # 保持监控的温度停止阈值（摄氏度）。
+    maximum_speed_deg_s: {min: 1.0, max: 30.0}  # 保持时的超速停止阈值（度/秒），不是转移速度。
+  drag_test:
+    maximum_speed_deg_s: {min: 1.0, max: 120.0}  # 人工拖动超速停止阈值（度/秒）。
+    temperature_c: {min: 1.0, max: 40.0}  # 拖动监控温度停止阈值（摄氏度）。
+  campaign:
+    static_poses: {min: 4, max: 60}  # 重力训练姿态数量（个）。
+    static_candidates: {min: 10, max: 400}  # 静态姿态候选数量（个）。
+    settle_samples: {min: 1, max: 20}  # 稳定测量样本数量（个）。
+    friction_amplitude_deg: {min: 5.0, max: 80.0}  # 摩擦扫动幅度（度）。
+    friction_repeats: {min: 1, max: null}  # 摩擦扫描重复次数。
+    friction_postures: {min: 1, max: null}  # 每关节摩擦基准姿态数。
+    fourier_harmonics: {min: 1, max: 6}  # 傅里叶谐波数量（个）。
+    fourier_base_frequency_hz: {min: 0.02, max: 0.3}  # 傅里叶基频（赫兹）。
+    fourier_duration_s: {min: 5.0, max: 120.0}  # 单条傅里叶轨迹时长（秒）。
+    fourier_ramp_s: {min: 0.0, max: 10.0}  # 傅里叶平滑起止时长（秒）。
+    fourier_attempts: {min: 5, max: 200}  # 可行轨迹候选尝试次数。
+    optimal_training_trajectories: {min: 2, max: 32}  # 最优激励训练轨迹数量（条）。
+    optimal_validation_trajectories: {min: 1, max: 8}  # 最优激励验证轨迹数量（条）。
+    optimal_friction_repeats: {min: 1, max: 5}  # 最优激励摩擦扫描重复次数。
+    optimal_friction_postures: {min: 1, max: 5}  # 最优激励摩擦基准姿态数量。
+    optimal_fourier_amplitude_fraction: {min: 0.0, max: 1.0}  # 激励幅度占可用范围的比例，实际必须大于零。
+    sample_rate_hz: {min: 5.0, max: 100.0}  # 实验轨迹采样频率（赫兹）。
+    validation_poses: {min: 3, max: 40}  # 完整辨识验证姿态数量。
+    validation_trajectory_s: {min: 4.0, max: 60.0}  # 独立动态验证轨迹时长（秒）。
+    position_margin_deg: {min: 3.0, max: 30.0}  # 关节限位规划余量（度）。
+    gravity_probe_deg: {min: 1.0, max: 20.0}  # 重力微动探测幅度（度）。
+    gravity_validation_poses: {min: 2, max: 30}  # 独立重力验证姿态数量。
+    gravity_probe_speed_deg_s: {min: 0.0, max: null}  # 完整辨识单速重力探测（度/秒），必须为正数。
+    coulomb_transition_deg_s: {min: 0.0, max: null}  # 库仑摩擦反向平滑宽度（度/秒），零表示不平滑。
+    stribeck_speed_deg_s: {min: 0.0, max: null}  # Stribeck 特征速度（度/秒），必须为正数。
+    skip_budget: {min: 0, max: null}  # 可恢复运动失败跳过预算。
+    seed: {min: 0, max: null}  # 非负实验设计随机种子。
+    maximum_speed_deg_s: {min: 1.0, max: null}  # 激励速度（度/秒）；null 不额外封顶，实际受档案约束。
+    maximum_acceleration_deg_s2: {min: 2.0, max: null}  # 激励加速度（度/秒²）；null 使用档案推导上限。
+    temperature_ceiling_c: {min: 30.0, max: null}  # 实验温度（摄氏度）；null 使用档案温度上限。
+  load_sweep:
+    maximum_levels: {min: 1, max: null}  # 每关节负载档数量，null 表示不增加软件上限。
+    speeds: {min: 2, max: null}  # 对数速度档数量，至少两个档位。
+    slowest_deg_s: {min: 0.0, max: null}  # 最低速度（度/秒），另须满足严格正数及不高于最快速度。
+    fastest_deg_s: {min: 0.0, max: null}  # 最高速度（度/秒），另须满足严格正数及机器人速度约束。
+    repeats: {min: 1, max: null}  # 每次扫描重复数。
+    arc_ceiling_deg: {min: 0.0, max: null}  # 扫动幅度上限（度），必须为正数并满足关节范围。
+    transit_speed_deg_s: {min: 0.0, max: null}  # 负载姿态间速度（度/秒），必须为正数并满足机器人约束。
+    drift_share: {min: 0.0, max: null}  # 允许的负载漂移与档距比例。
+    minimum_level_gap_nm: {min: 0.0, max: null}  # 负载分档最小间距（牛·米），必须为正数。
+    search_samples: {min: 1, max: null}  # 姿态搜索候选数量。
+    refine_steps: {min: 1, max: null}  # 负载极值细化搜索步数。
+    settle_steps: {min: 1, max: null}  # 负载稳定性优化步数。
+    seed: {min: 0, max: null}  # 非负随机种子。
+    pass_attempts: {min: 1, max: null}  # 单次扫描总尝试数。
+    pass_retry_s: {min: 0.0, max: null}  # 扫描失败后等待时间（秒）。
+    joint_failure_budget: {min: 1, max: null}  # 单关节连续失败预算。
+
+# 从 URDF 自动生成机器人档案时的软件策略；显式 profile 不会被这些值覆盖。
+# 比例取 (0, 1]，表示不超过 URDF 给定的额定能力；缺失额定速度时仅使用配置的回退值。
+profile_derivation:
+  default_speed_fraction: 0.25  # 默认取额定速度的25%，再与下面的绝对封顶取较小值；并非直接指定目标速度。
+  maximum_default_speed_deg_s: 40.0  # 自动档案的默认速度封顶（度/秒），可在此改变原来的 20。
+  requested_speed_fraction: 0.5  # 显式请求规划速度时，相对于 URDF 额定速度的封顶比例。
+  position_fraction: 0.9  # 自动档案相对于 URDF 对称位置范围的比例。
+  peak_speed_multiplier: 2.0  # 自动档案峰值速度相对于持续速度的倍数。
+
+# 与机器人档案结合的规划策略，配置值替代旧代码中的软件系数。
+planning:
+  acceleration_per_speed_s_inv: 4.0  # 用持续速度推导加速度上限的系数（1/秒），默认保持既有规划行为。
+
+# ROS 节点启动参数、外部文件路径与遥测接口映射。
+ros:
+  port: 8300  # dashboard HTTP 服务端口；同时启动多个面板时需使用不同端口。
+  profile_path: ""  # 机器人档案 YAML 路径，包含关节及安全包络；空字符串表示从 URDF 派生。
+  output_directory: identification_results  # 标定报告、模型、CSV 与保持/拖动验证证据的输出根目录。
+  gravity_test_source: ""  # 保持/拖动验证读取的合格标定结果目录；空值使用历史默认源，不会自动选最新结果。
+  config_file_path: ""  # 场景、工作空间及重力实验设置的持久化 JSON；空值只保存在内存，与 system_config 不同。
+  joint_state_topic: /joint_states  # 标准 JointState 话题，读取关节状态；也可作为动态状态话题的替代来源。
+  dynamic_joint_state_topic: /dynamic_joint_states  # DynamicJointState 话题；空字符串改用 joint_state_topic。
+  extra_telemetry_topics: [""]  # 附加 DynamicJointState 话题，按关节名合并独立发布的电流等信号；空项忽略。
+  robot_description_topic: /robot_description  # String 类型的 URDF 描述话题，用于模型、关节范围和三维显示。
+  controller: ""  # 目标轨迹控制器名称，用于推导 action 和状态话题；空值依赖下面的完整 action 路径。
+  controller_manager: /controller_manager  # 控制器管理器名称；用于只读查询控制器列表，不代表控制目标。
+  # 发送关节轨迹的完整 action 路径。显式指定 action 优先；显式 controller 可覆盖文件中继承的 action。
+  follow_joint_trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
+  effort_source: current  # 同时有两路信号时优先拟合 current（安培）或 torque（牛·米）；只有另一路时自动采用另一路。
+  signal.position: position  # 遥测中的关节位置接口名；ROS 角度为弧度，辨识与面板内部使用度。
+  signal.velocity: velocity  # 遥测中的速度接口名；空字符串表示从位置差分估计速度。
+  signal.current: current  # 电机电流接口名，单位安培；没有此接口时可留空。
+  signal.torque: effort  # 关节力矩接口名，单位牛·米；ROS 常用 effort，没有此接口时可留空。
+  signal.temperature: temperature  # 温度接口名，单位摄氏度；留空表示不读取该保护信号。
+  signal.enabled: enabled  # 驱动使能状态接口名，用于发现驱动掉使能；留空表示不读取。
+  signal.fault_code: fault_code  # 驱动故障码接口名，用于故障监控；留空表示不读取。
+  signal.voltage: ""  # 母线电压接口名，单位伏；需同时提供可靠的 profile 电压窗口才能启用对应保护。
+  telemetry_stale_s: 0.5  # 遥测允许的最大数据年龄（秒），超时视为失联；不是浏览器刷新周期。
+  maximum_speed_deg_s: 0.0  # 显式覆盖辨识规划速度上限（度/秒）；0 保持默认/派生值，仍受机器人档案约束。
+  workspace_limit_deg: [0.0]  # 额外的对称关节范围（度）：单值用于全部关节，也可逐关节给值；0 不额外限制。
+  safety_margin_m: 0.02  # 碰撞筛查安全间隙（米），用于机器人与场景几何之间的保守距离检查。
+
+# dashboard 操作默认值：仅作为初始值，实际执行还需通过状态、权限及安全检查。
+dashboard:
+  home:  # 回零操作。
+    transit_speed_deg_s: 10.0  # 回到零位时使用的默认运动速度上限（度/秒）。
+  jog:  # 面板手动点动操作。
+    transit_speed_deg_s: 10.0  # 前往点动目标时使用的默认运动速度上限（度/秒）。
+  gravity:  # 独立重力标定及其预演，不是完整辨识流程的单速探测默认值。
+    gravity_probe_speeds_deg_s: [1.0, 3.0]  # 每个姿态采用的正反向探测速度档（度/秒），用于成对平均与跨速度比较。
+  hold_test:  # 使用已辨识模型进行短时保持验证。
+    poses: 5  # 默认验证姿态数量；姿态集合需先生成并经过用户确认。
+    seconds: 3.0  # 每个姿态的保持时间（秒）；不是整组验证的总时长。
+    transit_speed_deg_s: 20.0  # 在保持测试姿态之间移动的默认速度上限（度/秒）。
+    corridor_deg: 5.0  # 保持阶段的姿态偏移停止阈值（度），不同于转移到位容差。
+    temperature_c: 40.0  # 保持阶段的温度停止阈值（摄氏度）。
+    maximum_speed_deg_s: 30.0  # 保持阶段的超速停止阈值（度/秒）。
+    planning_drift_deg: 1.0  # 规划后起始姿态可容许的变化（度），超过需重新规划。
+    target_tolerance_deg: 1.0  # 转移结束确认到位的角度容差（度）。
+    target_timeout_s: 1.0  # 等待转移到位遥测的最长时间（秒）。
+    path_samples: 400  # 保持姿态转移的碰撞插值检查点数，至少两个点。
+    replan_attempts: 8  # 重新生成不同保持姿态集合的最大尝试次数。
+    child_timeout_margin_s: 300.0  # 子程序保持时长以外预留的启动和恢复超时余量（秒）。
+  drag_test:  # 使用重力补偿进行人工拖动验证。
+    maximum_speed_deg_s: 120.0  # 实测速度超过此阈值时停止（度/秒），软件允许范围见 ranges；硬件插件另有实际限制。
+    temperature_c: 40.0  # 拖动阶段温度停止阈值（摄氏度），软件允许范围见 ranges。
+  optimal:  # 最优激励实验的附加选项。
+    reuse_friction: false  # 是否复用已有兼容的最优激励低速摩擦数据；启用但找不到合格数据时会拒绝运行。
+
+# 辨识实验计划默认值：覆盖重力、摩擦、惯性激励和独立验证阶段。
+# 实际计划会结合机器人档案、场景限制及本次操作参数生成，并非直接原样下发。
+campaign:
+  derive_speed_ladders: true  # true 按规划速度上限自动生成摩擦/验证速度阶梯；false 才采用下面显式速度列表。
+  static_poses: 24  # A_gravity 阶段用于训练的静态姿态数；姿态过少可能使重力模型不可辨识。
+  static_candidates: 200  # 供静态姿态设计筛选的候选数量；较多候选通常增加设计时间。
+  settle_samples: 3  # 静态采样时获取的样本数量，用于稳定测量；是样本数，不是等待秒数。
+  friction_amplitude_deg: 20.0  # 摩擦往返扫动的角度幅度参数（度），最终行程还会按速度和关节范围调整。
+  friction_speeds_deg_s: [2.0, 5.0, 8.0]  # 完整辨识摩擦阶段的显式速度档（度/秒）；自动阶梯开启时会被推导值替代。
+  friction_repeats: 3  # 每个摩擦速度、方向上的重复扫描次数，用于提高重复性并发现异常。
+  friction_postures: 3  # 每个关节进行摩擦扫描的不同基准姿态数，用于比较不同重力负载下的摩擦。
+  fourier_harmonics: 4  # 傅里叶激励的谐波数量，决定轨迹频率成分的丰富程度。
+  fourier_base_frequency_hz: 0.08  # 傅里叶激励基频（赫兹），其整数倍构成各次谐波。
+  fourier_duration_s: 30.0  # 单条傅里叶激励轨迹的规划时长（秒），不是整个实验时长。
+  fourier_ramp_s: 4.0  # 傅里叶轨迹起止处平滑过渡的时长参数（秒），减少突变。
+  fourier_attempts: 40  # 为寻找可行傅里叶轨迹允许生成/筛查的候选次数。
+  optimal_training_trajectories: 12  # 最优激励模式用于拟合的训练轨迹数量。
+  optimal_validation_trajectories: 3  # 最优激励模式的独立验证轨迹数量；验证数据不参与拟合。
+  optimal_fourier_amplitude_fraction: 0.2  # 最优激励幅度相对于可用关节范围的比例，无单位。
+  optimal_friction_speeds_deg_s: [0.05, 0.1, 0.2, 0.5, 1.0, 2.0]  # 最优激励模式的低速摩擦探测档位（度/秒）。
+  optimal_friction_repeats: 2  # 最优激励低速摩擦阶段每个速度、方向的重复次数。
+  optimal_friction_postures: 3  # 最优激励低速摩擦阶段每个关节使用的基准姿态数量。
+  sample_rate_hz: 20.0  # 实验轨迹采样频率（赫兹）；不等于驱动器遥测发布频率或控制器执行频率。
+  validation_poses: 12  # 完整辨识 D_validation 阶段的静态验证姿态数；独立重力模式使用 gravity_validation_poses。
+  validation_speeds_deg_s: [3.5, 6.5]  # 完整辨识的显式验证速度档（度/秒）；自动阶梯开启时按上限推导。
+  validation_trajectory_s: 12.0  # 完整辨识中独立动态验证轨迹的时长（秒）。
+  maximum_speed_deg_s: 10.0  # 实验激励的默认速度上限（度/秒），可被 ros.maximum_speed_deg_s 覆盖并受 profile 限制。
+  transit_speed_deg_s: 10.0  # 实验姿态之间转移的默认速度上限（度/秒），区别于测量用的探测/扫描速度。
+  maximum_acceleration_deg_s2: 20.0  # 激励轨迹的默认加速度上限（度/秒²），规划时与机器人允许值取约束。
+  position_margin_deg: 5.0  # 规划时在关节位置上下限内预留的角度余量（度）。
+  temperature_ceiling_c: 45.0  # 实验温度上限（摄氏度），还会与 profile 的允许温度取较严格值。
+  workspace_limit_deg: []  # 实验计划的逐关节对称范围（度）；空列表继承 profile，ROS/已保存场景限制可进一步覆盖。
+  workspace_range_deg: []  # 非对称逐关节范围 [[下限, 上限], ...]（度）；非空时优先于对称范围，顺序必须匹配关节。
+  gravity_probe_deg: 5.0  # 在静态姿态附近做正反向微动的角度幅度（度），用于减小静摩擦对重力测量的影响。
+  gravity_probe_speed_deg_s: 2.0  # 未指定多速度探测列表时使用的单一探测速度（度/秒）。
+  gravity_probe_speeds_deg_s: []  # 完整流程的多速度探测列表（度/秒）；空值用上面的单速，独立重力面板使用 dashboard.gravity。
+  gravity_validation_poses: 8  # 独立重力模式保留用于外部验证的姿态数，不参与重力模型训练。
+  coulomb_transition_deg_s: 1.8  # 库仑摩擦在速度反向附近的平滑过渡宽度（度/秒）；不是库仑摩擦幅值。
+  # 可供每个关节比较的库仑过渡宽度候选（度/秒），由拟合/验证数据选择合适宽度。
+  coulomb_transition_search: [0.08, 0.0958, 0.1146, 0.1372, 0.1643, 0.1967, 0.2354, 0.2818, 0.3374, 0.4039, 0.4835, 0.5788, 0.6928, 0.8294, 0.9928, 1.1885, 1.4228, 1.7032, 2.0389, 2.4407, 2.9217, 3.4976, 4.1869, 5.0121, 6.0]
+  stribeck: false  # 是否直接启用低速 Stribeck 摩擦项，描述低速区摩擦随速度下降的效应。
+  stribeck_search: true  # 是否由各关节的数据自动比较并决定采用 Stribeck 项；与直接启用开关不同。
+  stribeck_speed_deg_s: 1.6  # Stribeck 项的默认特征速度（度/秒），控制低速摩擦衰减的速度尺度。
+  stribeck_speed_search: []  # Stribeck 特征速度的候选列表（度/秒）；空列表表示不在此处指定候选。
+  load_friction: false  # 是否直接启用随负载大小变化的摩擦项，用于描述负载与摩擦的关联。
+  load_friction_search: true  # 是否根据各关节的数据自动比较并决定采用负载相关摩擦项。
+  load_stribeck: false  # 是否直接启用负载相关的低速 Stribeck 项，需要足够的低速及负载变化数据。
+  load_stribeck_search: false  # 是否自动比较负载相关 Stribeck 项；不是所有关节都具备可辨识条件。
+  skip_budget: 40  # 实验允许跳过的可恢复运动失败数量；超过预算则停止继续尝试。
+  start_deg: []  # 规划起始关节角（度）；空值通常按零位处理，重力规划会用当前站立姿态替换。
+  seed: 0  # 实验设计的随机种子，便于重现；面板重新规划时可能另选种子并记录在实际计划中。
+
+# 负载扫描实验：在不同重力负载姿态和速度档下采集摩擦数据，与上面的完整辨识计划独立。
+load_sweep:
+  maximum_levels: 10  # 每个关节最多设计多少个负载档；实际数量取决于可达到且可分辨的负载范围。
+  speeds: 18  # 从最低到最高扫描速度生成的对数间隔档位数，兼顾低速和较高速区域。
+  slowest_deg_s: 0.5  # 最低扫描速度（度/秒），决定低速摩擦采样的起点。
+  fastest_deg_s: 60.0  # 最高扫描速度（度/秒）；不是姿态转移速度，仍需满足运动可行性检查。
+  repeats: 3  # 各负载、速度及扫描方向组合的重复测量次数。
+  arc_ceiling_deg: 70.0  # 扫描角度幅度的上限（度），实际行程还受速度、负载稳定性和关节范围约束。
+  transit_speed_deg_s: 20.0  # 不同负载姿态之间移动的默认速度上限（度/秒）。
+  drift_share: 0.35  # 拟合窗口内允许的负载漂移占相邻负载档间距的比例；不是占当前负载的百分比。
+  minimum_level_gap_nm: 0.2  # 值得分成两个负载档的最小力矩间隔（牛·米），避免拟合不可分辨的负载差异。
+  search_samples: 20000  # 搜索可用负载姿态的随机候选样本数；不是实际采集的遥测帧数。
+  refine_steps: 300  # 在初步搜索结果附近细化负载极值姿态的优化步数。
+  settle_steps: 250  # 为每个负载档寻找扫描期间负载更稳定姿态的优化步数；不是等待时间。
+  decorrelate: false  # 是否尝试同时改变轴向/倾覆负载以降低相关性；实验性选项，不保证辨识改善。
+  seed: 0  # 负载姿态搜索的随机种子，便于复现相同候选设计。
+  joints: []  # 要扫描的关节索引列表，使用从 0 开始的模型顺序；空列表表示所有关节。
+  pass_attempts: 3  # 单次扫描失败时允许的总尝试次数，包含首次尝试。
+  pass_retry_s: 2.0  # 可恢复扫描失败后、再次尝试前的等待时间（秒）。
+  joint_failure_budget: 30  # 同一关节连续失败的容忍预算，达到限制后放弃该关节并继续处理后续关节。
+
+# 服务端缓存、轮询与几何/显示处理参数；这些不是机器人底层实时控制周期。
+runtime:
+  telemetry_depth: 3000  # 服务端保留的最近遥测帧数，供面板按游标增量读取。
+  telemetry_mismatch_warning_s: 5.0  # 遥测缺失或信号映射不匹配警告的最小输出间隔（秒），防止刷屏。
+  controller_poll_s: 1.0  # 查询控制器列表的周期（秒）。
+  jog_poll_s: 0.05  # 点动工作线程等待新目标时的检查间隔（秒），不是轨迹控制器的执行周期。
+  screen_drift_deg: 2.0  # 非受控关节偏离碰撞模型锁定姿态的容许角度（度）；超出后需重新筛查场景。
+  standing_quantum_deg: 0.5  # 起始姿态取整的量化步长（度），避免编码器微小波动反复使计划签名失效。
+  maximum_animation_steps: 60  # 单次可视化运动学请求允许的最大插值段数，限制浏览器请求计算量。
+  max_plot_points: 1500  # 拟合诊断散点图的抽稀目标点数，控制传输/绘制开销，不删除原始实验数据。
+  still_speed_deg_s: 0.01  # 摩擦诊断图中排除近似静止样本的速度阈值（度/秒），不是拖动停机阈值。
+
+# 解析预演的已知模型与验收容差：用于验证辨识流程，不是要下发到真机的补偿参数。
+# 驱动量及其误差使用预演拟合域的单位；电流域为安培，速度统一为度/秒。
+rehearsal:
+  noise: 0.002  # 注入模拟测量的噪声标准差，使预演能够检验有噪声条件下的恢复能力。
+  recovery_tolerance: 0.02  # 恢复出的库仑摩擦幅值与植入真值之间允许的最大绝对误差。
+  gravity_holdout_tolerance: 0.02  # 独立重力预演中最差关节的外部验证误差上限，防止仅摩擦恢复通过就被误判合格。
+  coulomb_base: 0.12  # 第一个关节植入的库仑摩擦幅值，驱动量单位。
+  coulomb_per_joint: 0.04  # 每增加一个关节索引所增加的库仑幅值：base + 此值 × 从 0 开始的索引。
+  viscous_base: 0.006  # 第一个关节植入的黏性摩擦系数，单位为驱动量/(度/秒)。
+  viscous_per_joint: 0.002  # 每个后续关节增加的黏性摩擦系数，单位同 viscous_base。
+  transition_deg_s: 1.8  # 植入摩擦模型的反向平滑宽度（度/秒），用于验证过渡区拟合。
+
+# 面板“保存为文件”时的备用文件名，不是输出目录，也不是系统配置文件名。
+storage:
+  cell_config_filename: dashboard_config.json  # 未指定 config_file_path/保存名时，在输出目录下使用的实验设置文件名。
+  profile_filename: profile.yaml  # 未指定 profile_path/保存名时，在输出目录下使用的机器人档案文件名。
+
+# 浏览器默认行为与外观参数；刷新/平滑只影响展示，不改变真实机器人运动。
+ui:
+  polling:  # 浏览器向后端请求数据的频率。
+    state_ms: 400  # 主状态、按钮和实验进度的轮询间隔（毫秒）。
+    runs_every: 25  # 每多少次主状态轮询刷新一次历史结果列表，减少目录扫描开销。
+    viewer_ms: 100  # 三维模型状态的轮询间隔（毫秒）。
+    telemetry_ms: 100  # 图表增量遥测的轮询间隔（毫秒），不是传感器实际采样间隔。
+  telemetry:  # 浏览器本地的实时曲线缓存与显示状态。
+    stale_ms: 1500  # 曲线多久未收到新帧后显示为陈旧（毫秒）；真正失联保护由 ros.telemetry_stale_s 等负责。
+    trace_depth: 1600  # 浏览器实时曲线最多保留的历史样本数。
+  plot:  # 实时信号图的初始显示方式。
+    signal: position_deg  # 默认展示的数据字段；position_deg 为关节角度，切换字段不会改变采集内容。
+    mode: normal  # 曲线初始模式：off 隐藏曲线，normal 常规，big 展开。
+    height:  # 常规/展开模式的曲线高度参数，实际高度还会受可用区域限制。
+      normal: 200  # 常规曲线高度（像素）。
+      big: 460  # 展开曲线的目标高度（像素）。
+  editor:  # 动态生成的数值编辑控件的步长。
+    workspace_step_deg: 1.0  # 逐关节工作空间输入的调整步长（度），不等于物理精度。
+    jog_step_deg: 0.1  # 点动目标滑块的调整步长（度），不是电机控制分辨率。
+  obstacle:  # 新建障碍物盒子的初始几何参数，位置和姿态相对于所选父坐标系。
+    size_m: [0.2, 0.2, 0.2]  # 盒子沿 X/Y/Z 三轴的尺寸（米），均需大于零。
+    xyz_m: [0.3, 0.0, 0.1]  # 盒子中心相对于父坐标系的 X/Y/Z 平移（米）。
+    rpy_deg: [0.0, 0.0, 0.0]  # 盒子的滚转/俯仰/偏航角（度）。
+  workspace:  # 面板“统一设置所有关节范围”输入框的初始内容，不自动应用为实际安全包络。
+    low: ""  # 统一下限输入框；空字符串表示尚未填写，填写内容表示角度（度）。
+    high: ""  # 统一上限输入框；空字符串表示尚未填写，填写内容表示角度（度）。
+  view:  # 三维视图图层复选框的初始状态。
+    mesh: true  # 显示机器人网格模型。
+    frames: false  # 显示模型坐标系轴线。
+    labels: false  # 显示模型坐标系/部件名称标签。
+    ghost: true  # 显示已规划姿态的预览，不代表机器人已经移动到这些姿态。
+    gravity: false  # 显示 URDF 中的质量/质心信息；不是展示标定得出的物理连杆参数。
+  sweep_resume: false  # 负载扫描“继续上次”复选框的默认状态；启用时尝试接续已有扫描数据。
+  scene:  # 三维渲染与初始相机设置，自动取景可能在模型加载后调整相机位置和目标。
+    smoothing_tau_s: 0.06  # 视图关节运动平滑的时间常数（秒），0 不做此平滑；不影响真实命令。
+    camera_fov_deg: 45.0  # 透视相机的垂直视场角（度），越大可见范围越宽。
+    camera_position_m: [1.1, -1.1, 0.9]  # 相机初始 X/Y/Z 位置（米），位于三维显示坐标系中。
+    camera_target_m: [0.0, 0.0, 0.35]  # 相机初始观察目标的 X/Y/Z 位置（米）。
+    pixel_ratio_max: 2.0  # 渲染像素比上限，限制高分屏的 GPU/显存开销。
+    orbit_damping: true  # 是否对鼠标旋转/缩放相机启用阻尼，使交互过渡更平滑。
+    grid_size_m: 3.0  # 地面参考网格的整体边长（米），只是视觉标尺，不是碰撞平面。
+    grid_divisions: 30  # 网格每边的分格数；单格尺寸为 grid_size_m / grid_divisions。
+    axes_size_m: 0.25  # 场景参考坐标轴的绘制长度（米），只影响显示。
+    tour:  # 规划姿态的自动浏览动画，不向机器人发送移动命令。
+      duration_ms: 8000  # 自动浏览整组姿态的目标总时长（毫秒），仍受各段时长限制。
+      min_segment_ms: 110  # 单段姿态过渡的最短动画时长（毫秒）。
+      max_segment_ms: 420  # 单段姿态过渡的最长动画时长（毫秒）。
+      frame_ms: 16  # 用于安排动画插值的目标帧间隔（毫秒），实际绘制速度由浏览器决定。
+
+# 面板控件与上述配置参数的对应关系；键名是 HTML 控件 ID，不是 ROS 参数名。
+# 以下每项的公共字段含义：
+#   source：默认值的配置路径，用点分隔层级；末尾 .0/.1/.2 表示数组元素，.-1 表示最后一项。
+#   range：引用 ranges 下的允许范围，面板和后端共用，不再另写重复的 min/max。
+#   step：输入框/滑块的增减步长，单位同参数；不是机器人分辨率，也不是采样周期。
+# 布尔复选框只需 source。未引用 range 的编辑框保留其原有几何/结构校验。
+# 控件范围不能替代服务端校验或底层安全保护；修改默认值通常应改 source 指向的参数。
+controls:
+  # 回零速度输入框（度/秒）。
+  home-speed: {source: dashboard.home.transit_speed_deg_s, range: motion.transit_speed_deg_s, step: 0.1}
+  # 点动速度输入框（度/秒）。
+  jog-speed: {source: dashboard.jog.transit_speed_deg_s, range: motion.transit_speed_deg_s, step: 0.1}
+  # 重力训练姿态数量输入框（个）；允许填写不代表满足模型可辨识性要求。
+  grav-poses: {source: campaign.static_poses, range: campaign.static_poses, step: 1}
+  # 独立重力验证姿态数量输入框（个）。
+  grav-check: {source: campaign.gravity_validation_poses, range: campaign.gravity_validation_poses, step: 1}
+  # 重力微动探测幅度输入框（度）。
+  grav-arc: {source: campaign.gravity_probe_deg, range: campaign.gravity_probe_deg, step: 0.5}
+  # 重力探测低速档输入框（度/秒），初值取多速度列表第一项。
+  grav-slow: {source: dashboard.gravity.gravity_probe_speeds_deg_s.0, range: gravity.probe_speed_deg_s, step: 0.1}
+  # 重力探测高速档输入框（度/秒），初值取多速度列表最后一项。
+  grav-fast: {source: dashboard.gravity.gravity_probe_speeds_deg_s.-1, range: gravity.probe_speed_deg_s, step: 0.1}
+  # 重力实验姿态间转移速度输入框（度/秒）。
+  grav-transit-speed: {source: campaign.transit_speed_deg_s, range: motion.transit_speed_deg_s, step: 0.1}
+  # 保持验证的姿态数量输入框（个）。
+  gravtest-poses: {source: dashboard.hold_test.poses, range: hold_test.poses, step: 1}
+  # 每个姿态的保持时长输入框（秒）。
+  gravtest-hold-seconds: {source: dashboard.hold_test.seconds, range: hold_test.seconds, step: 0.5}
+  # 保持验证的姿态间转移速度输入框（度/秒）。
+  gravtest-transit-speed: {source: dashboard.hold_test.transit_speed_deg_s, range: motion.transit_speed_deg_s, step: 0.1}
+  # 手动拖动的超速停止阈值输入框（度/秒），不是拖动目标速度。
+  gravtest-speed-stop: {source: dashboard.drag_test.maximum_speed_deg_s, range: drag_test.maximum_speed_deg_s, step: 1.0}
+  # 最优激励训练轨迹数量输入框（条）。
+  optimal-training: {source: campaign.optimal_training_trajectories, range: campaign.optimal_training_trajectories, step: 1}
+  # 最优激励独立验证轨迹数量输入框（条）。
+  optimal-validation: {source: campaign.optimal_validation_trajectories, range: campaign.optimal_validation_trajectories, step: 1}
+  # 最优激励单条傅里叶轨迹时长输入框（秒）。
+  optimal-duration: {source: campaign.fourier_duration_s, range: campaign.fourier_duration_s, step: 5.0}
+  # 最优激励低速摩擦阶段的基准姿态数量输入框（个）。
+  optimal-postures: {source: campaign.optimal_friction_postures, range: campaign.optimal_friction_postures, step: 1}
+  # 最优激励低速摩擦扫描重复次数输入框（次）。
+  optimal-repeats: {source: campaign.optimal_friction_repeats, range: campaign.optimal_friction_repeats, step: 1}
+  # 最优激励基频输入框（赫兹）。
+  optimal-frequency: {source: campaign.fourier_base_frequency_hz, range: campaign.fourier_base_frequency_hz, step: 0.01}
+  # 是否复用兼容历史低速摩擦数据的复选框。
+  optimal-reuse-friction: {source: dashboard.optimal.reuse_friction}
+  # 机器人网格模型显示开关。
+  show-mesh: {source: ui.view.mesh}
+  # 模型坐标系轴线显示开关。
+  show-frames: {source: ui.view.frames}
+  # 模型名称标签显示开关。
+  show-labels: {source: ui.view.labels}
+  # 已规划姿态预览显示开关。
+  show-ghost: {source: ui.view.ghost}
+  # URDF 质量和质心信息显示开关。
+  show-gravity: {source: ui.view.gravity}
+  # 继续已有负载扫描的复选框。
+  sweep-resume: {source: ui.sweep_resume}
+  # 障碍物沿 X 轴的尺寸输入框（米）。
+  sz-x: {source: ui.obstacle.size_m.0, step: 0.01}
+  # 障碍物沿 Y 轴的尺寸输入框（米）。
+  sz-y: {source: ui.obstacle.size_m.1, step: 0.01}
+  # 障碍物沿 Z 轴的尺寸输入框（米）。
+  sz-z: {source: ui.obstacle.size_m.2, step: 0.01}
+  # 障碍物相对于父坐标系的 X 位置输入框（米）。
+  px: {source: ui.obstacle.xyz_m.0, step: 0.01}
+  # 障碍物相对于父坐标系的 Y 位置输入框（米）。
+  py: {source: ui.obstacle.xyz_m.1, step: 0.01}
+  # 障碍物相对于父坐标系的 Z 位置输入框（米）。
+  pz: {source: ui.obstacle.xyz_m.2, step: 0.01}
+  # 障碍物滚转角输入框（度）。
+  rr: {source: ui.obstacle.rpy_deg.0, step: 1.0}
+  # 障碍物俯仰角输入框（度）。
+  rp: {source: ui.obstacle.rpy_deg.1, step: 1.0}
+  # 障碍物偏航角输入框（度）。
+  ry: {source: ui.obstacle.rpy_deg.2, step: 1.0}
+  # 批量设置全部关节工作空间下限的输入框（度），需用户应用后才生效。
+  space-all-low: {source: ui.workspace.low, step: 5.0}
+  # 批量设置全部关节工作空间上限的输入框（度），需用户应用后才生效。
+  space-all-high: {source: ui.workspace.high, step: 5.0}

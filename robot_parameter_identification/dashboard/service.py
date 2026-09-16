@@ -7,6 +7,7 @@ Python so the whole surface can be exercised in tests without a robot.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from copy import deepcopy
 from pathlib import Path
 import csv
 import hashlib
@@ -40,6 +41,10 @@ from ..model import ModelComponents
 from .. import obstacles as obstacles_module
 from ..obstacles import Obstacle, ObstacleScene
 from ..profile import RobotProfile
+from ..system_config import (
+    SystemConfig, checked_value, configured_range, default_system_config,
+    plan_defaults, resolved_controls, system_default, write_system_config_snapshot,
+)
 from . import hold_plan as hold_plan_module
 
 IDLE, RUNNING, PAUSED, JOGGING = "idle", "running", "paused", "jogging"
@@ -51,17 +56,17 @@ GRAVITY_TEST_ACKNOWLEDGEMENT = "I_AM_HOLDING_ARM_AND_ESTOP_READY"
 EDITED_SOURCE = "<edited in the dashboard>"
 PROFILE_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.yaml")
 CONFIG_FILE_NAME = re.compile(r"[A-Za-z0-9_.-]+\.json")
-DEFAULT_CONFIG_FILE = "dashboard_config.json"
+DEFAULT_CONFIG_FILE = system_default("storage", "cell_config_filename")
 # How far a joint this dashboard does not drive may move away from where the
 # screen was built around it before every pose it cleared is suspect. Small,
 # because it is a distance at the wrist that matters and leverage is long.
-SCREEN_DRIFT_DEG = 2.0
+SCREEN_DRIFT_DEG = system_default("runtime", "screen_drift_deg")
 # The starting pose is rounded to this before it enters a design or an arming
 # signature, so a servo holding still reads the same number twice.
-STANDING_QUANTUM_DEG = 0.5
+STANDING_QUANTUM_DEG = system_default("runtime", "standing_quantum_deg")
 # Sample points the canvas may ask for along one transit. A ceiling because
 # the request comes off a web surface listening on every interface.
-MAXIMUM_ANIMATION_STEPS = 60
+MAXIMUM_ANIMATION_STEPS = system_default("runtime", "maximum_animation_steps")
 # A ceiling nobody supplied is infinite, and JSON has no way to say so.
 UNBOUNDED_LIMITS = ("continuous_current_a", "peak_current_a")
 PINOCCHIO_INERTIAL_TERMS = (
@@ -177,16 +182,16 @@ def _parked_here(record, joint: int) -> bool:
 
 # A campaign yields tens of thousands of samples; a scatter plot stops being
 # readable long before a browser stops being able to draw them.
-MAX_PLOT_POINTS = 1500
+MAX_PLOT_POINTS = system_default("runtime", "max_plot_points")
 # Below this a joint has not established a direction of travel, so measured
 # minus rigid is wherever the position servo happened to settle inside the
 # stiction band, not friction at a speed. It sits well below the slowest
 # commanded rung; the parked rows of a sweep are excluded by their tag instead.
-STILL_SPEED_DEG_S = 0.01
+STILL_SPEED_DEG_S = system_default("runtime", "still_speed_deg_s")
 # The rehearsal plants known friction and must find it again; a run that merely
 # completes proves the code executes, not that it computes.
-REHEARSAL_NOISE = 0.002
-REHEARSAL_TOLERANCE = 0.02
+REHEARSAL_NOISE = system_default("rehearsal", "noise")
+REHEARSAL_TOLERANCE = system_default("rehearsal", "recovery_tolerance")
 # What a gravity dry run's held-out error may be before its answer is refused.
 # Recovering the planted friction is not enough on its own: the bidirectional
 # pairing separates friction from gravity, so a joint whose gravity columns are
@@ -194,15 +199,15 @@ REHEARSAL_TOLERANCE = 0.02
 # fourteen poses gave joint 1 a held-out error of 0.667 A while its Coulomb
 # error was 0.003 -- the friction gate passed a model that could not hold the
 # arm up. Ten times the planted noise; twenty-four poses land at 0.002.
-GRAVITY_HOLDOUT_TOLERANCE = 10.0 * REHEARSAL_NOISE
+GRAVITY_HOLDOUT_TOLERANCE = system_default("rehearsal", "gravity_holdout_tolerance")
 # Homing is a recovery move from an unknown pose, so it goes slowly whatever
 # speed the campaign was configured for.
-HOMING_SPEED_DEG_S = 10.0
+HOMING_SPEED_DEG_S = system_default("dashboard", "home")["transit_speed_deg_s"]
 # Jogging is hand-driven, so it is capped well below anything the campaign uses:
 # the operator is watching the arm, not a plot, and has no undo.
-JOG_SPEED_DEG_S = 10.0
+JOG_SPEED_DEG_S = system_default("dashboard", "jog")["transit_speed_deg_s"]
 # How long the jog worker naps when no new pose has been asked for.
-JOG_POLL_S = 0.05
+JOG_POLL_S = system_default("runtime", "jog_poll_s")
 OPTIMAL_MODE = "optimal_excitation"
 # Gravity alone, and its dry run. Split out because the answer it produces is
 # usable on its own -- it is what holds the arm up -- and because it takes
@@ -214,7 +219,8 @@ HARDWARE_MODES = ("hardware", OPTIMAL_MODE, GRAVITY_MODE)
 # Slow enough that the viscous term is small, fast enough to clear the 0.145
 # deg/s a parked joint reaches from coupling alone. Two of them, because their
 # difference is the only measurement of the viscous term a gravity run makes.
-DEFAULT_GRAVITY_PROBE_SPEEDS = (1.0, 3.0)
+DEFAULT_GRAVITY_PROBE_SPEEDS = tuple(
+    system_default("dashboard", "gravity")["gravity_probe_speeds_deg_s"])
 # Plan fields the gravity card may set.
 GRAVITY_OPTIONS = ("static_poses", "gravity_validation_poses",
                    "gravity_probe_deg")
@@ -267,9 +273,9 @@ def _comparison(optimal_errors, sweep: dict, joint_names) -> dict:
 
 @dataclass
 class DashboardConfig:
-    profile_path: str = ""
-    output_directory: str = "identification_results"
-    gravity_test_source: str = ""
+    profile_path: str = system_default("ros", "profile_path")
+    output_directory: str = system_default("ros", "output_directory")
+    gravity_test_source: str = system_default("ros", "gravity_test_source")
     telemetry: TelemetrySpec = field(default_factory=TelemetrySpec)
     commands: CommandSpec = field(default_factory=CommandSpec)
     # Frame the 3D view renders in. Empty means the model root.
@@ -282,15 +288,26 @@ class DashboardConfig:
     workspace_range_deg: tuple[tuple[float, float], ...] = ()
     # Top sweep speed. Zero keeps the conservative derived default, which is
     # too slow to see viscous friction on a full-size arm.
-    maximum_speed_deg_s: float = 0.0
+    maximum_speed_deg_s: float = system_default("ros", "maximum_speed_deg_s")
     # Where everything this panel edits lives between sessions: the obstacle
     # scene, the planner envelope and the gravity card's numbers. All three
     # describe the cell rather than the robot, so none of them can come from
     # the URDF and all of them are lost on restart without this. Empty
     # disables the file entirely.
-    config_file_path: str = ""
+    config_file_path: str = system_default("ros", "config_file_path")
     # How close the arm may come to anything before a pose is refused.
-    safety_margin_m: float = obstacles_module.SAFETY_MARGIN_M
+    safety_margin_m: float = system_default("ros", "safety_margin_m")
+    system_config: SystemConfig = field(default_factory=default_system_config)
+
+    @classmethod
+    def from_system_config(cls, settings: SystemConfig, **overrides):
+        ros = settings.values["ros"]
+        configured = {name: ros[name] for name in (
+            "profile_path", "output_directory", "gravity_test_source",
+            "config_file_path", "maximum_speed_deg_s", "safety_margin_m")}
+        configured["workspace_limit_deg"] = tuple(
+            float(value) for value in ros["workspace_limit_deg"] if value > 0)
+        return cls(system_config=settings, **(configured | overrides))
 
 
 class IdentificationService:
@@ -300,6 +317,10 @@ class IdentificationService:
                  profile: RobotProfile | None = None,
                  process_launcher=None) -> None:
         self.config = config
+        self.system = config.system_config.values
+        for path in (config.config_file_path, config.profile_path):
+            if path:
+                self._writable_settings_path(Path(path).expanduser())
         self.bridge = bridge
         self.profile = profile
         self.arm: ident.ArmModel | None = None
@@ -364,6 +385,46 @@ class IdentificationService:
         self._external_status_file: Path | None = None
         self._external_summary_file: Path | None = None
         self._restore_settings()
+
+    def system_config_payload(self) -> dict:
+        return {
+            "path": str(self.config.system_config.path or ""),
+            "values": deepcopy(self.system),
+            "controls": resolved_controls(self.system),
+            "control_ranges": self.control_ranges(),
+            "constraints": {
+                "profile_source": self.profile_source,
+                "profile_sustained_speed_deg_s": (
+                    self.profile.sustained_speed_deg_s if self.profile else None),
+                "profile_temperature_c": self.profile.temperature_c if self.profile else None,
+                "hardware_limits": "enforced independently by the robot controller and hardware plugin",
+            },
+        }
+
+    def control_ranges(self) -> dict:
+        campaign = (campaign_module.campaign_bounds(self.profile, system_config=self.system)
+                    if self.profile is not None else {})
+        result = {}
+        for name, descriptor in self.system["controls"].items():
+            reference = descriptor.get("range")
+            if not reference:
+                continue
+            low, high = configured_range(self.system, reference)
+            if self.profile is not None and reference == "motion.transit_speed_deg_s":
+                high = min(high, self.profile.sustained_speed_deg_s)
+            elif reference == "gravity.probe_speed_deg_s" and self.plan is not None:
+                high = min(high, self.plan.maximum_speed_deg_s)
+            elif reference.startswith("campaign.") and campaign:
+                low, high = campaign[reference.split(".", 1)[1]]
+            result[name] = {"min": low, "max": high if math.isfinite(high) else None,
+                            "source": f"ranges.{reference}"}
+        return result
+
+    def _writable_settings_path(self, path: Path) -> Path:
+        source = self.config.system_config.path
+        if source is not None and path.resolve() == source.resolve():
+            raise ValueError("system_config must be separate from cell settings and robot profiles")
+        return path
 
     # -- model -----------------------------------------------------------
 
@@ -461,7 +522,8 @@ class IdentificationService:
                 profile = autoprofile.derive_profile(
                     self.urdf_text, self.driven_joints,
                     workspace_limit_deg=cap,
-                    speed_limit_deg_s=self._requested_speed())
+                    speed_limit_deg_s=self._requested_speed(),
+                    policy=self.system["profile_derivation"])
                 source = "derived"
             except Exception as error:  # noqa: BLE001
                 self.note(f"profile could not be derived: {error}")
@@ -536,10 +598,12 @@ class IdentificationService:
         """The plan follows the operator's speed, clamped to the envelope."""
         speed = self._requested_speed()
         if speed is None:
-            plan = campaign_module.default_plan(profile)
+            plan = campaign_module.default_plan(
+                profile, defaults=self.system["campaign"], system_config=self.system)
         else:
             plan, notes = campaign_module.clamp_campaign_plan(
-                {"maximum_speed_deg_s": speed}, profile)
+                {"maximum_speed_deg_s": speed}, profile,
+                defaults=self.system["campaign"], system_config=self.system)
             for entry in notes:
                 self.note(entry)
             self.note(f"sweep speeds {list(plan.friction_speeds_deg_s)} deg/s, "
@@ -787,7 +851,7 @@ class IdentificationService:
         limits = np.asarray(self.jog_range_deg(), dtype=float)
         if self.scene is None or limits.shape != (7, 2):
             return False
-        for fraction in np.linspace(0.0, 1.0, 400):
+        for fraction in np.linspace(0.0, 1.0, self.system["dashboard"]["hold_test"]["path_samples"]):
             pose = np.asarray(start) + (np.asarray(target) - start) * fraction
             if (np.any(pose < limits[:, 0]) or np.any(pose > limits[:, 1])
                     or not self.scene.collision_free(pose)):
@@ -808,7 +872,8 @@ class IdentificationService:
             raise ValueError(capability["reason"])
         if self.scene is None or self.screen_drift():
             raise ValueError("refresh the collision scene before planning holds")
-        count = options.get("poses", 5)
+        count = checked_value(options.get("poses", self.system["dashboard"]["hold_test"]["poses"]),
+                      self.system, "hold_test.poses", integer=True)
         context = self._hold_context()
         start = self._hold_position()
         limits = np.asarray(self.jog_range_deg())
@@ -821,10 +886,10 @@ class IdentificationService:
         with self._lock:
             previous = self._hold_plan
             self._hold_plan = {}
-        for attempt in range(8):
+        for attempt in range(self.system["dashboard"]["hold_test"]["replan_attempts"]):
             plan = hold_plan_module.build_hold_plan(
                 str(self.config.gravity_test_source or ""), list(self.arm.joint_names),
-                start, count, clear)
+            start, count, clear, system_config=self.system)
             if plan["poses_deg"] != previous.get("poses_deg"):
                 break
         else:
@@ -832,7 +897,7 @@ class IdentificationService:
                              "or use a model with more recorded poses")
         if context != self._hold_context() or self.screen_drift():
             raise ValueError("scene changed during planning; plan again")
-        if np.max(np.abs(np.asarray(self._hold_position()) - start)) > 1.0:
+        if np.max(np.abs(np.asarray(self._hold_position()) - start)) > self.system["dashboard"]["hold_test"]["planning_drift_deg"]:
             raise ValueError("arm moved during planning; plan again")
         plan["context"] = context
         plan["id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
@@ -879,7 +944,7 @@ class IdentificationService:
             steps = int(payload.get("steps", 1))
         except (TypeError, ValueError):
             steps = 1
-        steps = min(max(steps, 1), MAXIMUM_ANIMATION_STEPS)
+        steps = min(max(steps, 1), self.system["runtime"]["maximum_animation_steps"])
         driven = {frame.name for frame in self.arm.model.frames
                   if frame.parentJoint > 0}
         frames = []
@@ -968,13 +1033,14 @@ class IdentificationService:
         root = Path(self.config.output_directory)
         cleaned = str(name or "").strip()
         if not cleaned:
-            return (Path(self.config.profile_path) if self.config.profile_path
-                    else root / "profile.yaml")
+            return self._writable_settings_path(
+                Path(self.config.profile_path).expanduser() if self.config.profile_path
+                else root / self.system["storage"]["profile_filename"])
         if not PROFILE_FILE_NAME.fullmatch(cleaned):
             raise ValueError(
                 "a profile file name may use letters, digits, dot, dash and "
                 f"underscore, and must end in .yaml: {cleaned!r}")
-        return root / cleaned
+        return self._writable_settings_path(root / cleaned)
 
     # -- obstacles -------------------------------------------------------
 
@@ -987,7 +1053,10 @@ class IdentificationService:
     def add_obstacle(self, payload: dict) -> dict:
         self._require_scene()
         self._require_idle("obstacles cannot be edited while a run is active")
-        box = self.scene.add(Obstacle.from_dict(payload))
+        defaults = self.system["ui"]["obstacle"]
+        box = self.scene.add(Obstacle.from_dict({
+            "size_m": defaults["size_m"], "xyz_m": defaults["xyz_m"],
+            "rpy_deg": defaults["rpy_deg"], **payload}))
         self.note(f"obstacle {box.name} bolted to {box.parent_frame}")
         self._persist_config()
         return box.as_dict()
@@ -1016,7 +1085,7 @@ class IdentificationService:
 
     def config_file(self) -> Path | None:
         raw = (self.config.config_file_path or "").strip()
-        return Path(raw).expanduser() if raw else None
+        return self._writable_settings_path(Path(raw).expanduser()) if raw else None
 
     def save_config(self, name: str = "") -> dict:
         """Write the configuration where the operator says.
@@ -1045,14 +1114,15 @@ class IdentificationService:
         cleaned = str(name or "").strip()
         if not cleaned:
             launched = self.config_file()
-            return (launched if launched is not None
-                    else Path(self.config.output_directory)
-                    / DEFAULT_CONFIG_FILE)
+            return self._writable_settings_path(
+                launched if launched is not None
+                else Path(self.config.output_directory)
+                / self.system["storage"]["cell_config_filename"])
         if not CONFIG_FILE_NAME.fullmatch(cleaned):
             raise ValueError(
                 "a config file name may use letters, digits, dot, dash and "
                 f"underscore, and must end in .json: {cleaned!r}")
-        return Path(self.config.output_directory) / cleaned
+        return self._writable_settings_path(Path(self.config.output_directory) / cleaned)
 
     def _config_document(self) -> dict:
         """Everything this panel edits, in the form written to disk.
@@ -1342,7 +1412,7 @@ class IdentificationService:
 
     # -- campaign --------------------------------------------------------
 
-    def screen_drift(self, tolerance_deg: float = SCREEN_DRIFT_DEG) -> list[dict]:
+    def screen_drift(self, tolerance_deg: float | None = None) -> list[dict]:
         """Joints this dashboard does not drive that have moved since the
         screen was built against them.
 
@@ -1359,6 +1429,8 @@ class IdentificationService:
         Measured on this cell, an arm 70 deg from where the screen holds it
         puts its wrist 621 mm from the screen's idea of it.
         """
+        if tolerance_deg is None:
+            tolerance_deg = self.system["runtime"]["screen_drift_deg"]
         drifted = []
         for name, radians in self._elsewhere_rad().items():
             # A joint the screen never had a reading for is held at zero
@@ -1507,17 +1579,12 @@ class IdentificationService:
         }
 
     def _motion_speed_limit(self) -> float:
-        return min(60.0, float(self.profile.sustained_speed_deg_s)) if self.profile else 0.0
+        maximum = configured_range(self.system, "motion.transit_speed_deg_s")[1]
+        return min(maximum, float(self.profile.sustained_speed_deg_s)) if self.profile else 0.0
 
     def _motion_speed(self, options: dict, default: float) -> float:
-        ceiling = self._motion_speed_limit()
-        try:
-            speed = float(options.get("transit_speed_deg_s", default))
-        except (TypeError, ValueError):
-            raise ValueError("transit_speed_deg_s is not numeric") from None
-        if not math.isfinite(speed) or not 0.1 <= speed <= ceiling:
-            raise ValueError(f"transit_speed_deg_s must be in [0.1, {ceiling:g}]")
-        return speed
+        return checked_value(options.get("transit_speed_deg_s", default), self.system,
+                             "motion.transit_speed_deg_s", ceiling=self._motion_speed_limit())
 
     def start_gravity_test(self, mode: str, options: dict | None = None) -> dict:
         """Start one standalone, guard-owned gravity validation activity."""
@@ -1537,22 +1604,17 @@ class IdentificationService:
         source = (str(Path(configured_source).expanduser().resolve())
                   if configured_source else "")
 
-        def bounded(name, default, low, high, integer=False):
-            try:
-                value = int(options.get(name, default)) if integer else float(
-                    options.get(name, default))
-            except (TypeError, ValueError):
-                raise ValueError(f"{name} is not numeric") from None
-            if not math.isfinite(value) or not low <= value <= high:
-                raise ValueError(f"{name} must be in [{low:g}, {high:g}]")
-            return value
-
         if mode == GRAVITY_HOLD_TEST:
-            poses = bounded("poses", 5, 1, 20, integer=True)
-            seconds = bounded("seconds", 3.0, 0.5, 10.0)
-            speed = self._motion_speed(options, 5.0)
+            defaults = self.system["dashboard"]["hold_test"]
+            poses = checked_value(options.get("poses", defaults["poses"]), self.system,
+                                  "hold_test.poses", integer=True)
+            seconds = checked_value(options.get("seconds", defaults["seconds"]), self.system,
+                                    "hold_test.seconds")
+            speed = self._motion_speed(options, defaults["transit_speed_deg_s"])
             return self._start_planned_hold(options.get("plan_id"), poses, seconds, speed)
-        speed = bounded("maximum_speed_deg_s", 120.0, 1.0, 120.0)
+        speed = checked_value(options.get("maximum_speed_deg_s",
+                              self.system["dashboard"]["drag_test"]["maximum_speed_deg_s"]),
+                              self.system, "drag_test.maximum_speed_deg_s")
         normalized = {"arm": arm, "maximum_speed_deg_s": speed}
         if source:
             normalized["source"] = source
@@ -1590,12 +1652,14 @@ class IdentificationService:
             status_file = folder / "status.json"
             summary_file = folder / "gravity_test_summary.json"
             output = folder / "drag.json"
+            snapshot = write_system_config_snapshot(folder, self.system)
             command = [
                 "ros2", "run", "rm_control", "manual_drag",
                 "--arm", arm,
                 "--maximum-speed-deg-s", str(speed),
                 "--output", str(output), "--status-file", str(status_file),
                 "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
+                "--system-config", str(snapshot),
             ]
             if source:
                 command.extend(["--source", source])
@@ -1640,7 +1704,9 @@ class IdentificationService:
         return {"ok": True, "message": f"{mode} started",
                 "output": str(folder)}
 
-    def _start_planned_hold(self, plan_id, poses, seconds, speed=5.0) -> dict:
+    def _start_planned_hold(self, plan_id, poses, seconds, speed=None) -> dict:
+        if speed is None:
+            speed = self.system["dashboard"]["hold_test"]["transit_speed_deg_s"]
         with self._lock:
             if self._state != IDLE or self.planning:
                 return {"ok": False, "message": "another activity is running"}
@@ -1652,7 +1718,7 @@ class IdentificationService:
             plan = json.loads(json.dumps(self._hold_plan))
             try:
                 position = self._hold_position()
-                if np.max(np.abs(np.asarray(position) - plan["start_deg"])) > 1.0:
+                if np.max(np.abs(np.asarray(position) - plan["start_deg"])) > self.system["dashboard"]["hold_test"]["planning_drift_deg"]:
                     raise ValueError("arm moved since planning; plan again")
             except ValueError as error:
                 return {"ok": False, "message": str(error)}
@@ -1708,7 +1774,8 @@ class IdentificationService:
         context = self._hold_context()
         plant = self.bridge.hardware_plant(
             self.profile, self.scene, require_neutral_start=False,
-            maximum_speed_deg_s=self._motion_speed(self._options, 5.0))
+            maximum_speed_deg_s=self._motion_speed(
+                self._options, self.system["dashboard"]["hold_test"]["transit_speed_deg_s"]))
         try:
             plant.set_monitor(self._monitor())
             plant.set_stop_requested(
@@ -1718,14 +1785,17 @@ class IdentificationService:
             if not self._hold_path_clear(self._hold_position(), pose):
                 raise ValueError("hold transit changed before motion")
             plant.move_to(pose)
-            sample = plant.wait_for_position(pose, tolerance_deg=1.0, timeout_s=1.0)
+            tolerance = self.system["dashboard"]["hold_test"]["target_tolerance_deg"]
+            sample = plant.wait_for_position(
+                pose, tolerance_deg=tolerance,
+                timeout_s=self.system["dashboard"]["hold_test"]["target_timeout_s"])
             actual = np.asarray((sample or {}).get("position_deg"), dtype=float)
             if actual.shape != (7,) or not np.isfinite(actual).all():
                 raise ValueError("move returned no fresh position telemetry")
             error = float(np.max(np.abs(actual - pose)))
-            return {"ok": error <= 1.0, "error_deg": error,
+            return {"ok": error <= tolerance, "error_deg": error,
                     "ros_deg": actual.tolist(),
-                    "reason": "" if error <= 1.0 else "hold target was not reached"}
+                    "reason": "" if error <= tolerance else "hold target was not reached"}
         except MotionStopUnverified:
             self._hold_recovery_required = True
             raise
@@ -1755,7 +1825,7 @@ class IdentificationService:
 
             result = hold_plan_module.execute_hold_plan(
                 plan, seconds, folder, self._abort, progress, self._run_hold_child,
-                move=self._move_hold_target)
+                move=self._move_hold_target, system_config=self.system)
             if self._hold_current_started and not result.get("stop_verified"):
                 self._hold_recovery_required = True
             result.update(mode=GRAVITY_HOLD_TEST, plan_id=plan["id"],
@@ -1961,7 +2031,8 @@ class IdentificationService:
             return {"ok": False, "message": "no /robot_description yet"}
         if self.profile is None:
             return {"ok": False, "message": "no robot profile loaded"}
-        speed = self._motion_speed(options or {}, HOMING_SPEED_DEG_S)
+        speed = self._motion_speed(
+            options or {}, self.system["dashboard"]["home"]["transit_speed_deg_s"])
         with self._lock:
             if self._state != IDLE or self.planning:
                 return {"ok": False, "message": f"{self._activity} is running"}
@@ -1986,7 +2057,8 @@ class IdentificationService:
             plant = self.bridge.hardware_plant(
                 self.profile, self.scene,
                 require_neutral_start=False,
-                maximum_speed_deg_s=self._motion_speed(self._options, HOMING_SPEED_DEG_S))
+                maximum_speed_deg_s=self._motion_speed(
+                    self._options, self.system["dashboard"]["home"]["transit_speed_deg_s"]))
             setter = getattr(plant, "set_monitor", None)
             if setter is not None:
                 setter(self._monitor())
@@ -2046,7 +2118,8 @@ class IdentificationService:
             return {"ok": False, "message": "no robot profile loaded"}
         if self.bridge is None:
             return {"ok": False, "message": "no ROS bridge; cannot drive hardware"}
-        speed = self._motion_speed(options or {}, JOG_SPEED_DEG_S)
+        speed = self._motion_speed(
+            options or {}, self.system["dashboard"]["jog"]["transit_speed_deg_s"])
         with self._lock:
             if self._state == JOGGING:
                 return {"ok": True, "message": "already jogging"}
@@ -2133,7 +2206,8 @@ class IdentificationService:
     def _run_jog(self) -> None:
         plant = None
         try:
-            speed = self._motion_speed(self._options, JOG_SPEED_DEG_S)
+            speed = self._motion_speed(
+                self._options, self.system["dashboard"]["jog"]["transit_speed_deg_s"])
             plant = self.bridge.hardware_plant(
                 self.profile, self.scene, require_neutral_start=False,
                 maximum_speed_deg_s=speed)
@@ -2146,7 +2220,7 @@ class IdentificationService:
                 with self._lock:
                     target, self._jog_target = self._jog_target, None
                 if target is None:
-                    time.sleep(JOG_POLL_S)
+                    time.sleep(self.system["runtime"]["jog_poll_s"])
                     continue
                 plant.move_to(target)
                 self._on_progress(
@@ -2183,7 +2257,8 @@ class IdentificationService:
             else:
                 plan = self.plan
             reused = None
-            if mode == OPTIMAL_MODE and self._options.get("reuse_friction"):
+            if mode == OPTIMAL_MODE and self._options.get(
+                    "reuse_friction", self.system["dashboard"]["optimal"]["reuse_friction"]):
                 folder = self._latest_optimal_friction(plan)
                 if folder is None:
                     raise RuntimeError(
@@ -2238,7 +2313,9 @@ class IdentificationService:
 
     def _apply_options(self, plan, names, options: dict) -> None:
         """Operator numbers onto a plan, bounded by this arm's envelope."""
-        bounds = campaign_module.campaign_bounds(self.profile)
+        if self.profile is None:
+            raise ValueError("a robot profile is required for campaign ranges")
+        bounds = campaign_module.campaign_bounds(self.profile, system_config=self.system)
         for name in names:
             if name not in options:
                 continue
@@ -2248,6 +2325,8 @@ class IdentificationService:
             except (TypeError, ValueError):
                 self.note(f"ignoring option {name}={options[name]!r}")
                 continue
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
             bounded = min(max(value, low), high)
             if bounded != value:
                 self.note(f"{name} {value:g} clamped to {bounded:g}")
@@ -2256,19 +2335,25 @@ class IdentificationService:
 
     def _gravity_plan(self, options: dict):
         """The gravity card's numbers, bounded, on a copy of the plan."""
+        options = self.gravity_options | options
         plan = replace(self.plan)
         if self._gravity_seed is not None:
             plan.seed = self._gravity_seed
         plan.transit_speed_deg_s = self._motion_speed(options, plan.transit_speed_deg_s)
-        plan.gravity_probe_speeds_deg_s = DEFAULT_GRAVITY_PROBE_SPEEDS
+        plan.gravity_probe_speeds_deg_s = tuple(
+            self.system["dashboard"]["gravity"]["gravity_probe_speeds_deg_s"])
         plan.start_deg = self._standing_deg()
         self._apply_options(plan, GRAVITY_OPTIONS, options)
-        speeds = options.get("gravity_probe_speeds_deg_s")
+        speeds = options.get("gravity_probe_speeds_deg_s", plan.gravity_probe_speeds_deg_s)
         if speeds:
-            ceiling = float(plan.maximum_speed_deg_s)
+            minimum, maximum = configured_range(self.system, "gravity.probe_speed_deg_s")
+            ceiling = min(maximum, float(plan.maximum_speed_deg_s))
+            if minimum > ceiling:
+                raise ValueError("gravity probe speed range does not overlap the robot/plan speed limit")
             try:
-                cleaned = sorted({round(min(max(float(value), 0.05), ceiling), 3)
-                                  for value in speeds if float(value) > 0.0})
+                cleaned = sorted({round(min(max(float(value), minimum), ceiling), 3)
+                                  for value in speeds if math.isfinite(float(value))
+                                  and float(value) > 0.0})
             except (TypeError, ValueError):
                 cleaned = []
                 self.note(f"ignoring probe speeds {speeds!r}")
@@ -2317,8 +2402,8 @@ class IdentificationService:
         pose = (sample or {}).get("position_deg")
         if not pose:
             return ()
-        return tuple(round(float(value) / STANDING_QUANTUM_DEG)
-                     * STANDING_QUANTUM_DEG for value in pose)
+        quantum = self.system["runtime"]["standing_quantum_deg"]
+        return tuple(round(float(value) / quantum) * quantum for value in pose)
 
     def _optimal_plan(self):
         """Apply the small set of options exposed by the optimal-run card."""
@@ -2481,7 +2566,7 @@ class IdentificationService:
 
     def _sweep_plan(self) -> loadsweep_module.SweepPlan:
         """The requested sweep, with anything unspecified left at its default."""
-        plan = loadsweep_module.SweepPlan()
+        plan = loadsweep_module.SweepPlan(**plan_defaults(self.system["load_sweep"]))
         for key, value in (getattr(self, "_options", None) or {}).items():
             if key == "resume" or not hasattr(plan, key):
                 continue
@@ -2490,13 +2575,31 @@ class IdentificationService:
                 if key == "joints":
                     setattr(plan, key, tuple(int(v) for v in value))
                 elif isinstance(current, bool):
-                    setattr(plan, key, bool(value))
-                elif isinstance(current, int):
-                    setattr(plan, key, int(value))
-                elif isinstance(current, float):
-                    setattr(plan, key, float(value))
-            except (TypeError, ValueError):
-                self.note(f"ignoring load sweep option {key}={value!r}")
+                    if type(value) is not bool:
+                        raise ValueError(f"{key} must be boolean")
+                    setattr(plan, key, value)
+                elif isinstance(current, (int, float)):
+                    setattr(plan, key, checked_value(value, self.system, f"load_sweep.{key}",
+                                                     integer=isinstance(current, int)))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"invalid load sweep option {key}: {error}") from error
+        for name in self.system["ranges"]["load_sweep"]:
+            value = getattr(plan, name)
+            ceiling = (float(self.profile.sustained_speed_deg_s)
+                       if self.profile is not None and name in
+                       ("slowest_deg_s", "fastest_deg_s", "transit_speed_deg_s") else None)
+            checked_value(value, self.system, f"load_sweep.{name}",
+                          integer=isinstance(value, int) and not isinstance(value, bool))
+            if ceiling is not None and value > ceiling:
+                checked_value(ceiling, self.system, f"load_sweep.{name}")
+                setattr(plan, name, ceiling)
+                self.note(f"load sweep {name} {value:g} limited to robot profile {ceiling:g}")
+        if plan.slowest_deg_s <= 0 or plan.fastest_deg_s < plan.slowest_deg_s:
+            raise ValueError("load sweep speeds must be positive and slowest <= fastest")
+        if plan.transit_speed_deg_s <= 0 or plan.arc_ceiling_deg <= 0 or plan.minimum_level_gap_nm <= 0:
+            raise ValueError("load sweep transit speed, arc and load spacing must be positive")
+        if self.arm is not None and any(index < 0 or index >= self.arm.joint_count for index in plan.joints):
+            raise ValueError("load sweep joint index is outside the current robot model")
         return plan
 
     def _sweep_folder(self) -> Path:
@@ -2630,7 +2733,7 @@ class IdentificationService:
             "gravity_validation_poses": plan.gravity_validation_poses,
             "gravity_probe_deg": plan.gravity_probe_deg,
             "gravity_probe_speeds_deg_s": list(
-                plan.gravity_probe_speeds_deg_s or DEFAULT_GRAVITY_PROBE_SPEEDS),
+                self.system["dashboard"]["gravity"]["gravity_probe_speeds_deg_s"]),
         }
         defaults.update(self.gravity_options)
         defaults["minimum_poses"] = self._minimum_gravity_poses()
@@ -2850,7 +2953,8 @@ class IdentificationService:
         aborted = payload.get("aborted")
         recovery = ({} if mode in HARDWARE_MODES else self._check_recovery(
             payload,
-            GRAVITY_HOLDOUT_TOLERANCE if mode == GRAVITY_REHEARSAL else 0.0))
+            self.system["rehearsal"]["gravity_holdout_tolerance"]
+            if mode == GRAVITY_REHEARSAL else 0.0))
         if recovery:
             payload["rehearsal_check"] = recovery
         preview = self._build_preview(mode, payload)
@@ -2967,6 +3071,7 @@ class IdentificationService:
                 "implementation_sha256": implementation,
             },
             "configuration": {
+                "system_config": self.system_config_payload(),
                 "profile": (_without_infinities(self.profile.as_dict())
                             if self.profile is not None else None),
                 "collision_safety_margin_m": self.config.safety_margin_m,
@@ -3148,7 +3253,7 @@ class IdentificationService:
                        <= acceleration_ceiling)]
         if not moving:
             return {}
-        stride = max(1, len(moving) // MAX_PLOT_POINTS)
+        stride = max(1, len(moving) // self.system["runtime"]["max_plot_points"])
         thinned = moving[::stride]
         fits = list(fits or [])
         if len(fits) != len(joints):
@@ -3172,7 +3277,7 @@ class IdentificationService:
                     measured = float(record.current_a[index])
                 except (AttributeError, IndexError, TypeError):
                     continue
-                if abs(speed) < STILL_SPEED_DEG_S or _parked_here(record, index):
+                if abs(speed) < self.system["runtime"]["still_speed_deg_s"] or _parked_here(record, index):
                     still += 1
                     continue
                 acceleration = 0.0
@@ -3199,7 +3304,7 @@ class IdentificationService:
             standstill.append(still)
         return {"friction_samples": friction, "residual_samples": residual,
                 "friction_standstill_excluded": standstill,
-                "friction_standstill_speed_deg_s": STILL_SPEED_DEG_S}
+                "friction_standstill_speed_deg_s": self.system["runtime"]["still_speed_deg_s"]}
 
     def _build_plant(self, mode: str, plan=None):
         if mode in HARDWARE_MODES:
@@ -3208,7 +3313,8 @@ class IdentificationService:
             options = {"expected_start_deg": tuple(getattr(plan, "start_deg", ()) or ())}
             if mode == GRAVITY_MODE and plan is not None:
                 options["maximum_speed_deg_s"] = self._motion_speed(
-                    {"transit_speed_deg_s": plan.transit_speed_deg_s}, 10.0)
+                    {"transit_speed_deg_s": plan.transit_speed_deg_s},
+                    self.system["campaign"]["transit_speed_deg_s"])
             return self.bridge.hardware_plant(
                 self.profile, self.scene, **options)
         from ..plants.analytic import AnalyticPlant  # noqa: PLC0415
@@ -3220,7 +3326,7 @@ class IdentificationService:
             coulomb=injected["coulomb"],
             viscous_per_deg_s=injected["viscous"],
             coulomb_transition_deg_s=injected["transition"],
-            noise=REHEARSAL_NOISE)
+            noise=self.system["rehearsal"]["noise"])
 
     def _rehearsal_friction(self) -> dict:
         """Friction to plant in the rehearsal so the fit has to find something.
@@ -3231,10 +3337,13 @@ class IdentificationService:
         joints up cannot pass.
         """
         count = self.arm.joint_count
+        defaults = self.system["rehearsal"]
         return {
-            "coulomb": [round(0.12 + 0.04 * index, 4) for index in range(count)],
-            "viscous": [round(0.006 + 0.002 * index, 5) for index in range(count)],
-            "transition": 1.8,
+            "coulomb": [round(defaults["coulomb_base"] + defaults["coulomb_per_joint"] * index, 4)
+                        for index in range(count)],
+            "viscous": [round(defaults["viscous_base"] + defaults["viscous_per_joint"] * index, 5)
+                        for index in range(count)],
+            "transition": defaults["transition_deg_s"],
         }
 
     def _check_recovery(self, payload: dict,
@@ -3259,8 +3368,8 @@ class IdentificationService:
         report = {
             "available": True,
             "worst_coulomb_error": round(worst, 4),
-            "tolerance": REHEARSAL_TOLERANCE,
-            "passed": worst <= REHEARSAL_TOLERANCE,
+            "tolerance": self.system["rehearsal"]["recovery_tolerance"],
+            "passed": worst <= self.system["rehearsal"]["recovery_tolerance"],
             "joints": errors,
         }
         if holdout_tolerance > 0.0:
@@ -3425,6 +3534,7 @@ class IdentificationService:
                 "rehearsal_passed": self.rehearsal_passed,
                 "gravity_armed": bool(self.gravity_armed),
                 "gravity_defaults": self.gravity_defaults(),
+                "control_ranges": self.control_ranges(),
                 "motion_speed_max_deg_s": self._motion_speed_limit(),
                 "gravity_test": self.gravity_test_capability(),
                 "hold_plan": self.hold_plan_payload(),

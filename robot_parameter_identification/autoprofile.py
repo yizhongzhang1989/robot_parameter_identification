@@ -5,6 +5,10 @@ first experience, and most of it is already stated in the URDF. So: take the
 joint list from the trajectory controller, the position and speed limits from
 the URDF, and be explicit about the one thing that cannot be derived.
 
+Position and speed margins come from the system configuration's
+``profile_derivation`` policy, optionally supplied for each call. Written
+robot profiles are independent of this automatic derivation policy.
+
 **Current ceilings are not derivable.** The URDF states effort in newton-metres;
 converting that to a drive current needs the torque constant, which is one of
 the quantities being identified. Inventing a number is wrong in both directions
@@ -18,15 +22,14 @@ import math
 import xml.etree.ElementTree as ElementTree
 
 from .profile import RobotProfile
+from .system_config import system_default, system_defaults
 
-# Identification is a slow, deliberate exercise, so the default stays well under
-# what the URDF permits. SPEED_CEILING_FRACTION is a separate question: the most
-# an operator may raise it to. Friction only shows itself at speed, so refusing
-# to go faster refuses to measure it -- but half of rated is far enough.
-SPEED_FRACTION = 0.15
-MAXIMUM_SPEED_DEG_S = 20.0
-SPEED_CEILING_FRACTION = 0.5
-POSITION_FRACTION = 0.9
+SPEED_FRACTION = system_default("profile_derivation", "default_speed_fraction")
+MAXIMUM_SPEED_DEG_S = system_default(
+    "profile_derivation", "maximum_default_speed_deg_s")
+SPEED_CEILING_FRACTION = system_default(
+    "profile_derivation", "requested_speed_fraction")
+POSITION_FRACTION = system_default("profile_derivation", "position_fraction")
 
 
 def joint_limits(urdf_text: str) -> dict[str, dict]:
@@ -57,7 +60,8 @@ def joint_limits(urdf_text: str) -> dict[str, dict]:
 
 def derive_profile(urdf_text: str, joint_names, name: str = "derived",
                    workspace_limit_deg=None,
-                   speed_limit_deg_s=None) -> RobotProfile:
+                   speed_limit_deg_s=None, *,
+                   policy: dict | None = None) -> RobotProfile:
     """A profile good enough to run, built from the URDF and a joint list.
 
     ``workspace_limit_deg`` caps how far the campaign may swing each joint,
@@ -66,12 +70,18 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
     the workspace, or model the obstruction as a box, or both.
 
     ``speed_limit_deg_s`` replaces the conservative default speed, up to
-    ``SPEED_CEILING_FRACTION`` of what the URDF rates each joint for. It exists
-    because viscous friction is invisible at crawling speeds.
+    the policy's ``requested_speed_fraction`` of each joint's URDF rating.
+    It exists because viscous friction is invisible at crawling speeds.
 
-    Raises ``ValueError`` when a named joint has no position limit, because
-    guessing a range for a joint we are about to move is not acceptable.
+    ``policy`` overrides the system template's ``profile_derivation`` values
+    for this call only. Fractions must be in (0, 1], the default speed ceiling
+    must be positive, and the peak multiplier must be at least one. All
+    policy values must be finite numbers.
+
+    Raises ``ValueError`` for an invalid policy or unusable URDF limits,
+    because guessing a range for a joint we are about to move is not acceptable.
     """
+    derivation = _derivation_policy(policy)
     names = [str(entry) for entry in joint_names]
     if not names:
         raise ValueError("no joint names supplied")
@@ -86,17 +96,27 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
         if lower is None or upper is None:
             missing.append(joint)
             continue
+        if not math.isfinite(lower) or not math.isfinite(upper):
+            raise ValueError(f"joint {joint} position limits must be finite")
         # Symmetric because the campaign designs poses about zero; the tighter
         # side wins so the asymmetric half is never exceeded.
         reach = min(abs(lower), abs(upper))
-        positions.append(round(math.degrees(reach) * POSITION_FRACTION, 2))
-        speeds.append(_speed_for(entry.get("velocity"), requested))
+        reach_deg = math.degrees(reach)
+        positions.append(_positive_finite(
+            min(round(reach_deg * derivation["position_fraction"], 2), reach_deg),
+            f"joint {joint} derived position limit"))
+        speeds.append(_speed_for(entry.get("velocity"), requested,
+                                 policy=derivation))
     if missing:
         raise ValueError(
             "these joints have no position limit in the URDF, so a profile "
             f"cannot be derived: {', '.join(missing)}")
 
-    sustained = round(min(speeds), 2) if speeds else MAXIMUM_SPEED_DEG_S
+    sustained = _positive_finite(_bounded_round(min(speeds)),
+                                 "derived sustained_speed_deg_s")
+    peak = _positive_finite(
+        max(sustained, _bounded_round(sustained * derivation["peak_speed_multiplier"])),
+        "derived peak_speed_deg_s")
     workspace = _workspace(workspace_limit_deg, positions)
     payload = {
         "schema_version": 1,
@@ -110,7 +130,7 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
         },
         "envelope": {
             "sustained_speed_deg_s": sustained,
-            "peak_speed_deg_s": round(sustained * 2.0, 2),
+            "peak_speed_deg_s": peak,
         },
         "notes": {
             "derived": "Built from /robot_description and the trajectory "
@@ -128,7 +148,8 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
     if requested is not None:
         payload["notes"]["speed"] = (
             f"Operator raised the campaign speed to {sustained} deg/s "
-            f"(asked {requested}, capped at {SPEED_CEILING_FRACTION:g} of what "
+            f"(asked {requested}, capped at "
+            f"{derivation['requested_speed_fraction']:g} of what "
             "the URDF rates each joint for).")
     return RobotProfile.from_dict(
         payload, source="<derived from /robot_description>")
@@ -147,26 +168,72 @@ def _workspace(requested, positions: list[float]) -> list[float]:
             f"got {len(values)}")
     if any(value <= 0.0 for value in values):
         raise ValueError("workspace_limit_deg must be positive")
-    return [round(min(cap, reach), 2) for cap, reach in zip(values, positions)]
+    return [_bounded_round(min(cap, reach)) for cap, reach in zip(values, positions)]
+
+
+def _bounded_round(value: float) -> float:
+    """Round a limit without widening its underlying bound."""
+    return min(round(value, 2), value)
 
 
 def _requested_speed(speed_limit_deg_s) -> float | None:
     if speed_limit_deg_s is None:
         return None
-    value = float(speed_limit_deg_s)
-    if value <= 0.0:
-        raise ValueError("speed_limit_deg_s must be positive")
+    return _positive_finite(speed_limit_deg_s, "speed_limit_deg_s")
+
+
+def _positive_finite(value, name: str) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be finite and positive") from error
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
     return value
 
 
-def _speed_for(velocity_rad_s, requested: float | None) -> float:
-    """This joint's campaign speed: the default, or the operator's, capped."""
+def _derivation_policy(policy: dict | None) -> dict:
+    """Resolve and validate per-call overrides without mutating shared defaults."""
+    values = system_defaults()["profile_derivation"]
+    if policy is not None:
+        if not isinstance(policy, dict):
+            raise ValueError("profile_derivation policy must be a dictionary")
+        for name, value in policy.items():
+            if name not in values:
+                raise ValueError(f"unknown profile_derivation.{name}")
+            values[name] = value
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"profile_derivation.{name} must be a finite number")
+        values[name] = _positive_finite(value, f"profile_derivation.{name}")
+    for name in ("default_speed_fraction", "requested_speed_fraction",
+                 "position_fraction"):
+        if values[name] > 1.0:
+            raise ValueError(f"profile_derivation.{name} must be in (0, 1]")
+    if values["peak_speed_multiplier"] < 1.0:
+        raise ValueError("profile_derivation.peak_speed_multiplier must be >= 1")
+    return values
+
+
+def _speed_for(velocity_rad_s, requested: float | None, *,
+               policy: dict | None = None) -> float:
+    """Use policy-capped URDF speed, or the default/request if velocity is absent."""
+    derivation = _derivation_policy(policy)
+    requested = _requested_speed(requested)
     if velocity_rad_s is None:
-        return MAXIMUM_SPEED_DEG_S if requested is None else requested
-    rated = math.degrees(velocity_rad_s)
+        return (derivation["maximum_default_speed_deg_s"]
+                if requested is None else requested)
+    rated = _positive_finite(
+        math.degrees(_positive_finite(velocity_rad_s, "URDF velocity")),
+        "URDF velocity in deg/s")
     if requested is None:
-        return min(MAXIMUM_SPEED_DEG_S, rated * SPEED_FRACTION)
-    return min(requested, rated * SPEED_CEILING_FRACTION)
+        return _positive_finite(
+            min(derivation["maximum_default_speed_deg_s"],
+                rated * derivation["default_speed_fraction"]),
+            "derived default speed")
+    return _positive_finite(
+        min(requested, rated * derivation["requested_speed_fraction"]),
+        "derived requested speed")
 
 
 def current_guard_active(profile: RobotProfile) -> bool:

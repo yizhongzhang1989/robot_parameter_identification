@@ -33,101 +33,47 @@ ParameterValue with an explicit value_type rather than passed raw.
 from typing import List
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
-
-TEXT_ARGUMENTS = (
-    ("profile_path", "", "robot profile YAML; blank derives one from the URDF"),
-    ("output_directory", "identification_results", "where results are written"),
-    ("gravity_test_source", "",
-     "passing ampere-domain result directory used by attended gravity "
-     "validation; blank uses the commissioned right-arm default"),
-    ("config_file_path", "",
-     "where everything this panel edits is kept between sessions -- the "
-     "obstacle scene, the planner envelope and the gravity settings; blank "
-     "keeps them in memory only"),
-    ("joint_state_topic", "/joint_states", "sensor_msgs/JointState source"),
-    ("dynamic_joint_state_topic", "/dynamic_joint_states",
-     "control_msgs/DynamicJointState source; blank falls back to joint_states"),
-    ("robot_description_topic", "/robot_description", "URDF source"),
-    ("controller", "",
-     "the ros2_control controller that drives the arm, by name; its trajectory "
-     "action and controller_state topic follow from it"),
-    ("controller_manager", "/controller_manager",
-     "controller manager used for the read-only controller inventory"),
-    ("follow_joint_trajectory_action",
-     "/joint_trajectory_controller/follow_joint_trajectory",
-     "the only path used to command motion; overrides 'controller' when given"),
-    ("effort_source", "current",
-     "which channel the identification regresses against when the arm offers "
-     "both: current or torque. An arm publishing only the other one overrides "
-     "this. The unit of every identified parameter follows from it."),
-    ("signal.position", "position", "interface carrying joint position"),
-    ("signal.velocity", "velocity",
-     "interface carrying joint velocity; blank differentiates position"),
-    ("signal.current", "current",
-     "interface carrying motor current; blank if the drive has none"),
-    ("signal.torque", "effort",
-     "interface carrying joint torque; blank if the drive has none. Defaults "
-     "to 'effort' because that is the only effort-like interface ros2_control "
-     "standardises on Humble, so an arm publishing either channel is read "
-     "without configuration and one publishing both has both shown."),
-    ("signal.temperature", "temperature",
-     "interface carrying joint temperature; blank disables the thermal guard"),
-    ("signal.enabled", "enabled",
-     "interface carrying the drive-enabled flag; blank disables that guard"),
-    ("signal.fault_code", "fault_code",
-     "interface carrying the drive fault word; blank disables that guard"),
-    ("signal.voltage", "",
-     "interface carrying bus voltage. Mapping it only enables the guard when "
-     "a written profile supplies the window, because a derived profile's "
-     "window is a default rather than a measurement."),
+from robot_parameter_identification.system_config import (
+    default_system_config_path, system_defaults,
 )
 
-TYPED_ARGUMENTS = (
-    ("port", "8300", int, "web port"),
-    ("extra_telemetry_topics", "['']", List[str],
-     "further control_msgs/DynamicJointState topics carrying signals the main "
-     "state topic does not, merged by joint name. Name the interface each one "
-     "carries with the matching signal.* argument."),
-    ("telemetry_stale_s", "0.5", float,
-     "how old a telemetry frame may be before it counts as lost"),
-    ("maximum_speed_deg_s", "0.0", float,
-     "top sweep speed; 0 keeps the conservative derived default. Viscous "
-     "friction is invisible at crawling speeds, so a full-size arm needs this "
-     "raised. Capped at half of what the URDF rates each joint for."),
-    ("workspace_limit_deg", "[0.0]", List[float],
-     "cap on how far each joint may swing, in degrees; one value or one per "
-     "joint, 0 for no cap. The URDF describes the arm, not the stand it is "
-     "bolted to, so set this whenever the surroundings are not modelled."),
-)
+
+INHERIT = "__system_config__"
+
+
+def _dashboard(context):
+    parameters = {"system_config": ParameterValue(
+        LaunchConfiguration("system_config"), value_type=str)}
+    for name, default in system_defaults()["ros"].items():
+        value = LaunchConfiguration(name).perform(context)
+        if value == INHERIT:
+            continue
+        value_type = type(default)
+        if isinstance(default, list):
+            value_type = List[str] if isinstance(default[0], str) else List[float]
+        parameters[name] = ParameterValue(LaunchConfiguration(name), value_type=value_type)
+    return [Node(
+        package="robot_parameter_identification",
+        executable="dashboard",
+        name="robot_parameter_identification",
+        output="screen",
+        parameters=[parameters],
+    )]
 
 
 def generate_launch_description() -> LaunchDescription:
-    declarations = [
-        DeclareLaunchArgument(name, default_value=default, description=text)
-        for name, default, text in TEXT_ARGUMENTS
-    ] + [
-        DeclareLaunchArgument(name, default_value=default, description=text)
-        for name, default, _type, text in TYPED_ARGUMENTS
-    ]
-
-    parameters = {name: LaunchConfiguration(name)
-                  for name, _default, _text in TEXT_ARGUMENTS}
-    parameters.update({
-        name: ParameterValue(LaunchConfiguration(name), value_type=value_type)
-        for name, _default, value_type, _text in TYPED_ARGUMENTS
-    })
-
-    return LaunchDescription(declarations + [
-        Node(
-            package="robot_parameter_identification",
-            executable="dashboard",
-            name="robot_parameter_identification",
-            output="screen",
-            parameters=[parameters],
-        ),
-    ])
+    declarations = [DeclareLaunchArgument(
+        "system_config", default_value=str(default_system_config_path()),
+        description="system defaults YAML; created from the package template if missing")]
+    declarations.extend(
+        DeclareLaunchArgument(
+            name, default_value=INHERIT,
+            description=f"override ros.{name} in system_config (factory default: {default!r})")
+        for name, default in system_defaults()["ros"].items()
+    )
+    return LaunchDescription(declarations + [OpaqueFunction(function=_dashboard)])

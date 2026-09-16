@@ -49,6 +49,7 @@ import pinocchio as pin
 
 from . import campaign as campaign_module
 from .interfaces import MotionFailed
+from .system_config import system_default
 
 # Bumped when a field changes meaning. New fields do not need it: readers take
 # what they know and ignore the rest, which is the point of a record per line.
@@ -62,31 +63,31 @@ MANIFEST_NAME = "manifest.json"
 class SweepPlan:
     """What to measure. Every field here is a choice, not a constant."""
 
-    maximum_levels: int = 10
-    speeds: int = 18
-    slowest_deg_s: float = 0.5
-    fastest_deg_s: float = 60.0
-    repeats: int = 3
-    arc_ceiling_deg: float = 70.0
+    maximum_levels: int = system_default('load_sweep', 'maximum_levels')
+    speeds: int = system_default('load_sweep', 'speeds')
+    slowest_deg_s: float = system_default('load_sweep', 'slowest_deg_s')
+    fastest_deg_s: float = system_default('load_sweep', 'fastest_deg_s')
+    repeats: int = system_default('load_sweep', 'repeats')
+    arc_ceiling_deg: float = system_default('load_sweep', 'arc_ceiling_deg')
     # Transits between levels are large moves across the workspace, and are not
     # measurements. They are driven well below the top sweep speed because a
     # pass being fast is the point of a pass, whereas a transit being fast is
     # only a way to arrive at the next posture harder.
-    transit_speed_deg_s: float = 20.0
+    transit_speed_deg_s: float = system_default('load_sweep', 'transit_speed_deg_s')
     # How far the load may move across the fitted window, as a share of the gap
     # between neighbouring levels. Judged against the gap rather than against
     # each level's own size because the absolute swing is nearly the same at
     # every level, which makes a percentage test vacuous at the top of the
     # range and impossible at the bottom.
-    drift_share: float = 0.35
+    drift_share: float = system_default('load_sweep', 'drift_share')
     # The smallest load gap worth separating. Joint one's friction rose 0.12 A
     # per Nm against a residual of 0.023 A, so two levels closer together than
     # this are two readings of the same thing wearing different labels.
-    minimum_level_gap_nm: float = 0.20
-    search_samples: int = 20000
-    refine_steps: int = 300
+    minimum_level_gap_nm: float = system_default('load_sweep', 'minimum_level_gap_nm')
+    search_samples: int = system_default('load_sweep', 'search_samples')
+    refine_steps: int = system_default('load_sweep', 'refine_steps')
     # Spent per level looking for a steadier posture at the same load.
-    settle_steps: int = 250
+    settle_steps: int = system_default('load_sweep', 'settle_steps')
     # Trade axial rungs for a second axis: half as many loads, each held at a
     # low and a high tilting moment.
     #
@@ -109,15 +110,15 @@ class SweepPlan:
     # terms on this arm; that needs an external payload, or a design that
     # deliberately sweeps through a load excursion and uses the per-sample
     # load already recorded with every row.
-    decorrelate: bool = False
-    seed: int = 0
+    decorrelate: bool = system_default('load_sweep', 'decorrelate')
+    seed: int = system_default('load_sweep', 'seed')
     # Empty means every joint.
-    joints: tuple[int, ...] = ()
-    pass_attempts: int = 3
-    pass_retry_s: float = 2.0
+    joints: tuple[int, ...] = tuple(system_default('load_sweep', 'joints'))
+    pass_attempts: int = system_default('load_sweep', 'pass_attempts')
+    pass_retry_s: float = system_default('load_sweep', 'pass_retry_s')
     # Consecutive failures on one joint before it is given up and the sweep
     # moves on. A joint that has stopped answering will not start answering.
-    joint_failure_budget: int = 30
+    joint_failure_budget: int = system_default('load_sweep', 'joint_failure_budget')
 
     def speed_ladder(self) -> list[float]:
         """Log spaced: the Stribeck dip lives in the bottom decade."""

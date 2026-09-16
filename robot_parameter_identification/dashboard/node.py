@@ -27,6 +27,10 @@ from std_msgs.msg import String
 from ..interfaces import (CommandSpec, EFFORT_SOURCES, SignalMap,
                           TelemetrySpec)
 from ..profile import RobotProfile
+from ..system_config import (
+    default_system_config_path, load_system_config, system_defaults,
+    validate_system_config,
+)
 from .http_server import DashboardServer
 from .controllers import ControllerInventory
 from .recovery import RecoveryMonitor
@@ -35,14 +39,14 @@ from .service import DashboardConfig, IdentificationService
 MESH_TYPES = {".stl": "model/stl", ".dae": "model/vnd.collada+xml",
               ".obj": "text/plain", ".png": "image/png", ".jpg": "image/jpeg",
               ".tga": "image/x-tga"}
-DEFAULT_ACTION = "/joint_trajectory_controller/follow_joint_trajectory"
+DEFAULT_ACTION = system_defaults()["ros"]["follow_joint_trajectory_action"]
 # Frames kept for the live panel to collect. A browser polling ten times a
 # second would otherwise see one frame in twenty on a 200 Hz arm, and a current
 # spike between two polls would simply never have happened.
-TELEMETRY_DEPTH = 3000
+TELEMETRY_DEPTH = system_defaults()["runtime"]["telemetry_depth"]
 # How often a mapping that matches nothing on the topic may say so. Loud enough
 # to be found, quiet enough not to drown the log at the telemetry rate.
-MISMATCH_WARN_S = 5.0
+MISMATCH_WARN_S = system_defaults()["runtime"]["telemetry_mismatch_warning_s"]
 DESCRIPTION_QOS = QoSProfile(
     depth=1, reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.TRANSIENT_LOCAL, history=HistoryPolicy.KEEP_LAST)
@@ -53,47 +57,50 @@ class DashboardNode(Node):
 
     def __init__(self) -> None:
         super().__init__("robot_parameter_identification")
+        self.system_config = load_system_config(self._declare(
+            "system_config", str(default_system_config_path())))
         get = self._declare
-        port = int(get("port", 8300))
+        port = int(get("port"))
         telemetry = TelemetrySpec(
-            joint_state_topic=str(get("joint_state_topic", "/joint_states")),
+            joint_state_topic=str(get("joint_state_topic")),
             dynamic_joint_state_topic=str(
-                get("dynamic_joint_state_topic", "/dynamic_joint_states")),
+                get("dynamic_joint_state_topic")),
             extra_dynamic_joint_state_topics=tuple(
                 self._declare_strings("extra_telemetry_topics")),
-            stale_after_s=float(get("telemetry_stale_s", 0.5)),
+            stale_after_s=float(get("telemetry_stale_s")),
             signals=SignalMap(
-                position=str(get("signal.position", "position")),
-                velocity=_optional(get("signal.velocity", "velocity")),
+                position=str(get("signal.position")),
+                velocity=_optional(get("signal.velocity")),
                 # Map whichever the drive publishes; map both if it has both.
-                current=_optional(get("signal.current", "current")),
-                torque=_optional(get("signal.torque", "effort")),
-                effort_source=str(get("effort_source", "current")),
-                temperature=_optional(get("signal.temperature", "temperature")),
+                current=_optional(get("signal.current")),
+                torque=_optional(get("signal.torque")),
+                effort_source=str(get("effort_source")),
+                temperature=_optional(get("signal.temperature")),
                 # Mapped by default: both are unambiguous on any drive and
                 # need no threshold guessed. The bus-voltage window does need
                 # one, so it stays off until an operator supplies a profile.
-                enabled=_optional(get("signal.enabled", "enabled")),
-                fault_code=_optional(get("signal.fault_code", "fault_code")),
-                voltage=_optional(get("signal.voltage", "")),
+                enabled=_optional(get("signal.enabled")),
+                fault_code=_optional(get("signal.fault_code")),
+                voltage=_optional(get("signal.voltage")),
             ))
         commands = CommandSpec(
-            controller_manager=str(get("controller_manager", "/controller_manager")),
+            controller_manager=str(get("controller_manager")),
             follow_joint_trajectory_action=self._resolve_action(),
             robot_description_topic=str(
-                get("robot_description_topic", "/robot_description")))
+                get("robot_description_topic")))
         # The launch argument is symmetric; the panel may make it not.
         workspace = self._declare_floats("workspace_limit_deg")
         config = DashboardConfig(
-            profile_path=str(get("profile_path", "")),
-            output_directory=str(get("output_directory",
-                                     "identification_results")),
-            gravity_test_source=str(get("gravity_test_source", "")),
-            config_file_path=str(get("config_file_path", "")),
-            safety_margin_m=float(get("safety_margin_m", 0.02)),
+            profile_path=str(get("profile_path")),
+            output_directory=str(get("output_directory")),
+            gravity_test_source=str(get("gravity_test_source")),
+            config_file_path=str(get("config_file_path")),
+            safety_margin_m=float(get("safety_margin_m")),
             workspace_range_deg=tuple((-value, value) for value in workspace),
-            maximum_speed_deg_s=float(get("maximum_speed_deg_s", 0.0)),
-            telemetry=telemetry, commands=commands)
+            maximum_speed_deg_s=float(get("maximum_speed_deg_s")),
+            telemetry=telemetry, commands=commands,
+            system_config=self.system_config)
+        validate_system_config(self.system_config.values)
 
         profile = None
         if config.profile_path:
@@ -112,7 +119,7 @@ class DashboardNode(Node):
         self._observed: set = set()
         self._complained_at = 0.0
         self._history: collections.deque = collections.deque(
-            maxlen=TELEMETRY_DEPTH)
+            maxlen=self.system_config.values["runtime"]["telemetry_depth"])
         self._sequence = 0
         # Signals arriving on their own topics, by topic: (arrival, per joint).
         self._extra: dict[str, tuple[float, dict]] = {}
@@ -131,20 +138,29 @@ class DashboardNode(Node):
         manager = commands.controller_manager.rstrip("/")
         client = self.create_client(ListControllers, manager + "/list_controllers")
         self._controllers = ControllerInventory(client, ListControllers.Request, manager)
-        self.create_timer(1.0, self._controllers.poll)
+        self.create_timer(self.system_config.values["runtime"]["controller_poll_s"],
+                  self._controllers.poll)
 
         self.server = DashboardServer(self.service, port=port,
                                       mesh_resolver=self._read_mesh, node=self)
         self.server.start()
+        self.get_logger().info(f"system_config: {self.system_config.path}")
         self.get_logger().info(
             f"dashboard on http://localhost:{self.server.port} "
             f"| telemetry {telemetry.topic()} ({telemetry.transport()})")
         for guard in telemetry.signals.missing_guards():
             self.get_logger().warn(f"guard unavailable: {guard}")
 
-    def _declare(self, name: str, default):
+    def _declare(self, name: str, default=None):
+        if name != "system_config":
+            default = self.system_config.values["ros"][name]
+            if isinstance(default, list) and not default:
+                default = system_defaults()["ros"][name]
         self.declare_parameter(name, default)
-        return self.get_parameter(name).value
+        value = self.get_parameter(name).value
+        if name != "system_config":
+            self.system_config.values["ros"][name] = value
+        return value
 
     def _resolve_action(self) -> str:
         """Which controller this dashboard drives, named the short way.
@@ -154,12 +170,15 @@ class DashboardNode(Node):
         available for a controller that does not follow the usual layout, and
         wins when it is given, because it is the more specific statement.
         """
-        action = str(self._declare("follow_joint_trajectory_action",
-                                   DEFAULT_ACTION))
-        controller = str(self._declare("controller", "")).strip()
-        if controller and action == DEFAULT_ACTION:
-            return CommandSpec.for_controller(
+        action = str(self._declare("follow_joint_trajectory_action"))
+        controller = str(self._declare("controller")).strip()
+        overrides = self._parameter_overrides
+        explicit_action = "follow_joint_trajectory_action" in overrides
+        if controller and not explicit_action and (
+                "controller" in overrides or action == DEFAULT_ACTION):
+            action = CommandSpec.for_controller(
                 controller).follow_joint_trajectory_action
+        self.system_config.values["ros"]["follow_joint_trajectory_action"] = action
         return action
 
     def _declare_strings(self, name: str) -> list[str]:
@@ -168,7 +187,7 @@ class DashboardNode(Node):
         An empty list default is inferred as a byte array and then refuses the
         strings the operator passes, so the default carries one blank instead.
         """
-        value = self._declare(name, [""]) or []
+        value = self._declare(name) or []
         return [str(entry).strip() for entry in value if str(entry).strip()]
 
     def _declare_floats(self, name: str) -> list[float]:
@@ -178,7 +197,7 @@ class DashboardNode(Node):
         doubles the operator passes, so the default carries one zero instead.
         Every value this reads is a positive cap, so zero is unambiguous.
         """
-        value = self._declare(name, [0.0]) or []
+        value = self._declare(name) or []
         return [float(entry) for entry in value if float(entry) > 0.0]
 
     # -- which joints are we identifying ---------------------------------
@@ -360,7 +379,7 @@ class DashboardNode(Node):
         telemetry dead, and the only symptom is a panel that never fills.
         """
         now = time.monotonic()
-        if now - self._complained_at < MISMATCH_WARN_S:
+        if now - self._complained_at < self.system_config.values["runtime"]["telemetry_mismatch_warning_s"]:
             return
         self._complained_at = now
         self.get_logger().warn(message)

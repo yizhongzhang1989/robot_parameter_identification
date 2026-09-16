@@ -268,6 +268,7 @@ class GravityValidationTest(unittest.TestCase):
         made = IdentificationService(
             DashboardConfig(output_directory=directory),
             profile=test_profile(), process_launcher=launch)
+        made.system["dashboard"]["hold_test"]["transit_speed_deg_s"] = 5.0
         made.adopt_description(synthetic_urdf())
         return made, processes
 
@@ -310,6 +311,7 @@ class GravityValidationTest(unittest.TestCase):
                 "--output", str(folder / "drag.json"),
                 "--status-file", str(folder / "status.json"),
                 "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
+                "--system-config", str(folder / "system_config.yaml"),
             ])
             self.assertNotIn("seconds", made._options)
             self.assertEqual(made.snapshot()["state"], RUNNING)
@@ -370,8 +372,10 @@ class GravityValidationTest(unittest.TestCase):
         self.assertIn("disabled", stop)
         self.assertEqual(stop["data-i18n"], "run.stop")
         speed = elements["gravtest-speed-stop"][1]
-        self.assertEqual((speed["min"], speed["max"], speed["value"]),
-                         ("1", "120", "120"))
+        self.assertIn("data-system-config", speed)
+        control = service().system_config_payload()["controls"]["gravtest-speed-stop"]
+        self.assertEqual((control["min"], control["max"], control["value"]),
+                 (1.0, 120.0, 120.0))
         self.assertIn("gravtest-hold-seconds", elements)
 
     def test_drag_cannot_exceed_hardware_speed_limit(self):

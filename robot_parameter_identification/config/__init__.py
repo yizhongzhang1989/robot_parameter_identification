@@ -1,0 +1,1 @@
+"""Packaged factory defaults for first-run system configuration."""

@@ -12,7 +12,7 @@
 }}
 </script>
 </head>
-<body>
+<body inert>
 
 <header id="topbar">
   <h1 data-i18n="app.title">Parameter identification</h1>
@@ -41,17 +41,17 @@
     <div id="scene-status" class="overlay hidden" aria-live="polite"></div>
 
     <div class="overlay" id="view-opts">
-      <label><input type="checkbox" id="show-mesh" checked/>
+      <label><input type="checkbox" id="show-mesh" data-system-config/>
         <span data-i18n="view.meshes">meshes</span></label>
-      <label><input type="checkbox" id="show-frames"/>
+      <label><input type="checkbox" id="show-frames" data-system-config/>
         <span data-i18n="view.frames">frames</span></label>
-      <label><input type="checkbox" id="show-labels"/>
+      <label><input type="checkbox" id="show-labels" data-system-config/>
         <span data-i18n="view.labels">labels</span></label>
       <label title="" data-i18n-title="view.ghost_hint">
-        <input type="checkbox" id="show-ghost" checked/>
+        <input type="checkbox" id="show-ghost" data-system-config/>
         <span data-i18n="view.ghost">planned pose</span></label>
       <label title="" data-i18n-title="view.gravity_hint">
-        <input type="checkbox" id="show-gravity"/>
+        <input type="checkbox" id="show-gravity" data-system-config/>
         <span data-i18n="view.gravity">mass and centre of mass</span></label>
     </div>
 
@@ -82,19 +82,19 @@
           <select id="obst-frame"></select>
         </label>
         <div class="grid3">
-          <label class="field"><span data-i18n="obst.size">size x</span><input id="sz-x" type="number" step="0.01"/></label>
-          <label class="field">y<input id="sz-y" type="number" step="0.01"/></label>
-          <label class="field">z<input id="sz-z" type="number" step="0.01"/></label>
+          <label class="field"><span data-i18n="obst.size">size x</span><input id="sz-x" type="number" data-system-config/></label>
+          <label class="field">y<input id="sz-y" type="number" data-system-config/></label>
+          <label class="field">z<input id="sz-z" type="number" data-system-config/></label>
         </div>
         <div class="grid3">
-          <label class="field"><span data-i18n="obst.pos">pos x</span><input id="px" type="number" step="0.01"/></label>
-          <label class="field">y<input id="py" type="number" step="0.01"/></label>
-          <label class="field">z<input id="pz" type="number" step="0.01"/></label>
+          <label class="field"><span data-i18n="obst.pos">pos x</span><input id="px" type="number" data-system-config/></label>
+          <label class="field">y<input id="py" type="number" data-system-config/></label>
+          <label class="field">z<input id="pz" type="number" data-system-config/></label>
         </div>
         <div class="grid3">
-          <label class="field"><span data-i18n="obst.roll">roll</span><input id="rr" type="number" step="1"/></label>
-          <label class="field"><span data-i18n="obst.pitch">pitch</span><input id="rp" type="number" step="1"/></label>
-          <label class="field"><span data-i18n="obst.yaw">yaw</span><input id="ry" type="number" step="1"/></label>
+          <label class="field"><span data-i18n="obst.roll">roll</span><input id="rr" type="number" data-system-config/></label>
+          <label class="field"><span data-i18n="obst.pitch">pitch</span><input id="rp" type="number" data-system-config/></label>
+          <label class="field"><span data-i18n="obst.yaw">yaw</span><input id="ry" type="number" data-system-config/></label>
         </div>
         <p class="hint" data-i18n="obst.hint">A box on the base is a bench. A box
           on a link travels with the arm.</p>
@@ -141,7 +141,7 @@
 
     <div class="card">
       <label class="field"><span data-i18n="run.home_speed">Home speed (deg/s)</span>
-        <input id="home-speed" type="number" min="0.1" max="60" step="0.1" value="10"/>
+        <input id="home-speed" type="number" data-system-config/>
       </label>
       <div class="row">
         <button id="btn-home" class="danger" disabled
@@ -156,7 +156,7 @@
         not the URDF's, and every pose is screened against the obstacle scene
         before the arm is asked to go there.</p>
       <label class="field"><span data-i18n="jog.speed">Jog speed (deg/s)</span>
-        <input id="jog-speed" type="number" min="0.1" max="60" step="0.1" value="10"/>
+        <input id="jog-speed" type="number" data-system-config/>
       </label>
       <div class="row">
         <button id="btn-jog" class="danger" disabled
@@ -200,9 +200,9 @@
         rehearsed are not the poses this will design.</p>
       <div class="row">
         <label class="field"><span data-i18n="space.low">low (°)</span>
-          <input id="space-all-low" type="number" step="5"/></label>
+          <input id="space-all-low" type="number" data-system-config/></label>
         <label class="field"><span data-i18n="space.high">high (°)</span>
-          <input id="space-all-high" type="number" step="5"/></label>
+          <input id="space-all-high" type="number" data-system-config/></label>
         <button id="space-fill" class="small" data-i18n="space.fill">set all</button>
       </div>
       <div class="scroll-x"><table class="live" id="space-joints"></table></div>
@@ -227,24 +227,24 @@
         does not move it fast.</p>
       <div class="grid3">
         <label class="field"><span data-i18n="grav.poses">training poses</span>
-          <input id="grav-poses" type="number" min="4" max="60" step="1" value="24"/>
+          <input id="grav-poses" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="grav.check">held-out poses</span>
-          <input id="grav-check" type="number" min="2" max="30" step="1" value="8"/>
+          <input id="grav-check" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="grav.arc">crossing arc (°)</span>
-          <input id="grav-arc" type="number" min="1" max="20" step="0.5" value="5"/>
+          <input id="grav-arc" type="number" data-system-config/>
         </label>
       </div>
       <div class="grid3">
         <label class="field"><span data-i18n="grav.slow">slow probe (°/s)</span>
-          <input id="grav-slow" type="number" min="0.05" max="20" step="0.1" value="1"/>
+          <input id="grav-slow" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="grav.fast">fast probe (°/s)</span>
-          <input id="grav-fast" type="number" min="0.05" max="20" step="0.1" value="3"/>
+          <input id="grav-fast" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="grav.transit_speed">Transit speed (deg/s)</span>
-          <input id="grav-transit-speed" type="number" min="0.1" max="60" step="0.1" value="10"/>
+          <input id="grav-transit-speed" type="number" data-system-config/>
         </label>
       </div>
       <div class="row">
@@ -277,13 +277,13 @@
             check that gravity current holds each one inside its corridor.</p>
           <div class="gravity-test-actions">
             <label class="field"><span data-i18n="gravtest.poses">test poses</span>
-              <input id="gravtest-poses" type="number" min="1" max="20" step="1" value="5"/>
+              <input id="gravtest-poses" type="number" data-system-config/>
             </label>
             <label class="field"><span data-i18n="gravtest.hold_seconds">hold each (s)</span>
-              <input id="gravtest-hold-seconds" type="number" min="0.5" max="10" step="0.5" value="3"/>
+              <input id="gravtest-hold-seconds" type="number" data-system-config/>
             </label>
             <label class="field"><span data-i18n="gravtest.transit_speed">Transit speed (deg/s)</span>
-              <input id="gravtest-transit-speed" type="number" min="0.1" max="60" step="0.1" value="5"/>
+              <input id="gravtest-transit-speed" type="number" data-system-config/>
             </label>
           </div>
           <div class="gravity-test-run-actions">
@@ -301,7 +301,7 @@
             gravity current supports it.</p>
           <div class="gravity-test-actions">
             <label class="field"><span data-i18n="gravtest.speed_stop">speed stop (°/s)</span>
-              <input id="gravtest-speed-stop" type="number" min="1" max="120" step="1" value="120"/>
+              <input id="gravtest-speed-stop" type="number" data-system-config/>
             </label>
           </div>
           <div class="gravity-test-run-actions">
@@ -362,30 +362,30 @@
         Separate Fourier trajectories remain untouched for validation.</p>
       <div class="grid3">
         <label class="field"><span data-i18n="optimal.training">training trajectories</span>
-          <input id="optimal-training" type="number" min="2" max="32" step="1" value="12"/>
+          <input id="optimal-training" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="optimal.validation">validation trajectories</span>
-          <input id="optimal-validation" type="number" min="1" max="8" step="1" value="3"/>
+          <input id="optimal-validation" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="optimal.duration">seconds each</span>
-          <input id="optimal-duration" type="number" min="5" max="120" step="5" value="30"/>
+          <input id="optimal-duration" type="number" data-system-config/>
         </label>
       </div>
       <div class="grid3">
         <label class="field"><span data-i18n="optimal.postures">low-speed load postures</span>
-          <input id="optimal-postures" type="number" min="1" max="5" step="1" value="3"/>
+          <input id="optimal-postures" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="optimal.repeats">passes per direction</span>
-          <input id="optimal-repeats" type="number" min="1" max="5" step="1" value="2"/>
+          <input id="optimal-repeats" type="number" data-system-config/>
         </label>
         <label class="field"><span data-i18n="optimal.frequency">Fourier base frequency (Hz)</span>
-          <input id="optimal-frequency" type="number" min="0.02" max="0.3" step="0.01" value="0.08"/>
+          <input id="optimal-frequency" type="number" data-system-config/>
         </label>
       </div>
       <div class="row">
         <button id="btn-optimal" class="danger" disabled
                 data-i18n="optimal.start">Run optimal excitation</button>
-        <label class="inline"><input type="checkbox" id="optimal-reuse-friction">
+        <label class="inline"><input type="checkbox" id="optimal-reuse-friction" data-system-config>
           <span data-i18n="optimal.reuse">reuse latest completed low-speed phase</span></label>
       </div>
     </div>
@@ -400,7 +400,7 @@
       <div class="row">
         <button id="btn-sweep" class="danger" disabled
                 data-i18n="sweep.start">Sweep loads</button>
-        <label class="inline"><input type="checkbox" id="sweep-resume">
+        <label class="inline"><input type="checkbox" id="sweep-resume" data-system-config>
           <span data-i18n="sweep.resume">resume the last one</span></label>
       </div>
       <div id="sweep-line" class="muted"></div>

@@ -6,20 +6,23 @@ import { SERIES, drawCondition, drawErrors, drawFriction, drawResidual, drawTrac
   from '/charts.js';
 import { LANGUAGES, applyStatic, getLang, onLangChange, setLang, t }
   from '/i18n.js';
+import { loadSystemConfig } from '/system_config.js';
+import '/viewer.js';
 
-const POLL_MS = 400;
+const systemConfig = await loadSystemConfig();
+const POLL_MS = systemConfig.values.ui.polling.state_ms;
 // A directory scan does not belong on the fast path; saved runs change once
 // per campaign, not four times a second.
-const RUNS_EVERY = 25;
+const RUNS_EVERY = systemConfig.values.ui.polling.runs_every;
 
 const $ = (id) => document.getElementById(id);
 const state = { snapshot: null, selected: null, frames: [], unit: 'A',
                 ticks: 0, runs: [], profile: null,
                 // The live-signal overlay: which quantity the plot shows,
                 // which joints are in it, and the frames behind it.
-                signal: 'position_deg', hidden: new Set(), trace: [],
+                signal: systemConfig.values.ui.plot.signal, hidden: new Set(), trace: [],
                 jointNames: [], cursor: 0, rate: 0, rows: [], rowKey: '',
-                lastFrameAt: 0, plot: 'normal',
+                lastFrameAt: 0, plot: systemConfig.values.ui.plot.mode,
                 // The gravity numbers a dry run was last asked to validate.
                 gravityRehearsed: '', gravitySeeded: false,
                 // The designed poses under review, and which one is pointed at.
@@ -129,8 +132,8 @@ $('obst-add').addEventListener('click', async () => {
   if (!frame) return toast(t('obst.nomodel'), 'err');
   const result = await post('/api/obstacles', {
     action: 'add',
-    obstacle: { parent_frame: frame, size_m: [0.2, 0.2, 0.2],
-                xyz_m: [0.3, 0.0, 0.1] },
+    obstacle: { parent_frame: frame, size_m: systemConfig.values.ui.obstacle.size_m,
+                xyz_m: systemConfig.values.ui.obstacle.xyz_m },
   });
   if (result.ok && result.obstacle) {
     setTimeout(() => window.__viewer.select(result.obstacle.id), 150);
@@ -286,10 +289,17 @@ function holdPoseCount() {
   return Number($('gravtest-poses').value);
 }
 
+function validHoldPoseCount(snapshot, poses) {
+  const bounds = snapshot?.control_ranges?.['gravtest-poses']
+    || systemConfig.controls['gravtest-poses'];
+  return Number.isInteger(poses) && poses >= bounds.min
+    && (bounds.max == null || poses <= bounds.max);
+}
+
 function matchingHoldPlan(snapshot) {
   const poses = holdPoseCount();
   const plan = snapshot?.hold_plan;
-  return Number.isInteger(poses) && poses >= 1 && poses <= 20
+  return validHoldPoseCount(snapshot, poses)
     && plan?.available === true && typeof plan.id === 'string'
     && plan.id.length > 0 && plan.poses === poses;
 }
@@ -397,14 +407,22 @@ function renderGravity(snapshot) {
   const speedMax = Number(snapshot.motion_speed_max_deg_s);
   for (const id of ['home-speed', 'jog-speed', 'grav-transit-speed',
     'gravtest-transit-speed']) {
-    $(id).max = String(Number.isFinite(speedMax) && speedMax >= 0.1
-      ? Math.min(60, speedMax) : 60);
+    const configuredMax = systemConfig.controls[id].max;
+    const maximum = Number.isFinite(speedMax) && speedMax > 0
+      ? Math.min(configuredMax ?? Infinity, speedMax) : configuredMax;
+    $(id).max = maximum === undefined ? '' : String(maximum);
     $(id).disabled = busy || planning;
   }
   $('btn-grav-rehearse').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-plan').disabled = busy || planning || !snapshot.have_model;
   $('btn-grav-run').disabled = busy || planning || !armed || astray.length > 0;
   const gravityTest = snapshot.gravity_test || { available: false };
+  for (const [id, bounds] of Object.entries(snapshot.control_ranges || {})) {
+    const input = $(id);
+    if (!input) continue;
+    input.min = bounds.min == null ? '' : String(bounds.min);
+    input.max = bounds.max == null ? '' : String(bounds.max);
+  }
   const gravityTestReady = snapshot.have_model && gravityTest.available;
   const holdPlanned = matchingHoldPlan(snapshot);
   $('btn-gravtest-plan').disabled = planBlocked(snapshot, GRAVITY_HOLD_TEST);
@@ -542,8 +560,8 @@ function renderWorkspace(snapshot) {
       + `<th>${t('space.high')}</th><th>${t('space.arm')}</th></tr>`
       + names.map((name, index) =>
         `<tr><td title="${name}">J${index + 1}</td>`
-        + `<td><input id="space-lo${index}" type="number" step="1"/></td>`
-        + `<td><input id="space-hi${index}" type="number" step="1"/></td>`
+        + `<td><input id="space-lo${index}" type="number" step="${systemConfig.values.ui.editor.workspace_step_deg}"/></td>`
+        + `<td><input id="space-hi${index}" type="number" step="${systemConfig.values.ui.editor.workspace_step_deg}"/></td>`
         + `<td class="arm" id="space-arm${index}"></td></tr>`).join('');
     state.spaceApplied = '';
   }
@@ -622,8 +640,7 @@ $('space-reset').addEventListener('click', async () => {
 
 async function requestPlan(mode, options) {
   if (planBlocked(state.snapshot, mode)) return;
-  if (mode === GRAVITY_HOLD_TEST
-      && (!Number.isInteger(options.poses) || options.poses < 1 || options.poses > 20)) return;
+  if (mode === GRAVITY_HOLD_TEST && !validHoldPoseCount(state.snapshot, options.poses)) return;
   state.planPending = true;
   state.snapshot.hold_plan = { available: false };
   renderGravity(state.snapshot);
@@ -1027,7 +1044,8 @@ function renderSweep(snapshot) {
 /** Fill the gravity card from the plan in force, once, before it is edited. */
 function seedGravityFields(snapshot) {
   const defaults = snapshot.gravity_defaults;
-  if (state.gravitySeeded || !defaults || !Object.keys(defaults).length) return;
+  if (state.gravitySeeded || !snapshot.have_model
+    || !defaults || !Object.keys(defaults).length) return;
   state.gravitySeeded = true;
   const set = (id, value) => {
     if (value != null && document.activeElement !== $(id)) $(id).value = value;
@@ -1090,15 +1108,15 @@ const SIGNALS = [
   { key: 'temperature_c', label: 'live.temperature', unit: '°C', digits: 1 },
   { key: 'voltage_v', label: 'live.voltage', unit: 'V', digits: 1 },
 ];
-const TELEMETRY_MS = 100;
+const TELEMETRY_MS = systemConfig.values.ui.polling.telemetry_ms;
 // A frame older than this is not a slow reading, it is a stopped feed. Leaving
 // the last one on screen is worse than showing nothing: a frozen number looks
 // exactly like a live one.
-const TELEMETRY_STALE_MS = 1500;
+const TELEMETRY_STALE_MS = systemConfig.values.ui.telemetry.stale_ms;
 // Deep enough to hold a few seconds at the rate a real arm publishes.
-const TRACE_DEPTH = 1600;
+const TRACE_DEPTH = systemConfig.values.ui.telemetry.trace_depth;
 // Plot heights per mode; 'big' is a ceiling, not a promise.
-const PLOT_HEIGHT = { normal: 200, big: 460 };
+const PLOT_HEIGHT = systemConfig.values.ui.plot.height;
 
 /** The signals this robot actually publishes.
  *
@@ -1332,7 +1350,7 @@ function buildJogRows(names, limits) {
   $('jog-sliders').innerHTML = names.map((name, index) =>
     `<div class="jogrow"><span class="name" title="${name}">${name}</span>`
     + `<input type="range" data-joint="${index}" disabled`
-    + ` min="${limits[index][0]}" max="${limits[index][1]}" step="0.1" value="0"/>`
+    + ` min="${limits[index][0]}" max="${limits[index][1]}" step="${systemConfig.values.ui.editor.jog_step_deg}" value="0"/>`
     + `<span class="val" data-readout="${index}">0.0\u00b0</span></div>`).join('');
   jog.rows = [...$('jog-sliders').children].map((row) => ({
     slider: row.querySelector('input'),
@@ -1679,3 +1697,4 @@ setInterval(poll, POLL_MS);
 poll();
 setInterval(pollTelemetry, TELEMETRY_MS);
 pollTelemetry();
+document.body.inert = false;

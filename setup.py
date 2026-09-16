@@ -22,6 +22,7 @@ setup(
     ],
     package_data={
         package_name: [
+            "config/*.yaml",
             "profiles/*.yaml",
             "profiles/templates/*.yaml",
             "dashboard/static/*.html",

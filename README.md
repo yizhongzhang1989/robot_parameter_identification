@@ -4,6 +4,110 @@
 
 它下发一段设计好的激励轨迹，把实测力矩（或电流）对刚体回归矩阵做回归，从而辨识刚体惯性参数与关节摩擦模型。模块自带一个 Web 面板，包含实时 3D 视图，以及一个可编辑的障碍物场景，供碰撞筛查使用。
 
+## 系统默认配置
+
+系统默认值集中在 [system_config.yaml](robot_parameter_identification/config/system_config.yaml)，
+包含 ROS 连接与输出路径、dashboard 操作默认值、完整辨识/负载扫描计划、预演参数、
+刷新频率和视图选项。修改选中的配置文件后重启面板即可生效，不需要修改 Python 或 JavaScript。
+
+默认启动读取 `$XDG_CONFIG_HOME/robot_parameter_identification/system_config.yaml`；
+未设置 `XDG_CONFIG_HOME` 时使用 `~/.config/robot_parameter_identification/system_config.yaml`。
+首次启动缺少该文件时，自动创建父目录并从包内完整模板生成它。已有文件不会被覆盖；
+格式、类型、未知字段或安全范围错误会阻止启动，不会静默恢复为出厂值。
+
+切换不同场合的配置：
+
+```bash
+ros2 launch robot_parameter_identification dashboard.launch.py \
+  system_config:=/absolute/path/to/system_config.yaml \
+  controller:=right_arm_joint_trajectory_controller
+```
+
+指定的文件不存在时，同样自动生成。直接运行节点也支持：
+
+```bash
+ros2 run robot_parameter_identification dashboard --ros-args \
+  -p system_config:=/absolute/path/to/system_config.yaml
+```
+
+例如，以下部分配置覆盖默认输出目录和拖动超限速度，未列出的字段继承包内模板：
+
+```yaml
+schema_version: 1
+ros:
+  controller: right_arm_joint_trajectory_controller
+  output_directory: /absolute/path/to/results
+  config_file_path: /absolute/path/to/cell.json
+dashboard:
+  drag_test:
+    maximum_speed_deg_s: 80.0
+```
+
+- 启动参数优先级：显式 ROS/launch 参数 > 选中的 `system_config` > 包内模板。
+- 面板操作参数优先级：本次输入 > `config_file_path` 中已保存的实验设置 > 系统默认值。
+- `system_config` 是只读的系统默认配置；`config_file_path` 仍是可自动保存的场景、工作空间和重力实验 JSON，二者不能指向同一文件。
+- 模板里的 `ros.config_file_path` 默认仍为空，不会改变原有实验设置的保存行为。
+- 所有相对路径仍按启动目录解析，不相对于 YAML 文件；不同机器部署建议使用绝对路径。
+- `controls` 的 `source` 引用实际配置值，浏览器和后端从同一来源取值。已打开页面中的后续用户输入不会被轮询覆盖。
+- `campaign.derive_speed_ladders: true` 保留原有自动速度阶梯；设为 `false` 才直接采用配置中的摩擦/验证速度列表，仍受机器人速度上限约束。
+- 软件允许范围统一由 `ranges` 提供，文件值优先于原代码中的范围；机器人 profile/URDF 与底层硬件保护独立生效。
+- `GET /api/system-config` 可只读检查选中的路径及启动覆盖后的值；运行报告的 provenance 会记录配置快照。
+
+### 配置参数范围
+
+修改 `ranges` 下的 `min`/`max` 即可同时改变面板允许输入和后端的软件校验范围。
+`max: null` 表示不增加软件上限，不表示绕过机器人限制；数值仍须有限、类型正确。
+例如下列配置替换原有 60 度/秒、20 个姿态和 10 秒的软件范围：
+
+```yaml
+ranges:
+  motion:
+    transit_speed_deg_s: {min: 0.1, max: 80.0}
+  hold_test:
+    poses: {min: 1, max: 24}
+    seconds: {min: 0.5, max: 15.0}
+  campaign:
+    static_poses: {min: 4, max: 80}
+profile_derivation:
+  maximum_default_speed_deg_s: 60.0
+  default_speed_fraction: 0.5
+```
+
+这只是配置方法示例，不代表当前硬件已验证适合这些数值。调整范围后，相关默认值也应落在范围内。
+配置读入时会拒绝逆序范围、非有限端点、非法整数范围及与面板默认值冲突的设置。
+
+| 位置 | 作用 |
+|---|---|
+| `ranges.motion` | 回零、点动及姿态间转移速度 |
+| `ranges.gravity` | 独立重力标定的探测速度 |
+| `ranges.hold_test` | 保持姿态数、时长、偏移、温度及保持超速阈值 |
+| `ranges.drag_test` | 拖动超速及温度停止阈值 |
+| `ranges.campaign` | 姿态数、候选数、采样率、傅里叶参数、摩擦等全部数值实验计划范围 |
+| `ranges.load_sweep` | 负载档位、速度、重复数、搜索数量、重试等扫描参数范围 |
+| `profile_derivation` | 自动档案中原来的 20 度/秒封顶、额定速度比例和位置比例 |
+| `planning.acceleration_per_speed_s_inv` | 从机器人持续速度推导加速度上限的系数 |
+| `dashboard.hold_test` | 默认保持参数、到位容差、规划后漂移容差、等待超时等 |
+| `runtime`、`rehearsal` | 场景漂移、采样/显示过滤和预演验收等已有可配置阈值 |
+
+`controls.*.range` 引用上述范围，`source` 只引用默认值，不再重复定义 `min/max`。
+旧文件的 `controls.*.min/max` 会在读取时迁移到相应范围，不改写原文件；显式 `ranges` 优先。
+多个旧控件对同一范围给出不同的非默认端点时会报错，需在 `ranges` 中明确唯一值。
+
+转移速度的有效上限为 `min(ranges.motion.transit_speed_deg_s.max, profile.sustained_speed_deg_s)`。
+因此只修改面板默认速度不会修改允许范围；若上限仍是自动档案的 20，需调整 `profile_derivation`。
+派生比例不得超过 URDF 给出的额定能力，显式机器人档案则继续作为独立约束。
+`GET /api/system-config` 的 `controls` 返回配置范围，`control_ranges` 返回结合档案后的有效范围，
+`constraints` 说明档案来源；主状态轮询也同步有效范围，后续用户输入不会被自动改值。
+
+保持/拖动的每次运行目录会保存独立的 `system_config.yaml` 快照，并通过 `--system-config` 传给
+`rm_control hold_check` / `manual_drag`，两端使用同一组范围。子程序缺少指定快照时会拒绝启动。
+单独运行旧工具、不传该参数时保留原 CLI 默认行为，历史 `tools/` 入口不自动采用 dashboard 配置。
+因此部署本改动需要同时更新辨识包和 `rm_control` 的 Python 入口；不要把新面板与不支持该参数的旧入口混用。
+
+本改动不修改硬件插件限流、实际限速、停流确认或急停约束。例如当前共享硬件接口的电流模式
+仍有独立的 120 度/秒限速；更改软件阈值不等于提高了硬件允许值。端口范围、关节数量、单位、
+有限数值及正时长/正尺寸等协议或数学约束也不会因配置范围变化而被跳过。
+
 ## 快速开始
 
 以本机 RM75 双臂为例，按**第一次接一台臂**来写：此刻没有任何配置文件，也不需要有。

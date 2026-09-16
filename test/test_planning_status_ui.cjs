@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { systemConfigFixture } = require('./system_config_fixture.cjs');
 
 const source = fs.readFileSync(path.join(__dirname,
   '../robot_parameter_identification/dashboard/static/dashboard.js'), 'utf8');
@@ -16,6 +17,7 @@ const element = (id) => {
 const state = { localEvents: [] };
 const context = vm.createContext({
   state, window: {}, $: element, t: (key) => key,
+  systemConfig: systemConfigFixture(),
   gravityArmed: () => false,
   gravityOptions: () => ({ static_poses: 5, gravity_validation_poses: 2,
     gravity_probe_speeds_deg_s: [1, 3] }),

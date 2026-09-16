@@ -16,34 +16,38 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { ColladaLoader } from 'three/addons/loaders/ColladaLoader.js';
 import { t } from '/i18n.js';
+import { loadSystemConfig } from '/system_config.js';
 
-const POLL_MS = 100;
-const SMOOTH_TAU = 0.06;
+const systemConfig = await loadSystemConfig();
+const sceneConfig = systemConfig.values.ui.scene;
+const POLL_MS = systemConfig.values.ui.polling.viewer_ms;
+const SMOOTH_TAU = sceneConfig.smoothing_tau_s;
 
 const host = document.getElementById('viewer');
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d11);
 
-const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
-camera.position.set(1.1, -1.1, 0.9);
+const camera = new THREE.PerspectiveCamera(sceneConfig.camera_fov_deg, 1, 0.01, 100);
+camera.position.set(...sceneConfig.camera_position_m);
 camera.up.set(0, 0, 1);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, sceneConfig.pixel_ratio_max));
 host.appendChild(renderer.domElement);
 
 const orbit = new OrbitControls(camera, renderer.domElement);
-orbit.target.set(0, 0, 0.35);
-orbit.enableDamping = true;
+orbit.target.set(...sceneConfig.camera_target_m);
+orbit.enableDamping = sceneConfig.orbit_damping;
 
 scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x202430, 2.0));
 const key = new THREE.DirectionalLight(0xffffff, 1.6);
 key.position.set(2, -2, 3);
 scene.add(key);
-const grid = new THREE.GridHelper(3, 30, 0x2a3140, 0x1a1f28);
+const grid = new THREE.GridHelper(sceneConfig.grid_size_m, sceneConfig.grid_divisions,
+  0x2a3140, 0x1a1f28);
 grid.rotation.x = Math.PI / 2;
 scene.add(grid);
-scene.add(new THREE.AxesHelper(0.25));
+scene.add(new THREE.AxesHelper(sceneConfig.axes_size_m));
 
 const linkGroup = new THREE.Group();
 const frameGroup = new THREE.Group();
@@ -78,11 +82,11 @@ const state = {
   serverFocus: false,
   obstacles: [],
   selected: null,
-  showMesh: true,
-  showFrames: false,
-  showLabels: false,
-  showGhost: true,
-  showGravity: false,
+  showMesh: document.getElementById('show-mesh').checked,
+  showFrames: document.getElementById('show-frames').checked,
+  showLabels: document.getElementById('show-labels').checked,
+  showGhost: document.getElementById('show-ghost').checked,
+  showGravity: document.getElementById('show-gravity').checked,
   meshCache: new Map(),
   modelReady: false,
   modelFramed: false,
@@ -577,10 +581,10 @@ function highlightPose(phase, index, completed = state.completedPoses) {
  */
 
 const FLY_COLOR = 0xff9f43;
-const FLY_TOUR_MS = 8000;      // about how long one lap takes to watch
-const FLY_MIN_MS = 110;        // floor, so a long tour is quick but not a blur
-const FLY_MAX_MS = 420;        // ceiling, so a short tour is not a crawl
-const FLY_FRAME_MS = 16;       // one sample per display frame, no more
+const FLY_TOUR_MS = sceneConfig.tour.duration_ms;
+const FLY_MIN_MS = sceneConfig.tour.min_segment_ms;
+const FLY_MAX_MS = sceneConfig.tour.max_segment_ms;
+const FLY_FRAME_MS = sceneConfig.tour.frame_ms;
 
 function buildFlier() {
   if (state.flierNodes.size || !state.linkNodes.size) return;

@@ -33,6 +33,8 @@ from . import excitation, identification as ident
 from .interfaces import DriveLimitExceeded, MotionFailed, MotionPaused
 from .model import ModelComponents
 from .profile import RobotProfile
+from .system_config import (
+    configured_range, plan_defaults, system_default, system_defaults)
 
 PHASE_GRAVITY = "A_gravity"
 PHASE_FRICTION = "B_friction"
@@ -43,7 +45,7 @@ PHASE_VALIDATION = "D_validation"
 # between 0.28 and 1.37 deg/s depending on the joint, so the grid brackets that
 # generously rather than asserting one figure for the whole arm.
 COULOMB_TRANSITION_SEARCH = tuple(
-    round(float(w), 4) for w in np.geomspace(0.08, 6.0, 25))
+    system_default("campaign", "coulomb_transition_search"))
 STRIBECK_SPEED_SEARCH = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 PHASES = (PHASE_GRAVITY, PHASE_FRICTION, PHASE_INERTIA, PHASE_VALIDATION)
 
@@ -296,93 +298,115 @@ class Observation:
 class CampaignPlan:
     """Everything the operator can choose before the arm moves."""
 
-    static_poses: int = 24
-    static_candidates: int = 200
-    settle_samples: int = 3
-    friction_amplitude_deg: float = 20.0
-    friction_speeds_deg_s: tuple[float, ...] = (2.0, 5.0, 8.0)
+    static_poses: int = system_default("campaign", "static_poses")
+    static_candidates: int = system_default("campaign", "static_candidates")
+    settle_samples: int = system_default("campaign", "settle_samples")
+    friction_amplitude_deg: float = system_default(
+        "campaign", "friction_amplitude_deg")
+    friction_speeds_deg_s: tuple[float, ...] = tuple(
+        system_default("campaign", "friction_speeds_deg_s"))
     # Passes per speed and direction. One pass gives no way to notice that a
     # pass went wrong; three disagree visibly when one does.
-    friction_repeats: int = 3
+    friction_repeats: int = system_default("campaign", "friction_repeats")
     # Postures each joint is swept at. Its gravity load depends on where the
     # other joints are, so one posture measures friction under one load: joint
     # one of this arm sees 0.17 Nm at home and 4.5 Nm with the arm extended.
-    friction_postures: int = 3
-    fourier_harmonics: int = 4
-    fourier_base_frequency_hz: float = 0.08
-    fourier_duration_s: float = 30.0
-    fourier_ramp_s: float = 4.0
-    fourier_attempts: int = 40
+    friction_postures: int = system_default("campaign", "friction_postures")
+    fourier_harmonics: int = system_default("campaign", "fourier_harmonics")
+    fourier_base_frequency_hz: float = system_default(
+        "campaign", "fourier_base_frequency_hz")
+    fourier_duration_s: float = system_default("campaign", "fourier_duration_s")
+    fourier_ramp_s: float = system_default("campaign", "fourier_ramp_s")
+    fourier_attempts: int = system_default("campaign", "fourier_attempts")
     # The dedicated optimal-excitation campaign replaces the single inertia
     # trajectory with a sequence selected against the cumulative regressor.
     # Validation uses separately seeded trajectories and never enters the fit.
-    optimal_training_trajectories: int = 12
-    optimal_validation_trajectories: int = 3
-    optimal_fourier_amplitude_fraction: float = 0.20
+    optimal_training_trajectories: int = system_default(
+        "campaign", "optimal_training_trajectories")
+    optimal_validation_trajectories: int = system_default(
+        "campaign", "optimal_validation_trajectories")
+    optimal_fourier_amplitude_fraction: float = system_default(
+        "campaign", "optimal_fourier_amplitude_fraction")
     # Fourier reversals contain low-speed points, but they are accelerating
     # transients rather than the steady windows a Stribeck curve assumes.
-    optimal_friction_speeds_deg_s: tuple[float, ...] = (
-        0.05, 0.1, 0.2, 0.5, 1.0, 2.0)
-    optimal_friction_repeats: int = 2
-    optimal_friction_postures: int = 3
-    sample_rate_hz: float = 20.0
-    validation_poses: int = 12
-    validation_speeds_deg_s: tuple[float, ...] = (3.5, 6.5)
-    validation_trajectory_s: float = 12.0
-    maximum_speed_deg_s: float = 10.0
-    transit_speed_deg_s: float = 10.0
-    maximum_acceleration_deg_s2: float = 20.0
-    position_margin_deg: float = 5.0
-    temperature_ceiling_c: float = 45.0
-    workspace_limit_deg: tuple[float, ...] = ()
+    optimal_friction_speeds_deg_s: tuple[float, ...] = tuple(
+        system_default("campaign", "optimal_friction_speeds_deg_s"))
+    optimal_friction_repeats: int = system_default(
+        "campaign", "optimal_friction_repeats")
+    optimal_friction_postures: int = system_default(
+        "campaign", "optimal_friction_postures")
+    sample_rate_hz: float = system_default("campaign", "sample_rate_hz")
+    validation_poses: int = system_default("campaign", "validation_poses")
+    validation_speeds_deg_s: tuple[float, ...] = tuple(
+        system_default("campaign", "validation_speeds_deg_s"))
+    validation_trajectory_s: float = system_default(
+        "campaign", "validation_trajectory_s")
+    maximum_speed_deg_s: float = system_default("campaign", "maximum_speed_deg_s")
+    transit_speed_deg_s: float = system_default("campaign", "transit_speed_deg_s")
+    maximum_acceleration_deg_s2: float = system_default(
+        "campaign", "maximum_acceleration_deg_s2")
+    position_margin_deg: float = system_default("campaign", "position_margin_deg")
+    temperature_ceiling_c: float = system_default(
+        "campaign", "temperature_ceiling_c")
+    workspace_limit_deg: tuple[float, ...] = tuple(
+        system_default("campaign", "workspace_limit_deg"))
     # Where each joint may go, low and high. A cell is not symmetric: an arm
     # mounted at an angle meets the bench swinging one way and nothing the
     # other, so one +/- number cannot describe it. Wins over the symmetric
     # cap above when both are set.
-    workspace_range_deg: tuple[tuple[float, float], ...] = ()
-    gravity_probe_deg: float = 5.0
-    gravity_probe_speed_deg_s: float = 2.0
+    workspace_range_deg: tuple[tuple[float, float], ...] = tuple(
+        tuple(bounds) for bounds in system_default("campaign", "workspace_range_deg"))
+    gravity_probe_deg: float = system_default("campaign", "gravity_probe_deg")
+    gravity_probe_speed_deg_s: float = system_default(
+        "campaign", "gravity_probe_speed_deg_s")
     # Two speeds rather than one. The difference between the pair-averaged
     # currents at two speeds IS the viscous term, so a gravity run measures it
     # instead of assuming the probe was slow enough to ignore it. Empty falls
     # back to the single speed above, which is what the four-phase campaign
     # has always used.
-    gravity_probe_speeds_deg_s: tuple[float, ...] = ()
+    gravity_probe_speeds_deg_s: tuple[float, ...] = tuple(
+        system_default("campaign", "gravity_probe_speeds_deg_s"))
     # Poses held back from a gravity run, crossed exactly the way training was.
-    gravity_validation_poses: int = 8
+    gravity_validation_poses: int = system_default(
+        "campaign", "gravity_validation_poses")
     # Width of the Coulomb reversal. Measured on run #5 data: sweeping this
     # from a hard sign() to 1.8 deg/s cuts worst-joint validation error 11%
     # and the gain survives the non-negativity constraint, unlike Stribeck.
-    coulomb_transition_deg_s: float = 1.8
+    coulomb_transition_deg_s: float = system_default(
+        "campaign", "coulomb_transition_deg_s")
     # Offered to each joint's fit instead of asserting one width for the arm.
-    coulomb_transition_search: tuple[float, ...] = COULOMB_TRANSITION_SEARCH
+    coulomb_transition_search: tuple[float, ...] = tuple(
+        system_default("campaign", "coulomb_transition_search"))
     # Superseded by coulomb_transition_deg_s, which buys the same curvature
     # with one non-negative column instead of a cancelling pair. Left available
     # because a different transmission may genuinely show static > dynamic.
-    stribeck: bool = False
+    stribeck: bool = system_default("campaign", "stribeck")
     # Offered to every joint; each one's data decides. On this arm three of
     # seven take it and the rest are better without.
-    stribeck_search: bool = True
-    stribeck_speed_deg_s: float = 1.6
-    stribeck_speed_search: tuple[float, ...] = ()
-    load_friction: bool = False
+    stribeck_search: bool = system_default("campaign", "stribeck_search")
+    stribeck_speed_deg_s: float = system_default("campaign", "stribeck_speed_deg_s")
+    stribeck_speed_search: tuple[float, ...] = tuple(
+        system_default("campaign", "stribeck_speed_search"))
+    load_friction: bool = system_default("campaign", "load_friction")
     # Offered to every joint and decided per joint. Measured on three postures
     # per joint it is worth twenty-nine per cent of the validation error on the
     # heaviest and nothing on the wrist, which carries no load in any pose.
-    load_friction_search: bool = True
-    load_stribeck: bool = False
-    load_stribeck_search: bool = False
+    load_friction_search: bool = system_default("campaign", "load_friction_search")
+    load_stribeck: bool = system_default("campaign", "load_stribeck")
+    load_stribeck_search: bool = system_default("campaign", "load_stribeck_search")
     # Motions the arm may refuse before the run is called off. A few gaps in a
     # ladder of thousands cost almost nothing; an arm refusing everything is
     # not producing a dataset and should not be left running for hours.
-    skip_budget: int = 40
+    skip_budget: int = system_default("campaign", "skip_budget")
     # Where the arm is standing when the run begins. The first transit of a
     # tour is screened from here and it is the longest one, so a design that
     # assumes neutral and an arm that is not there is an unscreened swing.
     # Empty means neutral, which is what every campaign but gravity designs
     # from.
-    start_deg: tuple = ()
-    seed: int = 0
+    start_deg: tuple = tuple(system_default("campaign", "start_deg"))
+    seed: int = system_default("campaign", "seed")
+    derive_speed_ladders: bool = system_default(
+        "campaign", "derive_speed_ladders")
 
     def design_limits(self, arm: ident.ArmModel,
                       plant_limits: tuple[np.ndarray, np.ndarray] | None = None,
@@ -555,9 +579,9 @@ class DriveTrip(Abort):
 
 # Phases A to C are position controlled, so the speed that matters is the
 # profile's sustained limit rather than any current-mode figure. The
-# acceleration bound is that same ceiling reached from rest in a quarter second.
+# acceleration bound follows the configured planning coefficient.
 PROBE_SPEED_FRACTION = 0.5
-ACCELERATION_PER_SPEED = 4.0
+ACCELERATION_PER_SPEED = system_default("planning", "acceleration_per_speed_s_inv")
 
 # How much of its swing a joint gives up after a trip, and how many times one
 # motion may be re-planned before the run moves on without it.
@@ -600,39 +624,41 @@ FRICTION_CRAWL_CRUISE_S = 24.0
 # speed left in the middle to measure. Amplitude is sized from this.
 SWEEP_ACCELERATION_DEG_S2 = 360.0
 
-_STATIC_BOUNDS = {
-    "static_poses": (4, 60),
-    "static_candidates": (10, 400),
-    "settle_samples": (1, 20),
-    "friction_amplitude_deg": (5.0, 80.0),
-    "fourier_harmonics": (1, 6),
-    "fourier_base_frequency_hz": (0.02, 0.3),
-    "fourier_duration_s": (5.0, 120.0),
-    "fourier_ramp_s": (0.0, 10.0),
-    "fourier_attempts": (5, 200),
-    "optimal_training_trajectories": (2, 32),
-    "optimal_validation_trajectories": (1, 8),
-    "optimal_friction_repeats": (1, 5),
-    "optimal_friction_postures": (1, 5),
-    "sample_rate_hz": (5.0, 100.0),
-    "validation_poses": (3, 40),
-    "validation_trajectory_s": (4.0, 60.0),
-    "position_margin_deg": (3.0, 30.0),
-    "gravity_probe_deg": (1.0, 20.0),
-    "gravity_validation_poses": (2, 30),
-}
 
-
-def campaign_bounds(profile: RobotProfile) -> dict:
+def campaign_bounds(
+    profile: RobotProfile, *, system_config: dict | None = None,
+) -> dict:
     """Operator-settable ranges, capped by this arm's envelope."""
-    speed = profile.sustained_speed_deg_s
-    return {
-        **_STATIC_BOUNDS,
-        "maximum_speed_deg_s": (1.0, speed),
-        "transit_speed_deg_s": (0.1, min(60.0, speed)),
-        "maximum_acceleration_deg_s2": (2.0, ACCELERATION_PER_SPEED * speed),
-        "temperature_ceiling_c": (30.0, profile.temperature_c),
+    values = system_defaults() if system_config is None else system_config
+    bounds = {
+        name: configured_range(values, f"campaign.{name}")
+        for name in values["ranges"]["campaign"]
     }
+    bounds["transit_speed_deg_s"] = configured_range(
+        values, "motion.transit_speed_deg_s")
+    speed = profile.sustained_speed_deg_s
+    ceilings = {
+        "maximum_speed_deg_s": speed,
+        "transit_speed_deg_s": speed,
+        "gravity_probe_speed_deg_s": speed,
+        "maximum_acceleration_deg_s2": (
+            values["planning"]["acceleration_per_speed_s_inv"] * speed),
+        "temperature_ceiling_c": profile.temperature_c,
+    }
+    for name, (low, high) in bounds.items():
+        if low > high:
+            raise ValueError(
+                f"system_config range for {name} is inverted: [{low:g}, {high:g}]")
+        if name == "position_margin_deg":
+            low = max(low, profile.position_margin_deg)
+        if name in ceilings:
+            high = min(high, ceilings[name])
+        if low > high:
+            raise ValueError(
+                f"system_config range for {name} has no overlap with the "
+                f"robot profile: [{low:g}, {high:g}]")
+        bounds[name] = (low, high)
+    return bounds
 
 
 _INTEGER_FIELDS = frozenset({
@@ -640,7 +666,7 @@ _INTEGER_FIELDS = frozenset({
     "fourier_attempts", "optimal_training_trajectories",
     "optimal_validation_trajectories", "optimal_friction_repeats",
     "optimal_friction_postures", "validation_poses",
-    "gravity_validation_poses", "seed",
+    "gravity_validation_poses", "friction_repeats", "friction_postures", "skip_budget", "seed",
 })
 
 
@@ -716,46 +742,81 @@ def pass_amplitude_deg(speed_deg_s: float, ceiling_deg: float) -> float:
                      ramps + speed * friction_cruise_s(speed)))
 
 
-def sweep_amplitude_deg(maximum_speed_deg_s: float, requested: float) -> float:
+def sweep_amplitude_deg(
+    maximum_speed_deg_s: float, requested: float, *,
+    system_config: dict | None = None,
+) -> float:
     """Room the fastest pass needs; slower passes take less of it."""
-    low, high = _STATIC_BOUNDS["friction_amplitude_deg"]
+    values = system_defaults() if system_config is None else system_config
+    low, high = configured_range(values, "campaign.friction_amplitude_deg")
+    if low > high:
+        raise ValueError(
+            "system_config range for friction_amplitude_deg is inverted: "
+            f"[{low:g}, {high:g}]")
     needed = pass_amplitude_deg(maximum_speed_deg_s, high)
     return float(min(max(requested, needed, low), high))
 
 
-def default_plan(profile: RobotProfile) -> CampaignPlan:
+def default_plan(
+    profile: RobotProfile, defaults: dict | None = None, *,
+    system_config: dict | None = None,
+) -> CampaignPlan:
     """A plan that already respects this arm's envelope."""
-    plan = CampaignPlan()
-    plan.temperature_ceiling_c = min(
-        plan.temperature_ceiling_c, profile.temperature_c)
-    plan.maximum_speed_deg_s = min(
-        plan.maximum_speed_deg_s, profile.sustained_speed_deg_s)
-    plan.maximum_acceleration_deg_s2 = min(
-        plan.maximum_acceleration_deg_s2,
-        ACCELERATION_PER_SPEED * profile.sustained_speed_deg_s)
-    plan.position_margin_deg = max(
-        plan.position_margin_deg, profile.position_margin_deg)
-    plan.workspace_limit_deg = tuple(profile.workspace_limit_deg)
-    _follow_speed(plan)
+    values = system_defaults() if system_config is None else system_config
+    configured = dict(values["campaign"])
+    if defaults is not None:
+        configured.update(defaults)
+    plan = CampaignPlan(**plan_defaults(configured))
+    for name, (low, high) in campaign_bounds(
+            profile, system_config=values).items():
+        value = getattr(plan, name)
+        if isinstance(value, bool) or not math.isfinite(value):
+            raise ValueError(f"system_config campaign default {name} must be finite")
+        bounded = min(max(value, low), high)
+        setattr(plan, name, int(bounded) if name in _INTEGER_FIELDS else bounded)
+    if not plan.workspace_limit_deg:
+        plan.workspace_limit_deg = tuple(profile.workspace_limit_deg)
+    elif profile.workspace_limit_deg:
+        plan.workspace_limit_deg = tuple(
+            min(abs(configured), abs(limit))
+            for configured, limit in zip(
+                plan.workspace_limit_deg, profile.workspace_limit_deg,
+                strict=True))
+    _follow_speed(plan, system_config=values)
     return plan
 
 
-def _follow_speed(plan: CampaignPlan) -> None:
-    """Re-derive everything that only means something relative to the ceiling."""
-    plan.friction_speeds_deg_s = friction_speed_ladder(plan.maximum_speed_deg_s)
-    plan.validation_speeds_deg_s = sweep_speeds(
-        plan.maximum_speed_deg_s, VALIDATION_SPEED_FRACTIONS)
+def _follow_speed(
+    plan: CampaignPlan, *, system_config: dict | None = None,
+) -> None:
+    """Derive or bound speed ladders, and size travel for the ceiling."""
+    if plan.derive_speed_ladders:
+        plan.friction_speeds_deg_s = friction_speed_ladder(plan.maximum_speed_deg_s)
+        plan.validation_speeds_deg_s = sweep_speeds(
+            plan.maximum_speed_deg_s, VALIDATION_SPEED_FRACTIONS)
+    else:
+        ceiling = float(plan.maximum_speed_deg_s)
+        if not math.isfinite(ceiling) or ceiling <= 0.0:
+            raise ValueError("maximum_speed_deg_s must be finite and positive")
+        for name in ("friction_speeds_deg_s", "validation_speeds_deg_s"):
+            speeds = (float(value) for value in getattr(plan, name))
+            kept = tuple(speed for speed in speeds if 0.0 < speed <= ceiling)
+            setattr(plan, name, kept or (
+                min(FRICTION_MINIMUM_SPEED_DEG_S, ceiling),))
     plan.friction_amplitude_deg = sweep_amplitude_deg(
-        plan.maximum_speed_deg_s, plan.friction_amplitude_deg)
+        plan.maximum_speed_deg_s, plan.friction_amplitude_deg,
+        system_config=system_config)
 
 
 def clamp_campaign_plan(
-    request: dict | None, profile: RobotProfile,
+    request: dict | None, profile: RobotProfile, defaults: dict | None = None,
+    *, system_config: dict | None = None,
 ) -> tuple[CampaignPlan, list[str]]:
     """Build a plan from a dashboard payload, reporting every clamped field."""
+    values = system_defaults() if system_config is None else system_config
     payload = request or {}
-    plan = default_plan(profile)
-    bounds = campaign_bounds(profile)
+    plan = default_plan(profile, defaults=defaults, system_config=values)
+    bounds = campaign_bounds(profile, system_config=values)
     notes: list[str] = []
 
     for name, (low, high) in bounds.items():
@@ -776,11 +837,19 @@ def clamp_campaign_plan(
 
     if "maximum_speed_deg_s" in payload:
         # Otherwise a raised ceiling leaves the sweep running at the old speeds.
-        _follow_speed(plan)
+        if not plan.derive_speed_ladders:
+            configured = dict(values["campaign"])
+            if defaults is not None:
+                configured.update(defaults)
+            configured = plan_defaults(configured)
+            plan.friction_speeds_deg_s = configured["friction_speeds_deg_s"]
+            plan.validation_speeds_deg_s = configured["validation_speeds_deg_s"]
+        _follow_speed(plan, system_config=values)
         if "maximum_acceleration_deg_s2" not in payload:
+            low, high = bounds["maximum_acceleration_deg_s2"]
             plan.maximum_acceleration_deg_s2 = min(
-                ACCELERATION_PER_SPEED * plan.maximum_speed_deg_s,
-                bounds["maximum_acceleration_deg_s2"][1])
+                max(values["planning"]["acceleration_per_speed_s_inv"]
+                    * plan.maximum_speed_deg_s, low), high)
 
     speeds = payload.get("friction_speeds_deg_s")
     if speeds is not None:

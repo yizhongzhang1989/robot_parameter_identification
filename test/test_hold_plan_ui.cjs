@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { systemConfigFixture } = require('./system_config_fixture.cjs');
 
 const staticPath = path.join(__dirname,
   '../robot_parameter_identification/dashboard/static');
@@ -34,6 +35,7 @@ const ready = () => ({
 });
 const context = vm.createContext({
   $: element,
+  systemConfig: systemConfigFixture(),
   state: { snapshot: ready(), plannedPoses: [], previewToken: 7, poseAt: 0 },
   window: {
     confirm: () => { confirmations += 1; return true; },
@@ -265,6 +267,37 @@ async function main() {
   await click('btn-gravtest-plan');
   assert.equal(element('btn-gravtest-plan').disabled, false);
   assert.ok(events.some(([message, level]) => message.includes('offline') && level === 'error'));
+
+  requests.length = 0;
+  context.state.snapshot = {
+    ...ready(), hold_plan: { available: false },
+    control_ranges: {
+      'gravtest-poses': { min: 2, max: 24 },
+      'gravtest-hold-seconds': { min: 1, max: 15 },
+    },
+  };
+  context.post = async (route, body) => {
+    requests.push(JSON.parse(JSON.stringify({ route, body })));
+    return { ok: true, hold_plan: { available: true, id: 'configured-21', poses: 21 } };
+  };
+  editCount('21');
+  element('gravtest-hold-seconds').value = '12';
+  await click('btn-gravtest-plan');
+  assert.equal(requests.pop().body.options.poses, 21);
+  assert.equal(element('btn-gravtest-hold').disabled, false);
+  assert.equal(element('gravtest-poses').max, '24');
+  assert.equal(element('gravtest-hold-seconds').max, '15');
+  await click('btn-gravtest-hold');
+  assert.deepEqual(requests.pop().body.options, {
+    poses: 21, seconds: 12, transit_speed_deg_s: 5, plan_id: 'configured-21',
+    acknowledgement: 'I_AM_HOLDING_ARM_AND_ESTOP_READY',
+  });
+  for (const count of ['1', '25', '21.5']) {
+    editCount(count);
+    assert.equal(element('btn-gravtest-hold').disabled, true);
+    await click('btn-gravtest-plan');
+    assert.equal(requests.length, 0);
+  }
 
   const html = fs.readFileSync(path.join(staticPath, 'index.html'), 'utf8');
   assert.match(html, /id="btn-gravtest-plan" disabled\s+data-i18n="gravtest.plan"/);
