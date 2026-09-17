@@ -239,20 +239,46 @@ class ArmModel:
         return poses
 
     def skeleton(self, q_deg) -> list[list[float]]:
-        """Joint origins then the last frame, as a polyline in the root frame.
+        """A single selected chain; branched controllers use skeleton_paths."""
+        paths = self.skeleton_paths(q_deg)
+        if len(paths) != 1:
+            raise ValueError("selected controller has multiple skeleton paths")
+        return paths[0]
 
-        Enough to see where a planned pose puts the arm without shipping every
-        link's full pose for every pose in a plan.
-        """
+    def skeleton_paths(self, q_deg) -> list[list[list[float]]]:
+        """Root-to-tip polylines of the controller's retained joint tree."""
         q = np.radians(np.asarray(q_deg, dtype=float))
         pin.forwardKinematics(self.model, self.data, q)
         pin.updateFramePlacements(self.model, self.data)
-        points = [self.data.oMi[index].translation.tolist()
-                  for index in range(1, self.model.njoints)]
-        if len(self.model.frames):
-            points.append(
-                self.data.oMf[len(self.model.frames) - 1].translation.tolist())
-        return points
+        parents = self.model.parents
+        terminals = set(range(1, self.model.njoints)).difference(parents)
+        paths = []
+        for terminal in sorted(terminals):
+            chain = []
+            joint = terminal
+            while joint:
+                chain.append(self.data.oMi[joint].translation.tolist())
+                joint = parents[joint]
+            chain.reverse()
+            joint_frame = self.model.getFrameId(self.model.names[terminal], pin.FrameType.JOINT)
+            attached = {}
+            for index, frame in enumerate(self.model.frames):
+                if frame.type != pin.FrameType.BODY or frame.parentJoint != terminal:
+                    continue
+                ancestors = set()
+                cursor = index
+                while cursor and cursor != joint_frame and cursor not in ancestors:
+                    ancestors.add(cursor)
+                    cursor = self.model.frames[cursor].parentFrame
+                if cursor == joint_frame:
+                    attached[index] = ancestors - {index}
+            nonterminal_frames = set().union(*attached.values())
+            tips = sorted(set(attached).difference(nonterminal_frames))
+            for tip in tips:
+                paths.append(chain + [self.data.oMf[tip].translation.tolist()])
+            if not tips:
+                paths.append(chain)
+        return paths
 
 
 def friction_row(velocity_deg_s: float) -> np.ndarray:

@@ -31,7 +31,7 @@ const context = vm.createContext({
   document: { querySelectorAll: () => Object.keys(systemConfig.controls).map(element) },
   state: {},
   window: { confirm: () => confirmed },
-  t: (key) => key,
+  t: (key, values = {}) => key === 'gravtest.selected_arm' ? `Arm: ${values.arm}` : key,
   post: async (route, body) => {
     requests.push(JSON.parse(JSON.stringify({ route, body })));
     return { ok: true };
@@ -92,6 +92,26 @@ async function main() {
     acknowledgement: 'I_AM_HOLDING_ARM_AND_ESTOP_READY',
   });
 
+  for (const arm of ['left', 'station_3']) {
+    context.snapshot = {
+      state: 'idle', have_model: true,
+      gravity_test: { available: true, arm, source: `/calibrations/${arm}` },
+    };
+    vm.runInContext('renderGravity(snapshot)', context);
+    assert.equal(element('gravtest-capability').textContent, `Arm: ${arm}`);
+    assert.equal(element('btn-gravtest-drag').disabled, false);
+    context.snapshot.gravity_test = {
+      available: false, arm, reason_code: 'invalid_source',
+      reason: 'source must describe the selected arm',
+    };
+    vm.runInContext('renderGravity(snapshot)', context);
+    assert.equal(element('btn-gravtest-drag').disabled, true);
+    assert.equal(element('btn-gravtest-plan').disabled, true);
+    assert.equal(element('btn-gravtest-hold').disabled, true);
+    assert.equal(element('gravtest-capability').textContent,
+      `Arm: ${arm}: gravtest.invalid_source: source must describe the selected arm`);
+  }
+
   for (const state of ['idle', 'running', 'paused']) {
     for (const activity of ['', 'gravity', 'gravity_hold_test', 'gravity_drag_test']) {
       context.snapshot = { state, activity, have_model: false, planning: true };
@@ -105,7 +125,7 @@ async function main() {
   await element('btn-gravtest-stop').handlers.click();
   assert.deepEqual(requests.pop(), { route: '/api/stop', body: {} });
   assert.equal(requests.length, 0);
-  console.log('PASS: config-initialized drag/hold payloads, later edits, cancel, 12 Stop states, and Stop route');
+  console.log('PASS: drag/hold payloads, selected-arm labels and refusal gates, cancel, 12 Stop states, and Stop route');
 }
 
 main().catch((error) => {

@@ -35,6 +35,7 @@ from .. import loadsweep as loadsweep_module
 from .. import loadsweep_report
 from .. import model as model_module
 from .. import report as report_module
+from ..arm_identity import ArmBinding, ArmIdentity
 from ..interfaces import CommandSpec, TelemetrySpec
 from ..loadsweep_run import LoadSweepRun
 from ..model import ModelComponents
@@ -360,7 +361,9 @@ class IdentificationService:
         self.preview_token = 0
         self._hold_plan: dict = {}
         self._hold_recovery_required = False
+        self._hold_recovery_selection = None
         self._hold_current_started = False
+        self._default_gravity_source = None
         # Poses the phases of a running campaign have designed so far.
         self._designed: dict = {}
         self._completed_poses: dict[str, list[int]] = {}
@@ -471,7 +474,9 @@ class IdentificationService:
         """Build the model from a freshly received /robot_description."""
         if not urdf_text or urdf_text == self.urdf_text:
             return False
-        self.urdf_text = urdf_text
+        with self._lock:
+            self.urdf_text = urdf_text
+            self._hold_plan = {}
         return self._rebuild()
 
     def adopt_driven_joints(self, names) -> bool:
@@ -483,7 +488,15 @@ class IdentificationService:
         names = [str(entry) for entry in names]
         if names == self.driven_joints:
             return False
-        self.driven_joints = names
+        with self._lock:
+            self.driven_joints = names
+            self._hold_plan = {}
+            self.preview = {"available": False}
+            self.preview_token += 1
+            self._designed = {}
+            self._completed_poses = {}
+            self.gravity_armed = ""
+            self.rehearsal_passed = False
         self.note(f"controller drives {len(names)} joints")
         return self._rebuild()
 
@@ -826,13 +839,18 @@ class IdentificationService:
         return self.arm is not None
 
     def _hold_context(self) -> str:
+        try:
+            source = self._gravity_source(validate=False)
+        except (OSError, ValueError, TypeError, OverflowError, ImportError, LookupError) as error:
+            source = {"configured": self.config.gravity_test_source, "error": str(error)}
         payload = {
             "urdf": self.urdf_text, "range": self.jog_range_deg(),
             "obstacles": self.scene.as_list() if self.scene else [],
             "margin": self.config.safety_margin_m,
             "reference": self.screen_reference,
             "joints": list(self.arm.joint_names) if self.arm else [],
-            "source": self.config.gravity_test_source,
+            "driven_joints": list(self.driven_joints),
+            "source": source,
             "commands": self.config.commands.follow_joint_trajectory_action,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -870,6 +888,7 @@ class IdentificationService:
         capability = self.gravity_test_capability()
         if not capability["available"]:
             raise ValueError(capability["reason"])
+        source = self._gravity_source(ArmIdentity(capability["arm"]))
         if self.scene is None or self.screen_drift():
             raise ValueError("refresh the collision scene before planning holds")
         count = checked_value(options.get("poses", self.system["dashboard"]["hold_test"]["poses"]),
@@ -888,8 +907,9 @@ class IdentificationService:
             self._hold_plan = {}
         for attempt in range(self.system["dashboard"]["hold_test"]["replan_attempts"]):
             plan = hold_plan_module.build_hold_plan(
-                str(self.config.gravity_test_source or ""), list(self.arm.joint_names),
-            start, count, clear, system_config=self.system)
+                source, list(self.arm.joint_names), start, count, clear,
+                system_config=self.system, urdf_text=self.urdf_text,
+                exclude_poses_deg=options.get("exclude_poses_deg"))
             if plan["poses_deg"] != previous.get("poses_deg"):
                 break
         else:
@@ -967,6 +987,13 @@ class IdentificationService:
         one.
         """
         profile = self.profile
+        hardware_limits = None
+        try:
+            identity = ArmIdentity.from_joint_names(self.driven_joints)
+            hardware_limits = ArmBinding.from_description(
+                identity, self.urdf_text).current_limits
+        except (ValueError, TypeError, ElementTree.ParseError):
+            pass
         return {
             "have_profile": profile is not None,
             "source": self.profile_source,
@@ -977,6 +1004,7 @@ class IdentificationService:
             "current_guard": (profile is not None
                               and autoprofile.current_guard_active(profile)),
             "dark_guards": list(self._dark_guards()),
+            "hardware_current_limits": hardware_limits,
             "profile": (_without_infinities(profile.as_dict())
                         if profile is not None else None),
         }
@@ -1551,32 +1579,52 @@ class IdentificationService:
         worker.join(max(0.0, float(timeout_s)))
         return not worker.is_alive()
 
+    def _gravity_source(self, identity: ArmIdentity | None = None, *, validate: bool = True) -> str:
+        """Resolve and validate only the configured artifact for the selected arm."""
+        selected = ArmIdentity.from_joint_names(
+            self.driven_joints or (self.arm.joint_names if self.arm else []))
+        if identity is not None and identity != selected:
+            raise ValueError("selected arm changed while resolving the gravity source")
+        source = str(self.config.gravity_test_source or "").strip()
+        if source:
+            source = source.replace("{arm}", selected.name)
+        else:
+            if selected.name != "right":
+                raise ValueError(
+                    f"an explicit gravity_test_source is required for arm {selected.name}")
+            if self._default_gravity_source is None:
+                self._default_gravity_source = hold_plan_module._load_backend().current.DEFAULT_SOURCE
+            source = str(self._default_gravity_source)
+        path = Path(source).expanduser().resolve()
+        if validate:
+            payload = json.loads(hold_plan_module._source_path(path).read_text("utf-8"))
+            hold_plan_module._validate_source(payload, list(selected.joint_names))
+        return str(path)
+
     def gravity_test_capability(self) -> dict:
-        """Whether this dashboard maps unambiguously to a supported RM arm."""
+        """Require a selected model, matching calibration and acknowledged live binding."""
         names = (list(self.driven_joints) if self.driven_joints else
                  list(self.arm.joint_names) if self.arm is not None else [])
-        right = [f"right_arm_joint{index}" for index in range(1, 8)]
-        left = [f"left_arm_joint{index}" for index in range(1, 8)]
-        if names == right:
-            source = str(self.config.gravity_test_source or "").strip()
-            return {
-                "available": True,
-                "arm": "right",
-                "source": (str(Path(source).expanduser().resolve())
-                           if source else "commissioned default"),
-            }
-        if names == left:
-            return {
-                "available": False,
-                "reason_code": "right_arm_only",
-                "reason": "gravity validation is currently fixed to the right RM75",
-                "arm": "left",
-            }
-        return {
-            "available": False,
-            "reason_code": "unsupported_arm",
-            "reason": "gravity validation requires one complete RealMan arm",
-        }
+        try:
+            identity = ArmIdentity.from_joint_names(names)
+        except (TypeError, ValueError):
+            return {"available": False, "reason_code": "unsupported_arm",
+                    "reason": "gravity validation requires one complete ordered RealMan arm"}
+        try:
+            source = self._gravity_source(identity)
+        except (OSError, ValueError, TypeError, OverflowError, ImportError, LookupError) as error:
+            return {"available": False, "arm": identity.name,
+                    "reason_code": "invalid_source", "reason": str(error)}
+        if self.arm is None or tuple(self.arm.joint_names) != identity.joint_names:
+            return {"available": False, "arm": identity.name,
+                    "reason_code": "model_mismatch",
+                    "reason": "live model does not match the selected arm joints"}
+        try:
+            ArmBinding.from_description(identity, self.urdf_text)
+        except (ValueError, TypeError, ElementTree.ParseError) as error:
+            return {"available": False, "arm": identity.name,
+                    "reason_code": "unsafe_binding", "reason": str(error)}
+        return {"available": True, "arm": identity.name, "source": source}
 
     def _motion_speed_limit(self) -> float:
         maximum = configured_range(self.system, "motion.transit_speed_deg_s")[1]
@@ -1600,9 +1648,10 @@ class IdentificationService:
         if not capability["available"]:
             return {"ok": False, "message": capability["reason"]}
         arm = capability["arm"]
-        configured_source = str(self.config.gravity_test_source or "").strip()
-        source = (str(Path(configured_source).expanduser().resolve())
-                  if configured_source else "")
+        try:
+            source = self._gravity_source(ArmIdentity(arm))
+        except (OSError, ValueError, TypeError, OverflowError, ImportError, LookupError) as error:
+            return {"ok": False, "message": str(error)}
 
         if mode == GRAVITY_HOLD_TEST:
             defaults = self.system["dashboard"]["hold_test"]
@@ -1615,9 +1664,8 @@ class IdentificationService:
         speed = checked_value(options.get("maximum_speed_deg_s",
                               self.system["dashboard"]["drag_test"]["maximum_speed_deg_s"]),
                               self.system, "drag_test.maximum_speed_deg_s")
-        normalized = {"arm": arm, "maximum_speed_deg_s": speed}
-        if source:
-            normalized["source"] = source
+        normalized = {"arm": arm, "maximum_speed_deg_s": speed, "source": source}
+        context = self._hold_context()
 
         with self._lock:
             if self._state != IDLE or self.planning:
@@ -1660,9 +1708,12 @@ class IdentificationService:
                 "--output", str(output), "--status-file", str(status_file),
                 "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
                 "--system-config", str(snapshot),
+                "--source", source,
             ]
-            if source:
-                command.extend(["--source", source])
+            with self._lock:
+                if context != self._hold_context() or source != self._gravity_source(ArmIdentity(arm)):
+                    raise ValueError("gravity source or selected arm changed before launch")
+                ArmBinding.from_description(ArmIdentity(arm), self.urdf_text)
             process = self._process_launcher(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, start_new_session=True)
@@ -1724,6 +1775,9 @@ class IdentificationService:
                 return {"ok": False, "message": str(error)}
             self._state, self._activity = RUNNING, GRAVITY_HOLD_TEST
             self._hold_current_started = False
+            self._hold_recovery_selection = (
+                tuple(plan["joint_names"]),
+                self.config.commands.follow_joint_trajectory_action)
             self._started_at = time.monotonic()
             self._abort.clear()
             self._completed_poses = {}
@@ -1741,6 +1795,20 @@ class IdentificationService:
         with self._lock:
             if self._abort.is_set():
                 raise RuntimeError("hold stopped before child launch")
+            if (not self._hold_plan or self._hold_plan["context"] != self._hold_context()
+                    or not hold_plan_module.source_is_current(self._hold_plan)):
+                raise ValueError("hold plan or source changed before child launch")
+            capability = self.gravity_test_capability()
+            if not capability["available"]:
+                raise ValueError(capability["reason"])
+            try:
+                arm = command[command.index("--arm") + 1]
+                source = command[command.index("--source") + 1]
+            except (ValueError, IndexError) as error:
+                raise ValueError("hold child requires an explicit arm and source") from error
+            if (arm != capability["arm"] or hold_plan_module._source_path(source)
+                    != hold_plan_module._source_path(capability["source"])):
+                raise ValueError("hold child arm or source differs from the selected calibration")
             endpoint = getattr(self.bridge, "controller_state_url", None)
             endpoint = endpoint() if callable(endpoint) else None
             if isinstance(endpoint, str) and endpoint:
@@ -1772,6 +1840,8 @@ class IdentificationService:
         if self._abort.is_set():
             raise RuntimeError("hold stopped before motion")
         context = self._hold_context()
+        selection = (tuple(self.driven_joints or self.arm.joint_names),
+                     self.config.commands.follow_joint_trajectory_action)
         plant = self.bridge.hardware_plant(
             self.profile, self.scene, require_neutral_start=False,
             maximum_speed_deg_s=self._motion_speed(
@@ -1798,6 +1868,7 @@ class IdentificationService:
                     "reason": "" if error <= tolerance else "hold target was not reached"}
         except MotionStopUnverified:
             self._hold_recovery_required = True
+            self._hold_recovery_selection = selection
             raise
         finally:
             self._release(plant)
@@ -2246,6 +2317,8 @@ class IdentificationService:
             return
         plant = None
         run = None
+        previous_report = self._reports.get(mode)
+        failure = None
         gravity = mode in (GRAVITY_MODE, GRAVITY_REHEARSAL)
         try:
             monitor = self._monitor() if mode in HARDWARE_MODES else None
@@ -2299,12 +2372,47 @@ class IdentificationService:
             self._finish(mode, result, run.observations,
                          getattr(plant, "raw_frames", None))
         except Exception as error:  # noqa: BLE001 - a crash must not be silent
+            failure = str(error)
             self.note(f"{mode} run failed: {error}")
             self.progress = {"mode": mode, "phase": "failed",
                              "error": str(error),
                              "traceback": traceback.format_exc()[-2000:]}
             self._salvage(mode, run, plant, error)
         finally:
+            try:
+                if mode in HARDWARE_MODES:
+                    evidence = getattr(plant, "failure_evidence", lambda: {})()
+                    entry = self._reports.get(mode)
+                    folder = (Path(self.config.output_directory) / entry["name"]
+                              if entry is not None and entry is not previous_report else None)
+                    payload = (json.loads((folder / report_module.RESULT_NAME).read_text(
+                        encoding="utf-8")) if folder is not None else {
+                            "mode": mode, "complete": False, "aborted": failure})
+                    if evidence or failure or payload.get("aborted"):
+                        payload["failure_evidence"] = evidence
+                        observations = getattr(run, "observations", None) or []
+                        raw_frames = getattr(plant, "raw_frames", None) or []
+                        if folder is None:
+                            self._write(payload, mode, observations, raw_frames)
+                            entry = self._reports.get(mode)
+                            if entry is not None and entry is not previous_report:
+                                folder = Path(self.config.output_directory) / entry["name"]
+                        with self._lock:
+                            self.result = payload
+                        if folder is not None:
+                            (folder / "failure_evidence.json").write_text(
+                                json.dumps(evidence, indent=2), encoding="utf-8")
+                            (folder / report_module.RESULT_NAME).write_text(
+                                json.dumps(payload, indent=2, ensure_ascii=False),
+                                encoding="utf-8")
+                            (folder / report_module.REPORT_NAME).write_text(
+                                report_module.render_report(
+                                    payload, observation_rows=len(observations),
+                                    raw_rows=len(raw_frames),
+                                    stamp=folder.name.removeprefix(f"{mode}-")),
+                                encoding="utf-8")
+            except Exception as evidence_error:
+                self.note(f"could not write failure evidence: {evidence_error}")
             self._release(plant)
             self._run_gate.set()
             with self._lock:
@@ -2779,6 +2887,8 @@ class IdentificationService:
         """
         if self.arm is None:
             return {"available": False}
+        if self.driven_joints and set(self.arm.joint_names) != set(self.driven_joints):
+            return {"available": False}
         groups = []
         for phase in payload.get("phases") or []:
             name = str(phase.get("phase") or "")
@@ -2791,14 +2901,16 @@ class IdentificationService:
             entries = []
             for index, pose in enumerate(poses):
                 try:
-                    points = self.arm.skeleton(pose)
+                    paths = self.arm.skeleton_paths(pose)
                 except (ValueError, TypeError):
                     continue
+                paths = [[[round(float(value), 5) for value in point]
+                          for point in path] for path in paths]
                 entry = {
                     "index": index + 1,
                     "pose_deg": [round(float(value), 3) for value in pose],
-                    "points": [[round(float(v), 5) for v in point]
-                               for point in points],
+                    "points": paths[0] if len(paths) == 1 else [],
+                    "paths": paths,
                 }
                 # How much room this pose has, so the operator reviewing them
                 # can go straight to the tightest one instead of all of them.
@@ -3478,6 +3590,11 @@ class IdentificationService:
             if (self._external_process is not None
                     and self._external_process.poll() is None):
                 return
+            selection = (tuple(self.driven_joints or (
+                self.arm.joint_names if self.arm else [])),
+                self.config.commands.follow_joint_trajectory_action)
+            if self._hold_recovery_selection != selection:
+                return
             reader = getattr(self.bridge, "recovery_status", None)
             if not callable(reader):
                 return
@@ -3492,6 +3609,7 @@ class IdentificationService:
             if not isinstance(evidence, dict) or evidence.get("ready") is not True:
                 return
             self._hold_recovery_required = False
+            self._hold_recovery_selection = None
             self._hold_current_started = False
             self._external_process = None
             self._hold_plan = {}

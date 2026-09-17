@@ -15,6 +15,9 @@ from unittest import mock
 
 import numpy as np
 
+from dashboard_gravity_fixtures import gravity_source, gravity_urdf
+from robot_parameter_identification.arm_identity import ArmIdentity
+
 try:
     from robot_parameter_identification import identification as ident
     from robot_parameter_identification import campaign as campaign_module
@@ -247,7 +250,7 @@ class GravityValidationTest(unittest.TestCase):
                                else 0 if self.result == "PASS" else 1)
             return self.returncode
 
-    def made(self, directory, result="PASS", gate=None, exit_code=None):
+    def made(self, directory, result="PASS", gate=None, exit_code=None, arm="right"):
         processes = []
 
         def launch(command, **kwargs):
@@ -266,10 +269,12 @@ class GravityValidationTest(unittest.TestCase):
             return process
 
         made = IdentificationService(
-            DashboardConfig(output_directory=directory),
-            profile=test_profile(), process_launcher=launch)
+            DashboardConfig(output_directory=directory,
+                            gravity_test_source=str(gravity_source(Path(directory) / "model", arm))),
+            profile=test_profile() if arm == "right" else None, process_launcher=launch)
         made.system["dashboard"]["hold_test"]["transit_speed_deg_s"] = 5.0
-        made.adopt_description(synthetic_urdf())
+        made.adopt_driven_joints(ArmIdentity(arm).joint_names)
+        made.adopt_description(gravity_urdf(arm))
         return made, processes
 
     def wait(self, made):
@@ -312,6 +317,7 @@ class GravityValidationTest(unittest.TestCase):
                 "--status-file", str(folder / "status.json"),
                 "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT,
                 "--system-config", str(folder / "system_config.yaml"),
+                "--source", made.config.gravity_test_source,
             ])
             self.assertNotIn("seconds", made._options)
             self.assertEqual(made.snapshot()["state"], RUNNING)
@@ -332,7 +338,7 @@ class GravityValidationTest(unittest.TestCase):
     def test_drag_ignores_legacy_seconds_and_forwards_configured_source(self):
         with tempfile.TemporaryDirectory() as directory:
             made, processes = self.made(directory)
-            source = Path(directory) / "model.json"
+            source = gravity_source(Path(directory) / "explicit-model") / "result.json"
             made.config.gravity_test_source = str(source)
             for seconds in (10, 0, 999, "not-a-duration", None):
                 with self.subTest(seconds=seconds):
@@ -489,10 +495,8 @@ class GravityValidationTest(unittest.TestCase):
                 release.wait(1.0)
                 return self.Process(command)
 
-            made = IdentificationService(
-                DashboardConfig(output_directory=directory),
-                profile=test_profile(), process_launcher=launch)
-            made.adopt_description(synthetic_urdf())
+            made, _processes = self.made(directory)
+            made._process_launcher = launch
             answer = {}
             caller = threading.Thread(target=lambda: answer.update(
                 made.start_gravity_test(GRAVITY_DRAG_TEST, {
@@ -607,7 +611,7 @@ class GravityValidationTest(unittest.TestCase):
             self.assertIn("RealMan", answer["message"])
             self.assertEqual(processes, [])
 
-    def test_left_arm_is_refused_before_any_process_starts(self):
+    def test_left_arm_rejects_right_source_before_any_process_starts(self):
         with tempfile.TemporaryDirectory() as directory:
             made, processes = self.made(directory)
             made.driven_joints = [
@@ -616,7 +620,108 @@ class GravityValidationTest(unittest.TestCase):
                 "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT,
             })
             self.assertFalse(refused["ok"])
-            self.assertIn("right RM75", refused["message"])
+            self.assertIn("selected arm", refused["message"])
+            self.assertEqual(processes, [])
+
+    def test_left_and_future_arm_start_forward_the_selected_source_and_arm(self):
+        for arm in ("left", "station_3"):
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as directory:
+                made, processes = self.made(directory, arm=arm)
+                source = gravity_source(Path(directory) / f"calibration-{arm}", arm)
+                made.config.gravity_test_source = str(Path(directory) / "calibration-{arm}")
+                capability = made.gravity_test_capability()
+                self.assertEqual(capability, {
+                    "available": True, "arm": arm, "source": str(source)})
+                answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})
+                self.assertTrue(answer["ok"], answer)
+                self.wait(made)
+                command = processes[0].command
+                self.assertEqual(command[command.index("--arm") + 1], arm)
+                self.assertEqual(command[command.index("--source") + 1], str(source))
+
+    def test_nonright_arm_without_source_is_refused(self):
+        for arm in ("left", "station_3"):
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as directory:
+                made, processes = self.made(directory, arm=arm)
+                made.config.gravity_test_source = ""
+                answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})
+                self.assertFalse(answer["ok"])
+                self.assertIn("explicit gravity_test_source", answer["message"])
+                self.assertEqual(processes, [])
+
+    def test_right_default_resolves_to_the_validated_commissioned_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory)
+            source = made.config.gravity_test_source
+            made.config.gravity_test_source = ""
+            with mock.patch.object(dashboard_service.hold_plan_module, "_load_backend") as backend:
+                backend.return_value.current.DEFAULT_SOURCE = Path(source)
+                answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})
+                self.assertTrue(answer["ok"], answer)
+                self.wait(made)
+                backend.assert_called_once()
+            self.assertEqual(processes[0].command[-2:], ["--source", source])
+
+    def test_invalid_calibration_never_starts_a_current_child(self):
+        invalid = [
+            {"complete": False}, {"verdict": {"state": "warn"}},
+            {"effort_unit": "newton_metre"}, {"joints": []},
+            {"joints": [{"columns": [0], "parameters": [float("nan")]}] * 7},
+            {"joint_names": list(reversed(ArmIdentity("left").joint_names))},
+            {"joint_names": list(ArmIdentity("right").joint_names)},
+        ]
+        for changes in invalid:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
+                made, processes = self.made(directory, arm="left")
+                path = Path(made.config.gravity_test_source) / "result.json"
+                payload = json.loads(path.read_text())
+                path.write_text(json.dumps({**payload, **changes}))
+                for mode in (GRAVITY_DRAG_TEST, GRAVITY_HOLD_TEST):
+                    answer = made.start_gravity_test(mode, {
+                        "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})
+                    self.assertFalse(answer["ok"], answer)
+                self.assertEqual(processes, [])
+
+    def test_live_binding_is_required_even_with_a_valid_calibration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory, arm="left")
+            made.adopt_description(synthetic_urdf(prefix="left_arm_"))
+            capability = made.gravity_test_capability()
+            self.assertFalse(capability["available"])
+            self.assertEqual(capability["arm"], "left")
+            self.assertEqual(capability["reason_code"], "unsafe_binding")
+            self.assertFalse(made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})["ok"])
+            self.assertEqual(processes, [])
+
+    def test_changed_source_is_revalidated_after_reserving_the_activity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory, arm="left")
+            snapshot = dashboard_service.write_system_config_snapshot
+
+            def replace_calibration(folder, settings):
+                gravity_source(made.config.gravity_test_source, "right")
+                return snapshot(folder, settings)
+
+            with mock.patch.object(dashboard_service, "write_system_config_snapshot",
+                                   side_effect=replace_calibration):
+                answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                    "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})
+            self.assertFalse(answer["ok"])
+            self.assertEqual(made._state, "idle")
+            self.assertEqual(processes, [])
+
+    def test_missing_source_never_selects_a_newer_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            made, processes = self.made(directory, arm="left")
+            made.config.gravity_test_source = str(Path(directory) / "missing-{arm}")
+            gravity_source(Path(directory) / "newest-result", "left")
+            answer = made.start_gravity_test(GRAVITY_DRAG_TEST, {
+                "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT})
+            self.assertFalse(answer["ok"])
             self.assertEqual(processes, [])
 
     def test_rehearsal_does_not_apply_the_hardware_current_envelope(self):

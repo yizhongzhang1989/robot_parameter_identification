@@ -1,4 +1,4 @@
-"""Passive evidence for recovery of an exited right-arm gravity hold worker.
+"""Passive evidence for recovery of an exited gravity hold worker.
 
 This monitor grants no command authority and performs no I/O. Positions and
 velocities are raw ros2_control radians; freshness uses a monotonic clock.
@@ -7,6 +7,8 @@ velocities are raw ros2_control radians; freshness uses a monotonic clock.
 import math
 import threading
 import time
+
+from ..arm_identity import ArmIdentity
 
 
 RIGHT_JOINTS = tuple(f"right_arm_joint{index}" for index in range(1, 8))
@@ -47,11 +49,18 @@ class RecoveryMonitor:
         self._travel = [0.0] * 7
         self._reason = reason
 
+    def _reset_telemetry(self, reason):
+        self._reset(reason)
+        self._at = None
+        self._sequences = None
+        self._advanced_at = None
+        self._positions = None
+
     def action_status(self, action, statuses):
         """Record a received GoalStatusArray; None means unknown, [] is idle."""
         with self._lock:
             if action != self._action:
-                self._reset("trajectory action changed")
+                self._reset_telemetry("trajectory action changed")
             self._action = action
             self._statuses = None if statuses is None else tuple(statuses)
             if self._statuses is None or any(
@@ -61,15 +70,17 @@ class RecoveryMonitor:
     def _context_reason(self, joints, action, inventory, require_goal_status=True):
         selection = (tuple(joints), action)
         if selection != self._selection:
-            self._reset("recovery selection changed")
+            self._reset_telemetry("recovery selection changed")
             self._selection = selection
-        if len(joints) != 7 or set(joints) != set(RIGHT_JOINTS):
-            return "recovery evidence is only for the seven driven right-arm joints"
+        try:
+            identity = ArmIdentity.from_joint_names(joints)
+        except (TypeError, ValueError):
+            return "recovery requires seven ordered joints from one arm instance"
         suffix = "/follow_joint_trajectory"
         if not isinstance(action, str) or not action.endswith(suffix):
             return "selected trajectory action is invalid"
         controller = action[:-len(suffix)].strip("/")
-        if not controller or controller == CURRENT_CONTROLLER:
+        if not controller or controller == identity.current_controller:
             return "selected trajectory controller is invalid"
         if self._action not in (None, action):
             return "trajectory action changed"
@@ -85,10 +96,10 @@ class RecoveryMonitor:
                 return "controller inventory unavailable or stale"
             items = inventory["items"]
             current = [item for item in items
-                       if item["name"] == CURRENT_CONTROLLER]
+                       if item["name"] == identity.current_controller]
             selected = [item for item in items if item["name"] == controller]
             if len(current) != 1 or current[0]["state"] != "inactive":
-                return "right-arm current controller is not confirmed inactive"
+                return "selected arm current controller is not confirmed inactive"
             if len(selected) != 1 or selected[0]["state"] != "active":
                 return "selected trajectory controller is not active"
             if selected[0].get("type") != "joint_trajectory_controller/JointTrajectoryController":
@@ -117,7 +128,7 @@ class RecoveryMonitor:
                 joints, action, inventory, require_goal_status=False)
             gap_reason = self._fresh_reason(now)
             try:
-                rows = [by_joint[joint] for joint in RIGHT_JOINTS]
+                rows = [by_joint[joint] for joint in joints]
                 for row in rows:
                     for flag, expected in SAFE_FLAGS.items():
                         if row[flag] != expected:
@@ -131,13 +142,9 @@ class RecoveryMonitor:
                 if any(value < 0 or not value.is_integer() for value in sequences):
                     raise ValueError("invalid hardware telemetry sequence")
                 if any(abs(value) > MAX_SPEED_RAD_S for value in speeds):
-                    raise ValueError("right arm is moving too fast")
+                    raise ValueError("selected arm is moving too fast")
             except (KeyError, TypeError, ValueError, OverflowError) as error:
-                self._reset(f"incomplete or unsafe hardware telemetry: {error}")
-                self._at = None
-                self._sequences = None
-                self._advanced_at = None
-                self._positions = None
+                self._reset_telemetry(f"incomplete or unsafe hardware telemetry: {error}")
                 return
             regressed = self._sequences is not None and any(
                 value < previous for value, previous in zip(sequences, self._sequences))
@@ -165,7 +172,7 @@ class RecoveryMonitor:
                                 for travel, value, previous in zip(
                                     self._travel, positions, self._positions)]
                 if any(travel > MAX_TRAVEL_RAD for travel in self._travel):
-                    self._reset("right-arm total travel exceeds 0.5 degrees")
+                    self._reset("selected arm total travel exceeds 0.5 degrees")
             self._positions = positions
             if self._since is not None:
                 self._reason = "waiting for one second of continuously safe evidence"
@@ -179,5 +186,5 @@ class RecoveryMonitor:
             if reason:
                 self._reset(reason)
             if self._since is not None and self._at - self._since >= HEALTHY_S:
-                return {"ready": True, "reason": "right-arm recovery evidence ready"}
+                return {"ready": True, "reason": "selected arm recovery evidence ready"}
             return {"ready": False, "reason": self._reason}

@@ -1009,6 +1009,25 @@ class GravityCampaignTest(unittest.TestCase):
         self.assertEqual(plant.calls.count("traverse"), 0)
         self.assertEqual(plant.calls.count("track"), 0)
 
+    def test_first_drive_trip_aborts_without_retry_or_validation(self):
+        for failure_type in (campaign.DriveTrip, campaign.DriveLimitExceeded):
+            class TrippingPlant(self.TaggingPlant):
+                def probe_pose(self, pose_deg, delta_deg, speed_deg_s, tag=""):
+                    self.probes.append((tag, speed_deg_s))
+                    raise failure_type("joint7 peak current exceeded", joint=6,
+                                       kind="peak_current")
+
+            with self.subTest(failure_type=failure_type):
+                plant = TrippingPlant()
+                run = campaign.GravityCampaign(arm_model(), plant, self.plan())
+                result = run.run()
+                self.assertIn("joint7 peak current", result.aborted)
+                self.assertEqual(len(plant.probes), 1)
+                self.assertEqual([report.phase for report in run.reports],
+                                 [campaign.PHASE_GRAVITY])
+                self.assertEqual(run.skipped, [])
+                self.assertEqual(result.skipped, [])
+
     def test_every_pose_is_crossed_at_every_speed(self):
         run, plant = self.build()
         run.run_gravity()

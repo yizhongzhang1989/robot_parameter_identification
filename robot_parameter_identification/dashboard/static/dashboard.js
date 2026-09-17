@@ -435,8 +435,13 @@ function renderGravity(snapshot) {
   const capability = $('gravtest-capability');
   const capabilityKey = gravityTest.reason_code
     ? `gravtest.${gravityTest.reason_code}` : '';
-  capability.textContent = capabilityKey ? t(capabilityKey) : '';
-  capability.classList.toggle('hidden', !capabilityKey);
+  const selectedArm = gravityTest.arm
+    ? t('gravtest.selected_arm', { arm: gravityTest.arm }) : '';
+  const refusal = gravityTest.available ? '' : [
+    capabilityKey ? t(capabilityKey) : '', gravityTest.reason || '',
+  ].filter(Boolean).join(': ');
+  capability.textContent = [selectedArm, refusal].filter(Boolean).join(': ');
+  capability.classList.toggle('hidden', !capability.textContent);
   const gravityHardware = snapshot.activity === 'gravity';
   const pausePending = !!snapshot.progress?.pause_pending;
   $('btn-grav-pause').disabled = snapshot.state !== 'running'

@@ -2,6 +2,7 @@
 
 import copy
 from contextlib import ExitStack
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -15,6 +16,8 @@ from unittest import mock
 
 import numpy as np
 
+from dashboard_gravity_fixtures import gravity_source, gravity_urdf
+from robot_parameter_identification.arm_identity import ArmIdentity
 from test_dashboard import (
     DashboardConfig, IdentificationService, GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST,
     GRAVITY_TEST_ACKNOWLEDGEMENT, RUNNING, PAUSED, build_routes, dashboard_service,
@@ -42,16 +45,17 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.bridge.hardware_plant.side_effect = AssertionError("unexpected hardware")
         self.service = IdentificationService(
             DashboardConfig(output_directory=directory.name,
-                            gravity_test_source=str(self.output / "model")),
+                            gravity_test_source=str(gravity_source(self.output / "model"))),
             bridge=self.bridge,
             profile=test_profile(), process_launcher=self.launch)
         self.service.system["dashboard"]["hold_test"]["transit_speed_deg_s"] = 5.0
-        self.service.adopt_description(synthetic_urdf())
+        self.service.adopt_description(gravity_urdf())
         patches = ExitStack()
         self.addCleanup(patches.close)
         self.plan = {
             "source": self.service.config.gravity_test_source,
-            "source_digest": "synthetic-source-digest",
+            "source_digest": dashboard_service.hold_plan_module._digest(
+                self.output / "model" / "result.json"),
             "joint_names": list(self.service.arm.joint_names),
             "start_deg": [0.0] * 7,
             "poses_deg": [[1.0] * 7, [2.0] * 7],
@@ -63,7 +67,7 @@ class HoldPlanServiceTest(unittest.TestCase):
             side_effect=lambda *_args, **_kwargs: copy.deepcopy(self.plan)))
         self.current_source = patches.enter_context(mock.patch.object(
             dashboard_service.hold_plan_module, "source_is_current",
-            return_value=True))
+            wraps=dashboard_service.hold_plan_module.source_is_current))
         self.real_executor = dashboard_service.hold_plan_module.execute_hold_plan
         self.executor = patches.enter_context(mock.patch.object(
             dashboard_service.hold_plan_module, "execute_hold_plan",
@@ -133,6 +137,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.service._completed_poses = {"hold_set": [1]}
         answer = self.preview()
         self.builder.assert_called_once()
+        self.assertEqual(self.builder.call_args.kwargs["urdf_text"], self.service.urdf_text)
         source, names, start, count, clear = self.builder.call_args.args
         self.assertEqual(source, self.plan["source"])
         self.assertEqual(names, self.plan["joint_names"])
@@ -153,7 +158,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.assertEqual(self.service._completed_poses, {})
         self.assertFalse(self.service.planning)
         self.assertEqual(self.service.snapshot()["state"], "idle")
-        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(list(self.output.iterdir()), [self.output / "model"])
         self.executor.assert_not_called()
         self.launch.assert_not_called()
         self.bridge.hardware_plant.assert_not_called()
@@ -167,6 +172,21 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.assertEqual(self.builder.call_count, 3)
         self.assertEqual(second["preview"]["groups"][0]["poses"][0]["pose_deg"],
                          changed["poses_deg"][0])
+
+    def test_verified_prior_poses_are_forwarded_and_bound_into_the_new_plan(self):
+        excluded = [[-3.0] * 7]
+        self.plan["excluded_poses_deg"] = copy.deepcopy(excluded)
+        answer = self.service.plan_preview(
+            GRAVITY_HOLD_TEST, {"poses": 2, "exclude_poses_deg": excluded})
+        self.assertTrue(answer["ok"])
+        self.assertEqual(self.builder.call_args.kwargs["exclude_poses_deg"], excluded)
+        self.assertEqual(self.service._hold_plan["excluded_poses_deg"], excluded)
+        frozen = copy.deepcopy(self.service._hold_plan)
+        identifier = frozen.pop("id")
+        self.assertEqual(identifier, hashlib.sha256(
+            json.dumps(frozen, sort_keys=True).encode()).hexdigest())
+        self.bridge.hardware_plant.assert_not_called()
+        self.launch.assert_not_called()
 
     def test_replanning_refuses_when_no_different_pose_set_is_found(self):
         self.preview()
@@ -257,6 +277,109 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.service.config.safety_margin_m += 0.01
         self.assertFalse(self.service.hold_plan_payload()["available"])
         self.assert_refused(options)
+
+    def test_selecting_another_arm_and_back_revokes_the_frozen_hold_plan(self):
+        self.preview()
+        options = self.options()
+        self.service.gravity_armed = "previous-arm-permission"
+        self.service.rehearsal_passed = True
+        self.service.adopt_driven_joints(ArmIdentity("left").joint_names)
+        self.assertFalse(self.service.hold_plan_payload()["available"])
+        self.assertFalse(self.service.gravity_armed)
+        self.assertFalse(self.service.rehearsal_passed)
+        self.service.adopt_driven_joints(ArmIdentity("right").joint_names)
+        self.assertFalse(self.service.hold_plan_payload()["available"])
+        self.assert_refused(options)
+
+    def test_hold_plan_context_tracks_selected_joints_even_before_model_rebuild(self):
+        self.preview()
+        self.service.driven_joints = list(ArmIdentity("left").joint_names)
+        self.assertEqual(self.service.arm.joint_names, self.plan["joint_names"])
+        self.assertFalse(self.service.hold_plan_payload()["available"])
+        self.assert_refused()
+
+    def test_motion_context_does_not_reparse_the_calibration_artifact(self):
+        self.preview()
+        expected = self.service._hold_plan["context"]
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError("no artifact reads")):
+            self.assertEqual(self.service._hold_context(), expected)
+
+    def test_left_hold_preview_uses_expanded_source_live_urdf_and_selected_joints(self):
+        identity = ArmIdentity("left")
+        source = gravity_source(self.output / "model-left", identity.name)
+        self.service.config.gravity_test_source = str(self.output / "model-{arm}")
+        self.service.configured_profile = None
+        self.service.config.commands = replace(
+            self.service.config.commands,
+            follow_joint_trajectory_action=f"/{identity.trajectory_controller}/follow_joint_trajectory")
+        self.service.adopt_driven_joints(identity.joint_names)
+        self.assertTrue(self.service.adopt_description(gravity_urdf(identity.name)))
+        self.plan["joint_names"] = list(identity.joint_names)
+        self.plan["source"] = str(source)
+        self.plan["source_digest"] = dashboard_service.hold_plan_module._digest(source / "result.json")
+        with mock.patch.object(self.service.scene, "collision_free", return_value=True), \
+                mock.patch.object(self.service.scene, "clearance_rank", return_value={}):
+            self.preview()
+        self.assertEqual(self.builder.call_args.args[:2], (str(source), list(identity.joint_names)))
+        self.assertEqual(self.builder.call_args.kwargs["urdf_text"], self.service.urdf_text)
+        self.assertEqual(self.service.gravity_test_capability()["arm"], "left")
+        self.service.config.gravity_test_source = str(source)
+        self.assertTrue(self.service.hold_plan_payload()["available"])
+        self.assertTrue(self.service.start_gravity_test(
+            GRAVITY_HOLD_TEST, self.options())["ok"])
+        self.wait()
+        self.assertEqual(self.executor.call_args.args[0]["joint_names"], list(identity.joint_names))
+        self.assertEqual(self.executor.call_args.args[0]["source"], str(source))
+        self.launch.assert_not_called()
+
+    def test_hold_child_rechecks_source_and_arm_at_the_launch_boundary(self):
+        self.preview()
+        other_source = gravity_source(self.output / "another-right-model")
+        commands = [
+            ["--arm", "left", "--source", self.plan["source"]],
+            ["--arm", "right", "--source", str(other_source)],
+            ["--arm", "right"],
+        ]
+        for arguments in commands:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, "arm|source"):
+                self.service._run_hold_child(
+                    ["ros2", "run", "rm_control", "hold_check", *arguments], 1.0)
+        self.launch.assert_not_called()
+
+    def test_hold_child_refuses_late_selection_description_or_source_changes(self):
+        command = ["ros2", "run", "rm_control", "hold_check",
+                   "--arm", "right", "--source", self.plan["source"]]
+        for change in ("selection", "description", "source"):
+            with self.subTest(change=change):
+                self.preview()
+                if change == "selection":
+                    self.service.adopt_driven_joints(ArmIdentity("left").joint_names)
+                elif change == "description":
+                    self.service.adopt_description(self.service.urdf_text + "\n")
+                else:
+                    gravity_source(self.output / "model", "left")
+                with self.assertRaisesRegex(ValueError, "changed before child launch"):
+                    self.service._run_hold_child(command, 1.0)
+                gravity_source(self.output / "model", "right")
+                self.service.adopt_driven_joints(ArmIdentity("right").joint_names)
+        self.launch.assert_not_called()
+
+    def test_valid_hold_child_preserves_source_and_controller_inventory_arguments(self):
+        self.preview()
+        endpoint = "http://127.0.0.1:8300/api/controller-state"
+        self.bridge.attach_mock(mock.Mock(return_value=endpoint), "controller_state_url")
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ("", "")
+        self.launch.side_effect = None
+        self.launch.return_value = process
+        command = ["ros2", "run", "rm_control", "hold_check", "--arm", "right",
+                   "--source", str(self.output / "model" / "result.json")]
+        result = self.service._run_hold_child(command, 1.0)
+        self.assertEqual(result.returncode, 0)
+        self.launch.assert_called_once()
+        self.assertEqual(self.launch.call_args.args[0],
+                         [*command, "--controller-state-url", endpoint])
+        self.assertTrue(self.launch.call_args.kwargs["start_new_session"])
 
     def test_changed_source_is_refused(self):
         self.preview()
@@ -556,6 +679,9 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.service._state = PAUSED
         self.service._activity = GRAVITY_HOLD_TEST
         self.service._hold_recovery_required = True
+        self.service._hold_recovery_selection = (
+            tuple(self.service.arm.joint_names),
+            self.service.config.commands.follow_joint_trajectory_action)
         self.service._hold_current_started = True
         self.service._worker = None
         self.service.result = {"result": "FAIL", "reason": "UDP state stale",
@@ -596,6 +722,29 @@ class HoldPlanServiceTest(unittest.TestCase):
                 self.assertEqual(self.service.snapshot()["state"], PAUSED)
         reader.side_effect = RuntimeError("telemetry unavailable")
         self.assertEqual(self.service.snapshot()["state"], PAUSED)
+
+    def test_new_arm_evidence_cannot_release_previous_arm_recovery(self):
+        self.recovery_latched_service()
+        reader = mock.Mock(return_value={"ready": True})
+        self.bridge.attach_mock(reader, "recovery_status")
+        self.service.adopt_driven_joints(ArmIdentity("left").joint_names)
+        self.assertEqual(self.service.snapshot()["state"], PAUSED)
+        self.assertTrue(self.service._hold_recovery_required)
+        reader.assert_not_called()
+        reader.return_value = {"ready": False}
+        self.service.adopt_driven_joints(ArmIdentity("right").joint_names)
+        self.assertEqual(self.service.snapshot()["state"], PAUSED)
+        reader.assert_called_once_with(require_goal_status=True)
+
+    def test_changed_action_does_not_release_previous_controller_recovery(self):
+        self.recovery_latched_service()
+        reader = mock.Mock(return_value={"ready": True})
+        self.bridge.attach_mock(reader, "recovery_status")
+        self.service.config.commands = replace(
+            self.service.config.commands,
+            follow_joint_trajectory_action="/other_controller/follow_joint_trajectory")
+        self.assertEqual(self.service.snapshot()["state"], PAUSED)
+        reader.assert_not_called()
 
     def test_only_confirmed_moves_allow_recovery_without_action_status(self):
         for records, required in (([], True), ([{}], True),
@@ -882,10 +1031,12 @@ class HoldPlanCompletionProgressTest(unittest.TestCase):
             }), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-                dashboard_service.hold_plan_module, "source_is_current", return_value=True), \
-                mock.patch.object(dashboard_service.hold_plan_module, "_load_backend",
+        with tempfile.TemporaryDirectory() as directory, \
+            mock.patch.object(dashboard_service.hold_plan_module, "_load_backend",
                                   side_effect=AssertionError("unexpected real backend")):
+            source = gravity_source(Path(directory) / "model")
+            plan["source"] = str(source)
+            plan["source_digest"] = dashboard_service.hold_plan_module._digest(source / "result.json")
             result = dashboard_service.hold_plan_module.execute_hold_plan(
                 plan, 2.0, directory, threading.Event(), progress, child,
                 move=move, backend=backend)

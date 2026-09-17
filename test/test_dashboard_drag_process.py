@@ -14,7 +14,8 @@ from robot_parameter_identification.dashboard.service import (
     DashboardConfig, GRAVITY_DRAG_TEST, GRAVITY_TEST_ACKNOWLEDGEMENT,
     IdentificationService,
 )
-from fixtures import synthetic_urdf, test_profile
+from dashboard_gravity_fixtures import gravity_source, gravity_urdf
+from fixtures import test_profile
 
 try:
     from ros2run.api import run_executable
@@ -91,9 +92,10 @@ class DragProcessGroupTest(unittest.TestCase):
         messages = []
         with tempfile.TemporaryDirectory() as directory:
             made = IdentificationService(
-                DashboardConfig(output_directory=directory),
+                DashboardConfig(output_directory=directory,
+                                gravity_test_source=str(gravity_source(Path(directory) / "model"))),
                 profile=test_profile())
-            made.adopt_description(synthetic_urdf())
+            made.adopt_description(gravity_urdf())
             made.publish_event = lambda message, **kwargs: messages.append(message)
 
             def launch(command, **kwargs):

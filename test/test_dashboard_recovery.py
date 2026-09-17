@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from robot_parameter_identification.arm_identity import ArmIdentity
 from robot_parameter_identification.dashboard.recovery import (
     CURRENT_CONTROLLER, RIGHT_JOINTS, RecoveryMonitor, SAFE_FLAGS)
 
@@ -23,6 +24,8 @@ class RecoveryMonitorTest(unittest.TestCase):
         self.now = 10.0
         self.sequence = 0
         self.monitor = RecoveryMonitor(clock=lambda: self.now)
+        self.joints = RIGHT_JOINTS
+        self.action = ACTION
         self.inventory = {
             "available": True, "age_s": 0.0, "error": "", "items": [
                 {"name": CURRENT_CONTROLLER, "state": "inactive",
@@ -35,12 +38,23 @@ class RecoveryMonitorTest(unittest.TestCase):
                                   telemetry_sequence=0.0) for joint in RIGHT_JOINTS}
         self.monitor.action_status(ACTION, [])
 
+    def select_arm(self, name):
+        identity = ArmIdentity(name)
+        self.joints = identity.joint_names
+        self.action = f"/{identity.trajectory_controller}/follow_joint_trajectory"
+        self.inventory["items"][0]["name"] = identity.current_controller
+        self.inventory["items"][1]["name"] = identity.trajectory_controller
+        self.inventory["items"][1]["claimed_interfaces"] = [
+            f"{joint}/position" for joint in self.joints]
+        self.frame = {joint: dict(SAFE_FLAGS, position=1.0, velocity=0.0,
+                                  telemetry_sequence=self.sequence) for joint in self.joints}
+
     def feed(self, advance=True):
         if advance:
             self.sequence += 1
             for row in self.frame.values():
                 row["telemetry_sequence"] = self.sequence
-        self.monitor.observe(self.frame, RIGHT_JOINTS, ACTION, self.inventory)
+        self.monitor.observe(self.frame, self.joints, self.action, self.inventory)
 
     def healthy(self):
         for _index in range(23):
@@ -48,7 +62,55 @@ class RecoveryMonitorTest(unittest.TestCase):
             self.feed()
 
     def status(self):
-        return self.monitor.status(RIGHT_JOINTS, ACTION, self.inventory)
+        return self.monitor.status(self.joints, self.action, self.inventory)
+
+    def test_left_and_future_instances_use_their_own_evidence(self):
+        for name in ("left", "station_3"):
+            with self.subTest(arm=name):
+                self.setUp()
+                self.select_arm(name)
+                self.monitor.action_status(self.action, [])
+                self.healthy()
+                self.assertTrue(self.status()["ready"])
+                self.inventory["items"][0]["name"] = CURRENT_CONTROLLER
+                self.assertFalse(self.status()["ready"])
+
+    def test_selection_change_discards_all_telemetry(self):
+        self.healthy()
+        self.assertTrue(self.status()["ready"])
+        self.select_arm("left")
+        self.assertFalse(self.status()["ready"])
+        for field in ("_since", "_at", "_sequences", "_advanced_at", "_positions"):
+            self.assertIsNone(getattr(self.monitor, field), field)
+        self.assertEqual(self.monitor._travel, [0.0] * 7)
+        self.monitor.action_status(self.action, [])
+        for _index in range(23):
+            self.now += 0.05
+            self.feed(advance=False)
+        self.assertFalse(self.status()["ready"])
+        self.sequence = 0
+        self.healthy()
+        self.assertTrue(self.status()["ready"])
+
+    def test_telemetry_selection_change_starts_a_new_position_and_sequence_baseline(self):
+        self.healthy()
+        self.select_arm("station_3")
+        self.monitor.action_status(self.action, [])
+        self.sequence = 0
+        self.feed()
+        self.assertFalse(self.status()["ready"])
+        self.assertNotIn("regressed", self.status()["reason"])
+        self.assertEqual(self.monitor._travel, [0.0] * 7)
+        self.healthy()
+        self.assertTrue(self.status()["ready"])
+
+    def test_reordered_and_mixed_joint_selections_are_refused(self):
+        self.healthy()
+        for joints in (tuple(reversed(RIGHT_JOINTS)),
+                       RIGHT_JOINTS[:-1] + ("left_arm_joint7",)):
+            with self.subTest(joints=joints):
+                self.assertFalse(self.monitor.status(
+                    joints, ACTION, self.inventory)["ready"])
 
     def test_complete_stable_advancing_evidence(self):
         self.feed()

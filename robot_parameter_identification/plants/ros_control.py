@@ -11,7 +11,10 @@ package stays testable without it.
 
 from __future__ import annotations
 
+from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 import math
 import threading
 import time
@@ -38,6 +41,10 @@ CRAWL_SPEED_DEG_S = 0.1
 GOAL_STATUS_SUCCEEDED = 4
 GOAL_STATUS_CANCELED = 5
 GOAL_STATUS_ABORTED = 6
+STATIONARY_START_WINDOW_S = 0.2
+STATIONARY_START_TRAVEL_DEG = 0.01
+STATIONARY_START_TIMEOUT_S = 2.0
+STATIONARY_START_MAX_AGE_S = 0.05
 
 
 def differentiate(times_s, values, window: int = 5) -> np.ndarray:
@@ -241,6 +248,8 @@ class HardwarePlant:
         self.monitor = monitor
         self._monitor_trip: str | None = None
         self._monitor_trip_detail: dict = {}
+        self._first_trip: str | None = None
+        self._prior_raw_frames: deque[dict] = deque(maxlen=40)
         self._pause_requested = lambda: False
         self._stop_requested = lambda: False
 
@@ -249,6 +258,8 @@ class HardwarePlant:
         self.monitor = monitor
         self._monitor_trip = None
         self._monitor_trip_detail = {}
+        self._first_trip = None
+        self._prior_raw_frames.clear()
 
     def set_pause_requested(self, requested) -> None:
         """Check for a cooperative pause only between controller goals."""
@@ -271,15 +282,31 @@ class HardwarePlant:
         """Discard raw frames belonging to an unfinished pose."""
         del self.raw_frames[max(0, int(checkpoint)):]
 
+    def failure_evidence(self) -> dict:
+        """Return a detached diagnostic snapshot; non-finite readings become null."""
+        return ({"first_trip": json.loads(
+            self._first_trip, parse_constant=lambda value: None)}
+            if self._first_trip is not None else {})
+
     def _check_monitor(self, sample: dict, now: float | None = None) -> None:
         if self.monitor is None or self._monitor_trip is not None:
             return
-        trip = self.monitor.check(
-            sample, time.monotonic() if now is None else float(now))
+        received_at = time.monotonic() if now is None else float(now)
+        trip = self.monitor.check(sample, received_at)
         if trip:
-            self._monitor_trip = str(trip)
             self._monitor_trip_detail = dict(
                 getattr(self.monitor, "last_trip", None) or {})
+            self._first_trip = json.dumps({
+                "sample": sample, "received_monotonic_s": received_at,
+                "guard": {"kind": self._monitor_trip_detail.get("kind", ""),
+                          "joint": self._monitor_trip_detail.get("joint"),
+                          "reason": str(trip)},
+                "prior_raw_frames": list(self._prior_raw_frames),
+            }, default=lambda value: value.tolist())
+            self._monitor_trip = str(trip)
+        else:
+            self._prior_raw_frames.append({
+                "sample": deepcopy(sample), "received_monotonic_s": received_at})
 
     def _raise_if_monitor_tripped(self) -> None:
         if self._monitor_trip is not None:
@@ -411,6 +438,8 @@ class HardwarePlant:
             "fault_code": [int(v) for v in columns.get("fault_code", [])],
             "arm_status": None,
         }
+        frame["publisher_speed_deg_s"] = (
+            frame["speed_deg_s"] if "velocity" in columns else None)
         if "current" in arrived:
             frame["drive_current_a"] = [float(v) for v in columns["current"]]
         if "torque" in arrived:
@@ -583,8 +612,9 @@ class HardwarePlant:
             return True
         return bool(self.collision_model.collision_free(pose_deg))
 
-    def _duration_for(self, target_deg, speed_deg_s: float) -> float:
-        current = np.asarray(self._require_sample()["position_deg"], dtype=float)
+    def _duration_for(self, target_deg, speed_deg_s: float, *, start_deg=None) -> float:
+        current = np.asarray(self._require_sample()["position_deg"]
+                             if start_deg is None else start_deg, dtype=float)
         distance = float(np.max(np.abs(np.asarray(target_deg, dtype=float) - current)))
         speed = max(float(speed_deg_s), 0.1)
         return max(MINIMUM_SEGMENT_S, PEAK_TO_AVERAGE * distance / speed)
@@ -608,11 +638,11 @@ class HardwarePlant:
         return goal
 
     def _execute(self, points, on_frame=None):
-        """Send one trajectory, retrying while the arm is still fit to try."""
+        """Send a trajectory; a point factory refreshes each retry's start state."""
         attempts = max(1, int(self.config.motion_attempts))
         for attempt in range(1, attempts + 1):
             try:
-                self._attempt(points, on_frame)
+                self._attempt(points() if callable(points) else points, on_frame)
                 return
             except DriveLimitExceeded:
                 raise
@@ -742,11 +772,65 @@ class HardwarePlant:
         if not terminal():
             raise RuntimeError("the goal has no confirmed terminal result")
 
+    def _stationary_start(self) -> np.ndarray:
+        """Fresh, position-verified rest before an explicit zero-velocity start."""
+        started = time.monotonic()
+        samples = deque()
+        last_stamp = None
+        last_received = None
+        while time.monotonic() - started < STATIONARY_START_TIMEOUT_S:
+            self._raise_if_stop_requested()
+            self._raise_if_monitor_tripped()
+            if self._pause_requested():
+                raise MotionPaused("pause requested before stationary start")
+            self._spin_once(0.01)
+            self._raise_if_stop_requested()
+            self._raise_if_monitor_tripped()
+            with self._lock:
+                received = self._latest_at
+                sample = dict(self._latest) if self._latest is not None else {}
+            now = time.monotonic()
+            if received < started or not 0 <= now - received <= STATIONARY_START_MAX_AGE_S:
+                samples.clear()
+                continue
+            stamp = sample.get("stamp_s")
+            position = np.asarray(sample.get("position_deg"), dtype=float)
+            if (not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
+                    or position.shape != (self.joint_count,) or not np.isfinite(position).all()):
+                raise TelemetryUnavailable("stationary start needs finite stamped joint positions")
+            if last_stamp is not None:
+                if stamp < last_stamp:
+                    raise TelemetryUnavailable("stationary-start publisher timestamp regressed")
+                if stamp == last_stamp:
+                    continue
+                if (stamp - last_stamp > STATIONARY_START_MAX_AGE_S or
+                        received - last_received > STATIONARY_START_MAX_AGE_S):
+                    samples.clear()
+            last_stamp, last_received = stamp, received
+            samples.append((stamp, received, position.copy()))
+            while len(samples) > 2 and stamp - samples[1][0] >= STATIONARY_START_WINDOW_S:
+                samples.popleft()
+            if (stamp - samples[0][0] < STATIONARY_START_WINDOW_S or
+                    received - samples[0][1] < STATIONARY_START_WINDOW_S):
+                continue
+            positions = np.asarray([entry[2] for entry in samples])
+            if np.max(np.ptp(positions, axis=0)) <= STATIONARY_START_TRAVEL_DEG:
+                return position.copy()
+        raise TelemetryUnavailable("no fresh stationary start within two seconds")
+
     def move_to(self, pose_deg) -> None:
-        """Drive there and stop. Nothing is collected, so a jog costs nothing."""
-        target = np.asarray(pose_deg, dtype=float)
-        duration = self._duration_for(target, self.config.maximum_speed_deg_s)
-        self._execute([(target, np.zeros(self.joint_count), duration)])
+        """Move between verified rest states without an implicit JTC velocity."""
+        target = np.asarray(pose_deg, dtype=float).copy()
+        if target.shape != (self.joint_count,) or not np.isfinite(target).all():
+            raise ValueError("move target must contain one finite angle per joint")
+
+        def points():
+            start = self._stationary_start()
+            duration = self._duration_for(target, self.config.maximum_speed_deg_s, start_deg=start)
+            return [(start, np.zeros(self.joint_count), 0.0),
+                    (target.copy(), np.zeros(self.joint_count), duration)]
+
+        self._execute(points)
 
     def wait_for_position(self, pose_deg, tolerance_deg=1.0, timeout_s=1.0) -> dict:
         """Confirm arrival from telemetry received after the trajectory result."""

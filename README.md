@@ -182,7 +182,7 @@ ros2 launch robot_parameter_identification dashboard.launch.py \
 | 参数 | 何时需要 |
 |---|---|
 | `profile_path:=...` | 已经存好一份档案，不想每次重填 |
-| `gravity_test_source:=...` | 为右臂重力补偿验证显式指定另一份完整、通过、安培域且关节名匹配的辨识结果；留空使用已投用默认模型 |
+| `gravity_test_source:=...` | 指定完整、通过、安培域且关节名匹配的辨识结果；支持 `{arm}` 实例名模板；仅右臂允许留空使用固定已投用模型 |
 | `maximum_speed_deg_s:=60.0` | 计划速度默认封顶 10 °/s；黏滞摩擦在爬行速度下根本看不出来 |
 | `signal.voltage:=voltage` | 驱动器有 `voltage` 接口、档案又给了电压窗口，母线电压保护才真正生效 |
 | `config_file_path:=config/rm75_cell.json` | 让障碍物场景、规划包络和重力标定参数在两次会话之间留存；不给它，它们既不会读回也不会保存 |
@@ -377,6 +377,13 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 这些输入仅控制 JTC 去往目标位姿的转场，不改变标定探针速度、电流保持参数或手动拖动的
 超速停止阈值。实际移动时长仍受最短轨迹时长和控制器约束影响。
 
+点到点 `HardwarePlant.move_to()` 在发送轨迹前，用新收到的位置确认至少 0.2 秒内
+所有关节的跨度不超过 0.01°，样本接收年龄不超过 50 ms；两秒内无法确认则不发出目标。
+确认后显式发送 `t=0` 的实测位置和零速度，再发送目标位置和零终点速度，时长由同一个
+实测起点计算。这样 JTC 不会把静止时带量化噪声的速度读数作为样条初始速度，导致未要求
+移动的关节也出现参考位移。已有停止、暂停和遥测保护在等待期间仍生效；动作重试必须重新
+确认起点。恒速扫描和其他已明确给出速度的轨迹段不经过此改写，控制器全局参数及电流限值不变。
+
 重力转场速度随标定设置保存，并参与预演授权签名，修改后必须重新预演才能真机标定。
 保持检查的转场速度在执行时选择，不改变已规划的目标点；实际速度记录在该次执行摘要中。
 回零、点动和保持速度不持久化，页面重新加载后恢复默认值。
@@ -391,6 +398,13 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 面板不再由各标定模式各写一套状态文字。服务中的 `publish_event()` 是唯一的操作员事件入口，原有 `note()` 只是它的兼容名称；`activity_payload()` 把当前任务、通用进度字典和最近事件合在一起，同时由 `/api/activity` 和 `/api/state.activity_feed` 提供。右侧 panel 分成两行：上半部分独立滚动，底部信息区不参与折叠并保留至少 160 px 高度。信息区第一行显示当前模式，第二行以 13 px 正文完整换行显示当前动态，内容较长时信息区继续自动增高；点击重力预演后立即显示已启动，运行时按后端最近一次回调依次显示设计位姿、采样、位姿完成和保存结果，而不是从累计字段猜测当前步骤，空闲后保持最后一条实际输出，不提供完整日志。状态轮询不会并发，旧响应不能倒退覆盖新进度。重力“已解锁”只作为被动摘要，在没有任何输出可显示时兜底，不会覆盖上一条运行结果。重力卡片原先显示的规划中、碰撞构型漂移、已失效/未解锁、位形数不足和执行位形进度全部由这一信息区显示，卡片内不再保留第二份状态文字。
 
 3D 视图同样只认一个 `scene_activity`：其中包含模式、阶段、当前目标位姿、各阶段已完成位姿，以及是否有可自动快放的关节位姿序列。重力运行会在开始测试一个点之前发布 `target_pose`，因此琥珀色高亮始终指向当前目标，而不是刚完成的上一个点；完成全部探针数据的位姿改为灰青色，尚未执行的位姿仍保留阶段颜色。重力预演、完整预演和后续新增的轨迹类任务使用同一个协议；模式特有的代码只负责发布数据，不负责控制 canvas。
+
+规划骨架由所选 controller 的关节集合及其在 URDF 中的父子关系确定，不依赖左右臂名称、
+关节数量或全模型最后一个坐标帧。`ArmModel.skeleton_paths()` 输出每条受控链及其固定工具
+末端；分叉 controller 的多条路径分别绘制，不在无父子关系的关节之间连线。
+`/api/preview` 的每个位姿带有 `paths`；单路径仍提供兼容的 `points`，多路径时该字段为空。
+多个路径共用一个位姿索引、高亮和播放步骤。切换 controller 会清空旧预览并更新 token；
+配置模型与 controller 关节不一致时不生成预览。
 
 真机重力标定支持暂停与恢复。`/api/pause` 先锁住后续 JTC goal；已经发出的 goal 不会被半途切断，而是在成功结束后的安全边界进入暂停。一个重力位姿是事务边界：该点所有速度、两个方向的探针都完成后，拟合样本和原始帧才算提交。若暂停落在点位中间，该点已经产生的 observation、phase 计数、峰值和 raw frame 会一起回滚；`/api/resume` 从同一位姿索引重新完整测试。暂停期间归零、点动和其他 campaign 都保持禁用，仍可用“停止”结束并保存此前完整提交的点位。
 
@@ -427,7 +441,7 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 `SIGINT`，由执行程序完成停流和恢复。若取消或停流恢复证据缺失，任务保留故障占用，
 但历史错误本身不禁用按钮：检查失败且停流恢复已确认时，直接回到空闲，保留 FAIL 结果。
 保持任务退出后的故障占用会随状态轮询自动复核，无需为了清除旧错误再次重启 Dashboard。
-复核要求控制器清单新鲜、右臂 JTC 持有位置接口且 active、电流控制器 inactive，七关节
+复核要求控制器清单新鲜、所选臂 JTC 持有位置接口且 active、对应电流控制器 inactive，七关节
 已使能、无故障、电流模式退出且停机确认；硬件遥测序号必须持续推进并新鲜，至少连续
 1 秒速度不超过 1 度/秒且各关节累计移动不超过 0.5 度。已观察到的非终态 JTC 目标会
 阻止释放；若此前位置运动未确认结束，还必须取得明确的目标终态证据。robot 重启后未
@@ -435,7 +449,7 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 复核通过只释放旧占用、保留失败记录并作废旧计划和预演授权，不自动续跑、切控制器或发运动命令。
 关闭 dashboard 节点同样会请求停止并有界等待 worker 退出。
 
-直接电流期间，右臂 JTC 暂时 inactive，但 `ros2_control_node`、`RMSystemHardware`、左臂 JTC、
+直接电流期间，所选臂 JTC 暂时 inactive，但 `ros2_control_node`、`RMSystemHardware`、其他臂 JTC、
 joint/F/T broadcaster、TF 和其它 ROS node 全部保持运行。Dashboard 的 sample/history 只有 ROS
 topic callback 可以写入，不再接受 subprocess stdout 遥测；`/dynamic_joint_states` 因此持续提供
 关节角度、电流、速度、温度、电压、使能和故障码。不得并行启动第二套 ros2_control。
@@ -452,12 +466,49 @@ topic callback 可以写入，不再接受 subprocess stdout 遥测；`/dynamic_
 同日清理无效试验代码并重新部署后，再次完整执行 10 组 × 5 个不同位姿，首轮全部通过。
 每点仍保持 3 秒，转场设置为 5.2–18.9°/秒；最大漂移约 0.148°，最大到位误差约 0.418°，
 无服务重试或恢复错误。本轮独立证据位于工作区 `test_data/hold_reacceptance_20260916/REPORT.md`。
-当前 CLI 默认 source 是 `identified_zero_force_drag.py` 中固定的已投用电流域模型；summary
-始终记录其解析后的绝对路径，因此默认值不会成为不可审计的隐式输入。服务会从
-`right_arm_joint1..7` 精确确认目标臂；其他命名（包括左臂）一律禁用，绝不猜测。当前 integrated
-current 接口硬锁在右侧 RM75 `.18/8080`，所以左臂按钮会显示“当前仅支持右侧 RM75”而不是
-复用右臂端点。父 CLI 会在 controller switch 之前复核 source 的 `result.json`：必须
-完整、结论通过、单位为安培，且七个关节名与右臂逐项一致。
+#### Per-instance calibration sources
+
+Gravity validation uses `ArmIdentity.from_joint_names` to require exactly seven
+ordered joints from one instance: `right_arm_joint1..7`, `left_arm_joint1..7`,
+or, for example, `station_3_arm_joint1..7`. The existing capability line shows
+the selected instance and any refusal reason. Ordinary identification remains generic.
+
+Set `ros.gravity_test_source` in the separately managed system configuration, or
+pass the existing `gravity_test_source` launch parameter. For example:
+
+```yaml
+ros:
+  gravity_test_source: "/absolute/calibrations/{arm}/accepted-run"
+```
+
+Selecting `left` resolves only `/absolute/calibrations/left/accepted-run/result.json`;
+`station_3` resolves only its own directory. An explicit literal directory or
+`result.json` path remains literal. There is no newest-result discovery, right-arm
+data copying, or cross-arm fallback. An empty source is allowed only for `right`,
+using the same fixed commissioned backend default; the dashboard resolves,
+validates and forwards that exact absolute source too.
+
+Before enabling validation or launching a current child, the dashboard checks
+that `result.json` is complete, has verdict `pass`, uses `ampere`, contains seven
+finite fits, and matches the selected ordered joint names exactly. A matching
+source alone does not enable the controls: the live description must declare
+one owning seven-joint `RMSystemHardware` with acknowledged direct current,
+`read_only=false`, position/current interfaces, and valid independent endpoint
+and guard bindings. Existing ACKs and all safety thresholds remain in force.
+
+Hold planning builds `ArmModel` from the live URDF using the instance's
+`<name>_arm_` prefix and checks its joint order against the calibration. It does
+not reuse stored-source geometry across mounts. Source bytes are pinned in the
+plan digest; source, description, selection and scene changes require replanning.
+Changing the selection discards sequence, position and timing evidence for
+recovery. A failed hold remains tied to its original joints and trajectory action;
+healthy evidence from another arm cannot release it.
+
+Live acceptance requires the coordinated `rm_control` current-session version
+that accepts the selected `--arm`, independently validates the explicit source,
+and binds its model and endpoints to live `/robot_description`. These dashboard
+changes are offline-verified only; they do not commission another arm or authorize
+hardware use. Do not deploy the dashboard alone against a right-only current runtime.
 
 正常的位置控制器与电流控制器切换不退出 ROS node。电流接管前必须预热新命令；退出时确认
 电流已关闭、取得停流后的新 UDP 反馈，再用当前角度初始化位置控制，避免跳回旧目标。
@@ -519,7 +570,6 @@ Pinocchio 回归量，再跨速度平均，最后只用 `A_gravity` 位姿拟合
 尚待完成：
 
 - 仍有三个测试模块引用旧的 MuJoCo 被控对象因而被跳过，需要迁移到解析被控对象
-- 3D 视图中的规划位姿残影仍是桩实现，尚未绘制
 - 还没有任何一次完整实验流程通过本面板端到端跑完
 
 ### 一个值得知道的告诫

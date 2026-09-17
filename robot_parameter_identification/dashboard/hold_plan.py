@@ -11,11 +11,13 @@ import threading
 
 import numpy as np
 
+from robot_parameter_identification.arm_identity import ArmIdentity
+from robot_parameter_identification.identification import ArmModel
 from robot_parameter_identification.system_config import (
     checked_value, system_defaults, write_system_config_snapshot,
 )
 
-RIGHT_JOINTS = [f"right_arm_joint{index}" for index in range(1, 8)]
+RIGHT_JOINTS = list(ArmIdentity("right").joint_names)
 _IMPORT_LOCK = threading.RLock()
 
 
@@ -82,11 +84,11 @@ def _load_backend():
         finally:
             sys.path[:] = original_path
 
-    def arm_model():
+    def arm_model(prefix="right_"):
         with _IMPORT_LOCK:
             original_path = sys.path[:]
             try:
-                return identified._arm_model("right_")[0]
+                return identified._arm_model(prefix)[0]
             finally:
                 sys.path[:] = original_path
 
@@ -121,8 +123,9 @@ def _vector(values, label):
 def _validate_source(payload, names):
     if not isinstance(payload, dict):
         raise ValueError("source must be a model object")
-    if names != RIGHT_JOINTS or payload.get("joint_names") != names:
-        raise ValueError("source must describe the seven ordered right-arm joints")
+    ArmIdentity.from_joint_names(names)
+    if payload.get("joint_names") != names:
+        raise ValueError("source must describe the selected arm's seven ordered joints")
     verdict = payload.get("verdict")
     if (payload.get("complete") is not True or
             not isinstance(verdict, dict) or verdict.get("state") != "pass" or
@@ -146,7 +149,8 @@ def _validate_source(payload, names):
 
 
 def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
-                    collision_free, *, backend=None, system_config=None) -> dict:
+                    collision_free, *, backend=None, system_config=None,
+                    urdf_text: str | None = None, exclude_poses_deg=None) -> dict:
     """Select a fixed preview; collision_free must screen the fresh scene in degrees.
 
     Invalid sources, insufficient admissible poses, or blocked transits raise
@@ -158,16 +162,27 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
     checked_value(count, settings, "hold_test.poses", integer=True)
     if not callable(collision_free):
         raise ValueError("a fresh scene collision guard is required")
+    excluded = [] if exclude_poses_deg is None else exclude_poses_deg
+    if not isinstance(excluded, list) or len(excluded) > 1000:
+        raise ValueError("excluded poses must be a list of at most 1000 joint vectors")
+    excluded_keys = {tuple(round(float(value), 3) for value in _vector(pose, "excluded pose"))
+                     for pose in excluded}
     names = list(joint_names)
+    identity = ArmIdentity.from_joint_names(names)
+    if not source.strip() and identity.name != "right":
+        raise ValueError("an explicit gravity source is required for the selected arm")
     start = _vector(start_deg, "start_deg").copy()
     backend = backend if backend is not None else _load_backend()
     path = _source_path(source.strip() or backend.current.DEFAULT_SOURCE)
     digest = _digest(path)
     _validate_source(json.loads(path.read_text("utf-8")), names)
-    model = backend.identified.load_identification(path.parent, "right_")
-    arm = backend.arm_model()
+    model = backend.identified.load_identification(path.parent, identity.prefix)
+    arm = (ArmModel.from_urdf_text(urdf_text, identity.model_prefix)
+           if urdf_text is not None else backend.arm_model(identity.prefix))
     if model["joint_names"] != names:
         raise ValueError("loaded model joint order differs from preview")
+    if list(arm.joint_names) != names:
+        raise ValueError("URDF joint order differs from the selected calibration")
     if any(not any(column < arm.parameter_count for column in columns)
            for columns in model["columns"]):
         raise ValueError("each joint requires gravity regressor columns")
@@ -175,6 +190,10 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
     if candidates.ndim != 2 or candidates.shape[1] != 7:
         raise ValueError("candidate poses must have seven joints")
     candidates = candidates[np.isfinite(candidates).all(axis=1)]
+    if excluded_keys:
+        keep = [tuple(round(float(value), 3) for value in pose) not in excluded_keys
+                for pose in candidates]
+        candidates = candidates[np.asarray(keep, dtype=bool)]
     gravity = np.asarray([
         _vector(backend.identified.gravity_current(model, arm, pose), "predicted current")
         for pose in candidates], dtype=float).reshape((-1, 7))
@@ -199,6 +218,8 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
             "joint_names": names, "start_deg": start.tolist(),
             "poses_deg": poses.tolist(), "predicted_current_a": gravity[order].tolist(),
             "count": count, "seed": seed}
+    if excluded_keys:
+        plan["excluded_poses_deg"] = [list(pose) for pose in sorted(excluded_keys)]
     if not source_is_current(plan):
         raise ValueError("source changed during planning")
     return plan
@@ -224,7 +245,10 @@ def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
             raise ValueError("source changed or is unavailable; rebuild the preview")
         checked_value(seconds, settings, "hold_test.seconds")
         checked_value(plan["count"], settings, "hold_test.poses", integer=True)
-        if (plan["joint_names"] != RIGHT_JOINTS or type(plan["count"]) is not int or
+        identity = ArmIdentity.from_joint_names(plan["joint_names"])
+        _validate_source(json.loads(_source_path(plan["source"]).read_text("utf-8")),
+                 list(identity.joint_names))
+        if (type(plan["count"]) is not int or
             len(plan["poses_deg"]) != plan["count"] or
                 len(plan["predicted_current_a"]) != plan["count"]):
             raise ValueError("invalid hold plan structure")
@@ -278,7 +302,7 @@ def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
                 "ros2", "run", "rm_control", "hold_check",
                 "--output", str(report_path), "--seconds", str(seconds),
                 "--corridor-deg", str(corridor), "--temperature-c", str(temperature),
-                "--source", plan["source"], "--arm", "right",
+                "--source", plan["source"], "--arm", identity.name,
                 "--ack", backend.current.ACKNOWLEDGEMENT]
             if snapshot is not None:
                 command.extend(["--system-config", str(snapshot)])

@@ -93,10 +93,16 @@ test('initial fit waits for synchronized geometry and does not repeat on telemet
   vm.runInNewContext(telemetryFit[0], { state, fitScene });
   assert.deepEqual(camera.position, userPosition);
   state.ghostNodes.push({
-    line: new THREE.Line(new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 1.1), new THREE.Vector3(3, 3, 4),
-    ])),
-    tip: new THREE.Mesh(new THREE.SphereGeometry(0.012)),
+    parts: [new THREE.Vector3(3, 3, 4), new THREE.Vector3(-4, -2, 3)].map(endpoint => {
+      const tip = new THREE.Mesh(new THREE.SphereGeometry(0.012));
+      tip.position.copy(endpoint);
+      return {
+        line: new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(0, 0, 1.1), endpoint,
+        ])),
+        tip,
+      };
+    }),
   });
   fitScene();
   assert.ok(camera.position.distanceTo(userPosition) > 0.1);
@@ -104,4 +110,10 @@ test('initial fit waits for synchronized geometry and does not repeat on telemet
   camera.aspect = 0.4;
   fitScene();
   assert.ok(camera.position.distanceTo(previewPosition) > 0.1);
+  camera.updateMatrixWorld(true);
+  for (const { tip } of state.ghostNodes[0].parts) {
+    const projected = tip.position.clone().project(camera);
+    assert.ok(Math.abs(projected.x) < 1 && Math.abs(projected.y) < 1);
+    assert.ok(projected.z > -1 && projected.z < 1);
+  }
 });

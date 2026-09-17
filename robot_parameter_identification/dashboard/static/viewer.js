@@ -158,9 +158,11 @@ function fitScene() {
     }
   }
   const hasModelBounds = !bounds.isEmpty();
-  for (const { line, tip } of state.ghostNodes) {
-    bounds.expandByObject(line, true);
-    bounds.expandByObject(tip, true);
+  for (const { parts } of state.ghostNodes) {
+    for (const { line, tip } of parts) {
+      bounds.expandByObject(line, true);
+      bounds.expandByObject(tip, true);
+    }
   }
   const rect = host.getBoundingClientRect();
   if (!rect.width || !rect.height) return false;
@@ -527,19 +529,24 @@ async function loadPreview() {
   for (const group of data.groups || []) {
     const color = GHOST_COLORS[group.phase] ?? GHOST_FALLBACK;
     for (const pose of group.poses || []) {
-      const points = (pose.points || []).map((p) => new THREE.Vector3(...p));
-      if (points.length < 2) continue;
-      const line = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(points),
-        new THREE.LineBasicMaterial({ color, transparent: true,
-                                      opacity: GHOST_DIM }));
-      const tip = new THREE.Mesh(ballGeometry, new THREE.MeshBasicMaterial({
-        color, transparent: true, opacity: GHOST_DIM + 0.2 }));
-      tip.position.copy(points[points.length - 1]);
-      tip.scale.setScalar(0.012);
-      ghostGroup.add(line, tip);
+      const parts = [];
+      for (const path of pose.paths || [pose.points || []]) {
+        const points = path.map((point) => new THREE.Vector3(...point));
+        if (points.length < 2) continue;
+        const line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(points),
+          new THREE.LineBasicMaterial({ color, transparent: true,
+                                        opacity: GHOST_DIM }));
+        const tip = new THREE.Mesh(ballGeometry, new THREE.MeshBasicMaterial({
+          color, transparent: true, opacity: GHOST_DIM + 0.2 }));
+        tip.position.copy(points[points.length - 1]);
+        tip.scale.setScalar(0.012);
+        ghostGroup.add(line, tip);
+        parts.push({ line, tip });
+      }
+      if (!parts.length) continue;
       state.ghostNodes.push({ phase: group.phase, index: pose.index,
-              pose: pose.pose_deg, color, line, tip });
+              pose: pose.pose_deg, color, parts });
     }
   }
   state.flyFrom = 0;
@@ -557,11 +564,13 @@ function highlightPose(phase, index, completed = state.completedPoses) {
     const on = node.phase === phase && node.index === index;
     const complete = done.get(node.phase)?.has(node.index) || false;
     const color = on ? GHOST_ACTIVE : complete ? GHOST_COMPLETED : node.color;
-    node.line.material.color.setHex(color);
-    node.tip.material.color.setHex(color);
-    node.line.material.opacity = on ? 1.0 : complete ? 0.68 : GHOST_DIM;
-    node.tip.material.opacity = on ? 1.0 : complete ? 0.84 : GHOST_DIM + 0.2;
-    node.tip.scale.setScalar(on ? 0.024 : complete ? 0.016 : 0.012);
+    for (const { line, tip } of node.parts) {
+      line.material.color.setHex(color);
+      tip.material.color.setHex(color);
+      line.material.opacity = on ? 1.0 : complete ? 0.68 : GHOST_DIM;
+      tip.material.opacity = on ? 1.0 : complete ? 0.84 : GHOST_DIM + 0.2;
+      tip.scale.setScalar(on ? 0.024 : complete ? 0.016 : 0.012);
+    }
   }
 }
 

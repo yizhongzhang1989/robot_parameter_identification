@@ -265,9 +265,18 @@ const DICT = {
   'gravtest.output': { en: 'output', zh: '输出' },
   'gravtest.exit': { en: 'process exit', zh: '进程退出码' },
   'gravtest.evidence': { en: 'Open summary evidence', zh: '打开汇总证据' },
-  'gravtest.right_arm_only': {
-    en: 'These checks are currently fixed to the right RM75.',
-    zh: '这些检查当前仅支持右侧 RM75。',
+  'gravtest.selected_arm': { en: 'Arm: {arm}', zh: '机械臂：{arm}' },
+  'gravtest.invalid_source': {
+    en: 'A matching validated calibration is required.',
+    zh: '需要与所选机械臂匹配且验证通过的标定结果。',
+  },
+  'gravtest.model_mismatch': {
+    en: 'The live model does not match the selected arm.',
+    zh: '实时模型与所选机械臂不匹配。',
+  },
+  'gravtest.unsafe_binding': {
+    en: 'The selected hardware is not ready for acknowledged current control.',
+    zh: '所选硬件尚未满足已确认的电流控制条件。',
   },
   'gravtest.unsupported_arm': {
     en: 'These checks require one complete RealMan arm with joints 1 through 7.',

@@ -360,13 +360,12 @@ class MotionStopVerificationTest(unittest.TestCase):
             stopped = True
 
         self.plant.set_stop_requested(lambda: stopped)
-        self.plant.sample.side_effect = [None, frame()]
-        self.plant._spin_for = Mock(side_effect=refresh)
+        self.plant._spin_once = Mock(side_effect=refresh)
 
         with self.assertRaisesRegex(RuntimeError, "^stop requested$"):
             self.plant.move_to(np.zeros(JOINTS))
 
-        self.plant._spin_for.assert_called_once_with(hardware.TELEMETRY_REFRESH_S)
+        self.plant._spin_once.assert_called_once_with(0.01)
         self.plant._client.send_goal_async.assert_not_called()
 
     def test_stop_during_goal_construction_prevents_actual_send(self):
@@ -586,6 +585,8 @@ class MotionTest(unittest.TestCase):
         self.plant._rclpy = FakeRclpy(self.plant, [frame()])
         self.plant._latest = frame()
         self.plant._latest_at = __import__("time").monotonic()
+        self.plant._stationary_start = Mock(side_effect=lambda: np.asarray(
+            self.plant._require_sample()["position_deg"], dtype=float).copy())
 
     def test_duration_scales_with_distance_and_speed(self):
         target = np.zeros(JOINTS)

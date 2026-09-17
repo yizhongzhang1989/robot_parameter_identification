@@ -1,6 +1,8 @@
 """Identification must generalise, not just fit the data it was given."""
 
 import unittest
+from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -72,6 +74,75 @@ class LockedJointPlacementTest(unittest.TestCase):
     def test_a_name_this_robot_lacks_is_skipped_not_fatal(self):
         # The same reading is shared between arms and dashboards.
         self.assertTrue(self.reduced({"no_such_joint": 1.0}).joint_count == 1)
+
+    def test_preview_ends_at_the_controller_selected_body(self):
+        for selected in ("mine", "theirs"):
+            profile = SimpleNamespace(name="selected-controller",
+                                      joint_names=[f"{selected}_joint1"])
+            model = ident.ArmModel.from_profile(TWO_ARM_URDF, profile)
+            for angle in (0.0, 30.0, -60.0):
+                with self.subTest(selected=selected, angle=angle):
+                    points = model.skeleton([angle])
+                    transforms = model.link_transforms([angle])
+                    expected = np.asarray(transforms[f"{selected}_link1"]).reshape(4, 4)
+                    np.testing.assert_allclose(points[-1], expected[:3, 3])
+                    self.assertEqual(len(points), 2)
+
+    def test_fixed_tool_belongs_to_selected_chain_not_last_urdf_frame(self):
+        root = ET.fromstring(TWO_ARM_URDF)
+        for selected in ("mine", "theirs"):
+            ET.SubElement(root, "link", name=f"{selected}_tool")
+            joint = ET.SubElement(root, "joint", name=f"{selected}_mount", type="fixed")
+            ET.SubElement(joint, "parent", link=f"{selected}_link1")
+            ET.SubElement(joint, "child", link=f"{selected}_tool")
+            ET.SubElement(joint, "origin", xyz="0.1 0 0.2")
+        for selected in ("mine", "theirs"):
+            profile = SimpleNamespace(name="selected-controller",
+                                      joint_names=[f"{selected}_joint1"])
+            model = ident.ArmModel.from_profile(ET.tostring(root, encoding="unicode"), profile)
+            points = model.skeleton([45.0])
+            expected = np.asarray(model.link_transforms([45.0])[f"{selected}_tool"]).reshape(4, 4)
+            np.testing.assert_allclose(points[-1], expected[:3, 3])
+
+    def test_controller_with_two_roots_has_no_segment_between_robots(self):
+        model = ident.ArmModel.from_profile(TWO_ARM_URDF, SimpleNamespace(
+            name="both-controller", joint_names=["theirs_joint1", "mine_joint1"]))
+        paths = model.skeleton_paths([20.0, -40.0])
+        self.assertEqual(len(paths), 2)
+        np.testing.assert_allclose(paths[0], [[0, 0.2, 0], [0, 0.2, 0]])
+        np.testing.assert_allclose(paths[1], [[0, -0.2, 0], [0, -0.2, 0]])
+        with self.assertRaisesRegex(ValueError, "multiple skeleton paths"):
+            model.skeleton([20.0, -40.0])
+
+    def test_fixed_tool_branches_have_independent_tips(self):
+        root = ET.fromstring(TWO_ARM_URDF)
+        for label, offset in (("camera", "0.2 0 0.3"), ("tool", "0 0 0.5")):
+            ET.SubElement(root, "link", name=label)
+            joint = ET.SubElement(root, "joint", name=f"mount_{label}", type="fixed")
+            ET.SubElement(joint, "parent", link="mine_link1")
+            ET.SubElement(joint, "child", link=label)
+            ET.SubElement(joint, "origin", xyz=offset)
+        model = ident.ArmModel.from_profile(
+            ET.tostring(root, encoding="unicode"),
+            SimpleNamespace(name="custom", joint_names=["mine_joint1"]))
+        paths = model.skeleton_paths([30.0])
+        transforms = model.link_transforms([30.0])
+        expected = [np.asarray(transforms[name]).reshape(4, 4)[:3, 3]
+                    for name in ("camera", "tool")]
+        self.assertEqual(len(paths), 2)
+        for endpoint in expected:
+            self.assertTrue(any(np.allclose(path[-1], endpoint) for path in paths))
+
+    def test_uncontrolled_movable_descendant_is_not_a_controller_tool(self):
+        root = ET.fromstring(TWO_ARM_URDF)
+        joint = root.find("joint[@name='theirs_joint1']")
+        joint.find("parent").set("link", "mine_link1")
+        model = ident.ArmModel.from_profile(
+            ET.tostring(root, encoding="unicode"),
+            SimpleNamespace(name="custom", joint_names=["mine_joint1"]))
+        points = model.skeleton([30.0])
+        expected = np.asarray(model.link_transforms([30.0])["mine_link1"]).reshape(4, 4)
+        np.testing.assert_allclose(points[-1], expected[:3, 3])
 
 
 def arm_model():

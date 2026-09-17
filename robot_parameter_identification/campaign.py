@@ -1124,6 +1124,8 @@ class Campaign:
         self.reports.append(report)
         return report, self.clock()
 
+    _recover_drive_trips = True
+
     def _attempt(self, report: PhaseReport, what: str, motion) -> bool:
         """Run one motion, and let the campaign outlive it failing.
 
@@ -1142,7 +1144,7 @@ class Campaign:
             motion()
             return True
         except DriveTrip as trip:
-            if not trip.recoverable:
+            if not trip.recoverable or not self._recover_drive_trips:
                 raise
             self._skipped(report, what, f"drive trip: {trip}")
             self._back_off(trip)
@@ -1150,7 +1152,7 @@ class Campaign:
         except DriveLimitExceeded as failure:
             trip = DriveTrip(str(failure), joint=failure.joint,
                              kind=failure.kind)
-            if not trip.recoverable:
+            if not trip.recoverable or not self._recover_drive_trips:
                 raise
             self._skipped(report, what, f"drive trip: {trip}")
             self._back_off(trip)
@@ -1651,6 +1653,8 @@ class GravityCampaign(Campaign):
     identically zero and the base-parameter reduction drops them. What this
     yields holds the arm up; it does not move it fast.
     """
+
+    _recover_drive_trips = False
 
     def _main_training_observations(self, usable):
         return [record for record in usable if record.phase == PHASE_GRAVITY]

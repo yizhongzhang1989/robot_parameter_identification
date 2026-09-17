@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from dashboard_gravity_fixtures import gravity_source, gravity_urdf
 from robot_parameter_identification.dashboard.http_server import build_routes
 from robot_parameter_identification.dashboard.service import (
     DashboardConfig, GRAVITY_HOLD_TEST, GRAVITY_TEST_ACKNOWLEDGEMENT,
@@ -85,6 +86,8 @@ def test_saved_cell_gravity_overrides_system_without_writing_system(tmp_path):
 
 def test_hold_api_uses_configured_defaults_when_options_are_absent(tmp_path):
     made, _ = configured_service(tmp_path)
+    made.config.gravity_test_source = str(gravity_source(tmp_path / "model"))
+    made.adopt_description(gravity_urdf())
     with patch.object(made, "_start_planned_hold", Mock(return_value={"ok": True})) as start:
         made.start_gravity_test(GRAVITY_HOLD_TEST, {
             "acknowledgement": GRAVITY_TEST_ACKNOWLEDGEMENT, "plan_id": "reviewed"})

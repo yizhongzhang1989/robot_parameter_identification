@@ -4,9 +4,12 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
+from fixtures import synthetic_urdf
+from robot_parameter_identification.arm_identity import ArmIdentity
 from robot_parameter_identification.dashboard import hold_plan
 
 
@@ -43,7 +46,8 @@ class HoldPlanTest(unittest.TestCase):
                 DEFAULT_CORRIDOR_DEG=self.legacy.current.DEFAULT_CORRIDOR_DEG,
                 MAXIMUM_TEMPERATURE_C=self.legacy.current.MAXIMUM_TEMPERATURE_C,
                 ACKNOWLEDGEMENT=self.legacy.current.ACKNOWLEDGEMENT),
-            arm_model=Mock(return_value=SimpleNamespace(parameter_count=70)))
+            arm_model=Mock(return_value=SimpleNamespace(
+                parameter_count=70, joint_names=hold_plan.RIGHT_JOINTS.copy())))
         self.commands = []
         self.moves = []
         self.events = []
@@ -131,6 +135,110 @@ class HoldPlanTest(unittest.TestCase):
             np.testing.assert_allclose(seen[(index + 1) * 400 - 1], pose, atol=1e-12)
         np.testing.assert_allclose(plan["predicted_current_a"], np.abs(plan["poses_deg"]) / 100)
 
+    def test_selected_instance_controls_model_and_every_hold_child(self):
+        for name in ("right", "left", "station_3"):
+            with self.subTest(name=name):
+                identity = ArmIdentity(name)
+                names = list(identity.joint_names)
+                self.payload["joint_names"] = names
+                self.source.write_text(json.dumps(self.payload))
+                self.model["joint_names"] = names
+                self.backend.arm_model.return_value.joint_names = names
+                self.commands.clear()
+                plan = self.build(joint_names=names)
+                self.backend.identified.load_identification.assert_called_with(
+                    self.folder, identity.prefix)
+                self.backend.arm_model.assert_called_with(identity.prefix)
+                result = self.execute(plan, output_directory=self.folder / name)
+                self.assertEqual(result["result"], "PASS", result)
+                for command, _timeout in self.commands:
+                    self.assertEqual(command[command.index("--arm") + 1], name)
+
+    def test_source_from_another_instance_is_refused_before_loading_model(self):
+        with self.assertRaisesRegex(ValueError, "selected arm"):
+            self.build(joint_names=list(ArmIdentity("left").joint_names))
+        self.backend.identified.load_identification.assert_not_called()
+        self.backend.arm_model.assert_not_called()
+
+    def test_nonright_arm_requires_an_explicit_source(self):
+        for name in ("left", "station_3"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "explicit"):
+                self.build(source="", joint_names=list(ArmIdentity(name).joint_names))
+        self.backend.identified.load_identification.assert_not_called()
+        self.backend.arm_model.assert_not_called()
+
+    def test_live_urdf_uses_the_selected_model_prefix_without_backend_geometry(self):
+        for name in ("right", "left", "station_3"):
+            with self.subTest(name=name):
+                identity = ArmIdentity(name)
+                names = list(identity.joint_names)
+                self.payload["joint_names"] = names
+                self.source.write_text(json.dumps(self.payload))
+                self.model["joint_names"] = names
+                urdf = synthetic_urdf(prefix=identity.model_prefix)
+                with patch.object(hold_plan.ArmModel, "from_urdf_text",
+                                  wraps=hold_plan.ArmModel.from_urdf_text) as constructor:
+                    plan = self.build(joint_names=names, urdf_text=urdf)
+                constructor.assert_called_once_with(urdf, identity.model_prefix)
+                self.assertEqual(plan["joint_names"], names)
+                arm = self.backend.identified.gravity_current.call_args.args[1]
+                self.assertEqual(list(arm.joint_names), names)
+                self.backend.arm_model.assert_not_called()
+
+    def test_live_urdf_with_incomplete_selected_joints_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "URDF joint order"):
+            self.build(urdf_text=synthetic_urdf(joints=6))
+        self.backend.identified.gravity_current.assert_not_called()
+        self.backend.arm_model.assert_not_called()
+
+    def test_live_mount_prediction_matches_runtime_gravity_without_source_geometry(self):
+        identity = ArmIdentity("left")
+        names = list(identity.joint_names)
+        columns = list(range(70))
+        parameters = [0.001] * 70
+        self.payload["joint_names"] = names
+        self.payload["joints"] = [
+            {"columns": columns, "parameters": parameters} for _index in range(7)]
+        self.source.write_text(json.dumps(self.payload))
+        self.model.update(joint_names=names, columns=[np.asarray(columns)] * 7,
+                          parameters=[np.asarray(parameters)] * 7)
+        self.backend.identified.gravity_current = self.legacy.identified.gravity_current
+        self.candidates = np.array([[7.0] * 7])
+        predictions = []
+        for rotation in ("0 0 0", "0 1.2 0"):
+            root = ET.fromstring(synthetic_urdf(prefix=identity.model_prefix))
+            ET.SubElement(root, "link", name="world")
+            mount = ET.SubElement(root, "joint", name="mount", type="fixed")
+            ET.SubElement(mount, "parent", link="world")
+            ET.SubElement(mount, "child", link=f"{identity.model_prefix}base_link")
+            ET.SubElement(mount, "origin", xyz="0 0 0", rpy=rotation)
+            urdf = ET.tostring(root, encoding="unicode")
+            plan = self.build(joint_names=names, count=1, urdf_text=urdf)
+            runtime_arm = hold_plan.ArmModel.from_urdf_text(urdf, identity.model_prefix)
+            expected = self.legacy.identified.gravity_current(
+                self.model, runtime_arm, self.candidates[0])
+            np.testing.assert_allclose(plan["predicted_current_a"][0], expected, atol=1e-12)
+            predictions.append(plan["predicted_current_a"][0])
+        self.assertFalse(np.allclose(*predictions))
+        self.backend.arm_model.assert_not_called()
+
+    def test_execution_rechecks_source_identity_before_any_move_or_child(self):
+        plan = self.build()
+        plan["joint_names"] = list(ArmIdentity("left").joint_names)
+        result = self.execute(plan)
+        self.assertEqual(result["result"], "FAIL")
+        self.assertIn("selected arm", result["reason"])
+        self.assertFalse(self.moves)
+        self.assertFalse(self.commands)
+
+    def test_identity_rejects_mixed_reordered_or_invalid_joint_names(self):
+        right = list(ArmIdentity("right").joint_names)
+        for names in ([], right[:-1], right[::-1],
+                      [*right[:-1], "left_arm_joint7"],
+                      [name.replace("right", "../left") for name in right]):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                ArmIdentity.from_joint_names(names)
+
     def test_new_seeds_produce_different_pose_sets(self):
         self.candidates = np.array([[value] * 7 for value in range(20)])
         with patch.object(hold_plan.secrets, "randbits", side_effect=[11, 12]):
@@ -138,6 +246,39 @@ class HoldPlanTest(unittest.TestCase):
             second = self.build()
         self.assertNotEqual(first["seed"], second["seed"])
         self.assertNotEqual(first["poses_deg"], second["poses_deg"])
+
+    def test_ten_batches_select_fifty_unique_measured_poses_without_replanning(self):
+        self.candidates = np.array([[value] * 7 for value in range(60)], dtype=float)
+        selected = []
+        for _batch in range(10):
+            plan = self.build(count=5, exclude_poses_deg=selected)
+            keys = {tuple(round(value, 3) for value in pose) for pose in selected}
+            self.assertFalse(keys.intersection(tuple(pose) for pose in plan["poses_deg"]))
+            selected.extend(plan["poses_deg"])
+        self.assertEqual(len({tuple(pose) for pose in selected}), 50)
+        self.assertEqual(self.backend.campaign.random_then_order.call_count, 10)
+
+    def test_excluded_poses_use_preview_precision_and_are_frozen_in_plan(self):
+        excluded = [[-10.12346] * 7]
+        plan = self.build(exclude_poses_deg=excluded)
+        self.assertEqual(plan["poses_deg"], [[0.0] * 7, [10.0] * 7, [20.0] * 7])
+        self.assertEqual(plan["excluded_poses_deg"], [[-10.123] * 7])
+        excluded[0][0] = 999
+        self.assertEqual(plan["excluded_poses_deg"][0][0], -10.123)
+
+    def test_exclusions_cannot_relax_current_or_collision_constraints(self):
+        self.candidates = np.asarray([[0.0] * 7, [100.0] * 7])
+        with self.assertRaisesRegex(ValueError, "insufficient"):
+            self.build(count=1, exclude_poses_deg=[[0.0] * 7])
+        self.candidates = np.asarray([[0.0] * 7, [10.0] * 7])
+        with self.assertRaisesRegex(ValueError, "blocked"):
+            self.build(count=1, exclude_poses_deg=[[0.0] * 7], collision_free=lambda _pose: False)
+
+    def test_malformed_exclusions_fail_before_backend_loading(self):
+        for excluded in ("bad", {}, [[0] * 6], [[float("nan")] * 7], [[0] * 7] * 1001):
+            with self.subTest(excluded=str(excluded)[:50]), self.assertRaises(ValueError):
+                self.build(exclude_poses_deg=excluded)
+        self.backend.identified.load_identification.assert_not_called()
 
     def test_configured_wider_ranges_reach_every_hold_child_snapshot(self):
         from robot_parameter_identification.system_config import load_system_config, system_defaults
