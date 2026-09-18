@@ -8,92 +8,82 @@ import math
 import secrets
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 
-from robot_parameter_identification.arm_identity import ArmIdentity
+from robot_parameter_identification import gravity_current_model, hold_candidates
+from robot_parameter_identification.arm_identity import (
+    ArmIdentity, DEFAULT_MAXIMUM_COMMAND_A, DEFAULT_PEAK_CURRENT_A,
+)
 from robot_parameter_identification.identification import ArmModel
 from robot_parameter_identification.system_config import (
     checked_value, system_defaults, write_system_config_snapshot,
 )
 
 RIGHT_JOINTS = list(ArmIdentity("right").joint_names)
-_IMPORT_LOCK = threading.RLock()
+_OFFLINE_MODEL_LOCK = threading.RLock()
+
+
+def _workspace_root() -> Path:
+    candidates = (*Path.cwd().parents, *Path(__file__).resolve().parents)
+    for candidate in (Path.cwd(), *candidates):
+        if (candidate / "src" / "robot_description" / "urdf" / "robot.urdf.xacro").is_file():
+            return candidate
+    return Path.cwd()
+
+
+def _offline_arm_model(prefix="right_"):
+    """Render workspace geometry only when an offline caller supplies no live URDF."""
+    import xacro
+
+    with _OFFLINE_MODEL_LOCK:
+        mappings = {
+            "use_mock_hardware": "true",
+            "right_arm_xyz": "0 -0.2 0.4", "right_arm_rpy": "0 0 0",
+            "left_arm_xyz": "0 0.2 0.4", "left_arm_rpy": "0 0 0",
+        }
+        try:
+            import yaml
+            from common.workspace_utils import get_config_dir
+
+            with (Path(get_config_dir()) / "robot_mounts.yaml").open(encoding="utf-8") as handle:
+                mounts = yaml.safe_load(handle) or {}
+            for arm in ("right_arm", "left_arm"):
+                section = mounts.get(arm) or {}
+                for key in ("xyz", "rpy"):
+                    if key in section:
+                        mappings[f"{arm}_{key}"] = " ".join(
+                            str(float(value)) for value in section[key])
+        except Exception as error:
+            import warnings
+
+            warnings.warn(f"offline hold model using default mounts ({error})", stacklevel=2)
+        path = _workspace_root() / "src" / "robot_description" / "urdf" / "robot.urdf.xacro"
+        urdf = xacro.process_file(str(path), mappings=mappings).toxml()
+    return ArmModel.from_urdf_text(urdf, prefix)
 
 
 def _load_backend():
-    """Load installed flat legacy modules without changing global import bindings."""
-    import builtins
-    import importlib.util
-    import sys
-    from types import SimpleNamespace
-
-    from ament_index_python.packages import get_package_prefix
-
-    directory = Path(get_package_prefix("rm_control")) / "lib" / "rm_control"
-    modules = {}
-
-    def render_xacro(command, **_options):
-        import xacro
-
-        if (len(command) < 2 or command[0] != "xacro" or
-                any(":=" not in value for value in command[2:])):
-            raise ValueError("offline model loading only permits in-process xacro")
-        mappings = dict(value.split(":=", 1) for value in command[2:])
-        return SimpleNamespace(
-            stdout=xacro.process_file(command[1], mappings=mappings).toxml(),
-            stderr="", returncode=0)
-
-    def load(name):
-        if name in modules:
-            return modules[name]
-        spec = importlib.util.spec_from_file_location(
-            f"{__name__}._legacy_{name}", directory / f"{name}.py")
-        if spec is None or spec.loader is None:
-            raise ImportError(f"installed rm_control helper unavailable: {name}")
-        module = importlib.util.module_from_spec(spec)
-
-        def import_local(import_name, globals=None, locals=None, fromlist=(), level=0):
-            if level == 0 and import_name == "subprocess" and name == "identified_zero_force_drag":
-                return SimpleNamespace(run=render_xacro)
-            if level == 0 and (directory / f"{import_name}.py").is_file():
-                return load(import_name)
-            return builtins.__import__(import_name, globals, locals, fromlist, level)
-
-        module.__dict__["__builtins__"] = dict(vars(builtins), __import__=import_local)
-        modules[name] = module
-        previous = sys.modules.get(spec.name)
-        sys.modules[spec.name] = module
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            if previous is None:
-                sys.modules.pop(spec.name, None)
-            else:
-                sys.modules[spec.name] = previous
-        return module
-
-    with _IMPORT_LOCK:
-        original_path = sys.path[:]
-        try:
-            campaign = load("identified_static_hold_campaign")
-            identified = load("identified_zero_force_drag")
-            current = load("forward_current_controller_test")
-            if current.WORKSPACE_ROOT is not None:
-                identified.REPO = current.WORKSPACE_ROOT
-        finally:
-            sys.path[:] = original_path
-
-    def arm_model(prefix="right_"):
-        with _IMPORT_LOCK:
-            original_path = sys.path[:]
-            try:
-                return identified._arm_model(prefix)[0]
-            finally:
-                sys.path[:] = original_path
-
-    return SimpleNamespace(campaign=campaign, identified=identified,
-                           current=current, arm_model=arm_model)
+    """Expose the legacy planning surface using only local shared functions."""
+    source = (_workspace_root() / "identification_results" /
+              "optimal_excitation_regime_separated-20260825-232541")
+    return SimpleNamespace(
+        campaign=SimpleNamespace(
+            _executed_poses=hold_candidates.executed_poses,
+            admissible=hold_candidates.admissible,
+            random_then_order=hold_candidates.random_then_order,
+            spread_then_order=hold_candidates.spread_then_order,
+            transit_clear=hold_candidates.transit_clear),
+        identified=SimpleNamespace(
+            load_identification=gravity_current_model.load_identification,
+            gravity_current=gravity_current_model.gravity_current,
+            CONTINUOUS_CURRENT_A=np.asarray(DEFAULT_MAXIMUM_COMMAND_A),
+            PEAK_CURRENT_A=np.asarray(DEFAULT_PEAK_CURRENT_A)),
+        current=SimpleNamespace(
+            DEFAULT_SOURCE=source, ACKNOWLEDGEMENT="I_AM_HOLDING_ARM_AND_ESTOP_READY",
+            DEFAULT_CORRIDOR_DEG=5.0, MAXIMUM_TEMPERATURE_C=40.0),
+        arm_model=_offline_arm_model)
 
 
 def _source_path(source):
@@ -118,6 +108,13 @@ def _vector(values, label):
     if array.shape != (7,) or not np.isfinite(array).all():
         raise ValueError(f"{label} must contain seven finite values")
     return array
+
+
+def _command_limits(values):
+    limits = _vector(values, "maximum command current").copy()
+    if np.any(limits <= 0) or np.any(limits > DEFAULT_MAXIMUM_COMMAND_A):
+        raise ValueError("maximum command current exceeds the supported command envelope")
+    return limits
 
 
 def _validate_source(payload, names):
@@ -150,7 +147,8 @@ def _validate_source(payload, names):
 
 def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
                     collision_free, *, backend=None, system_config=None,
-                    urdf_text: str | None = None, exclude_poses_deg=None) -> dict:
+                    urdf_text: str | None = None, exclude_poses_deg=None,
+                    maximum_command_a=DEFAULT_MAXIMUM_COMMAND_A) -> dict:
     """Select a fixed preview; collision_free must screen the fresh scene in degrees.
 
     Invalid sources, insufficient admissible poses, or blocked transits raise
@@ -162,6 +160,7 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
     checked_value(count, settings, "hold_test.poses", integer=True)
     if not callable(collision_free):
         raise ValueError("a fresh scene collision guard is required")
+    command_limits = _command_limits(maximum_command_a)
     excluded = [] if exclude_poses_deg is None else exclude_poses_deg
     if not isinstance(excluded, list) or len(excluded) > 1000:
         raise ValueError("excluded poses must be a list of at most 1000 joint vectors")
@@ -198,7 +197,7 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
         _vector(backend.identified.gravity_current(model, arm, pose), "predicted current")
         for pose in candidates], dtype=float).reshape((-1, 7))
     keep = backend.campaign.admissible(
-        gravity, np.zeros(len(candidates)), backend.identified.CONTINUOUS_CURRENT_A, 0.0)
+        gravity, np.zeros(len(candidates)), command_limits, 0.0)
     candidates, gravity = candidates[keep], gravity[keep]
     if len(candidates) < count:
         raise ValueError("insufficient finite poses inside the commissioned current envelope")
@@ -217,7 +216,7 @@ def build_hold_plan(source: str, joint_names: list, start_deg: list, count: int,
     plan = {"source": str(path.parent), "source_digest": digest,
             "joint_names": names, "start_deg": start.tolist(),
             "poses_deg": poses.tolist(), "predicted_current_a": gravity[order].tolist(),
-            "count": count, "seed": seed}
+            "maximum_command_a": command_limits.tolist(), "count": count, "seed": seed}
     if excluded_keys:
         plan["excluded_poses_deg"] = [list(pose) for pose in sorted(excluded_keys)]
     if not source_is_current(plan):
@@ -254,8 +253,10 @@ def execute_hold_plan(plan, seconds, output_directory, abort, on_progress,
             raise ValueError("invalid hold plan structure")
         _vector(plan["start_deg"], "start_deg")
         poses = [_vector(pose, "pose").tolist() for pose in plan["poses_deg"]]
+        command_limits = _command_limits(plan.get("maximum_command_a", DEFAULT_MAXIMUM_COMMAND_A))
         for current in plan["predicted_current_a"]:
-            _vector(current, "predicted current")
+            if np.any(np.abs(_vector(current, "predicted current")) > command_limits):
+                raise ValueError("predicted current exceeds the frozen instance command limit")
         backend = backend if backend is not None else _load_backend()
         defaults = settings["dashboard"]["hold_test"]
         corridor = checked_value(defaults["corridor_deg"], settings, "hold_test.corridor_deg")

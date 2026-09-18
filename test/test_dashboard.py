@@ -490,7 +490,8 @@ class GravityValidationTest(unittest.TestCase):
             def launch(command, **_kwargs):
                 folder = Path(command[command.index("--status-file") + 1]).parent
                 (folder / "gravity_test_summary.json").write_text(
-                    json.dumps({"result": "PASS"}), encoding="utf-8")
+                    json.dumps({"result": "PASS", "stop_verified": True,
+                                "restore_errors": []}), encoding="utf-8")
                 entered.set()
                 release.wait(1.0)
                 return self.Process(command)

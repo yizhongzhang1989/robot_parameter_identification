@@ -110,7 +110,7 @@ class DragProcessGroupTest(unittest.TestCase):
                 self.assertEqual(self.read_ready_line(process), "child ready")
                 folder = Path(command[command.index("--status-file") + 1]).parent
                 (folder / "gravity_test_summary.json").write_text(
-                    '{"result": "STOPPED", "stop_verified": true}',
+                    '{"result": "STOPPED", "stop_verified": true, "restore_errors": []}',
                     encoding="utf-8")
                 if during_launch:
                     self.assertIsNone(made._external_process)

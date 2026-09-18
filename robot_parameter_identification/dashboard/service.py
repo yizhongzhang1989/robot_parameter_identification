@@ -363,6 +363,8 @@ class IdentificationService:
         self._hold_recovery_required = False
         self._hold_recovery_selection = None
         self._hold_current_started = False
+        self._current_recovery_running = False
+        self._current_recovery_report = None
         self._default_gravity_source = None
         # Poses the phases of a running campaign have designed so far.
         self._designed: dict = {}
@@ -888,7 +890,9 @@ class IdentificationService:
         capability = self.gravity_test_capability()
         if not capability["available"]:
             raise ValueError(capability["reason"])
-        source = self._gravity_source(ArmIdentity(capability["arm"]))
+        identity = ArmIdentity(capability["arm"])
+        binding = ArmBinding.from_description(identity, self.urdf_text)
+        source = self._gravity_source(identity)
         if self.scene is None or self.screen_drift():
             raise ValueError("refresh the collision scene before planning holds")
         count = checked_value(options.get("poses", self.system["dashboard"]["hold_test"]["poses"]),
@@ -909,7 +913,8 @@ class IdentificationService:
             plan = hold_plan_module.build_hold_plan(
                 source, list(self.arm.joint_names), start, count, clear,
                 system_config=self.system, urdf_text=self.urdf_text,
-                exclude_poses_deg=options.get("exclude_poses_deg"))
+                exclude_poses_deg=options.get("exclude_poses_deg"),
+                maximum_command_a=binding.maximum_command_a)
             if plan["poses_deg"] != previous.get("poses_deg"):
                 break
         else:
@@ -1579,6 +1584,130 @@ class IdentificationService:
         worker.join(max(0.0, float(timeout_s)))
         return not worker.is_alive()
 
+    def current_recovery_payload(self) -> dict:
+        with self._lock:
+            payload = {"required": self._hold_recovery_required,
+                       "available": False, "running": self._current_recovery_running,
+                       "reason": "no pending current-mode recovery"}
+            if not self._hold_recovery_required:
+                return payload
+            if (self._state != PAUSED or self._worker is not None or self.planning
+                    or self._current_recovery_running
+                    or (self._external_process is not None
+                        and self._external_process.poll() is None)):
+                return {**payload, "reason": "waiting for the current owner to exit"}
+            try:
+                names = tuple(self.driven_joints or (self.arm.joint_names if self.arm else []))
+                selection = (names, self.config.commands.follow_joint_trajectory_action)
+                if selection != self._hold_recovery_selection:
+                    raise ValueError("select the original arm and trajectory controller")
+                identity = ArmIdentity.from_joint_names(names)
+                ArmBinding.from_description(identity, self.urdf_text)
+                payload["arm"] = identity.name
+                health = self.connection()
+                inventory = health.get("controllers", {})
+                age = inventory.get("age_s")
+                if (health.get("telemetry_ok") is not True
+                        or inventory.get("available") is not True
+                        or inventory.get("manager") != self.config.commands.controller_manager
+                        or not isinstance(age, (int, float)) or not 0 <= age < 3):
+                    raise ValueError("fresh telemetry and controller inventory are required")
+                items = inventory.get("items", [])
+                controllers = {item["name"]: item for item in items}
+                if len(controllers) != len(items):
+                    raise ValueError("controller inventory contains duplicate names")
+                current = controllers[identity.current_controller]
+                position = controllers[identity.trajectory_controller]
+                expected = {f"{joint}/position" for joint in names}
+                if (current.get("state") != "inactive" or current.get("claimed_interfaces") != []
+                        or position.get("state") not in ("active", "inactive")
+                        or position.get("type") != "joint_trajectory_controller/JointTrajectoryController"
+                        or set(position.get("claimed_interfaces", [])) != (
+                            expected if position["state"] == "active" else set())):
+                    raise ValueError("position recovery requires exclusive inactive current ownership")
+            except (ValueError, KeyError, TypeError, ElementTree.ParseError) as error:
+                return {**payload, "reason": str(error)}
+            return {**payload, "available": True,
+                    "reason": "guarded position recovery is available"}
+
+    def recover_position(self, options: dict) -> dict:
+        if options.get("acknowledgement") != GRAVITY_TEST_ACKNOWLEDGEMENT:
+            return {"ok": False, "message": "confirm support and E-stop readiness for recovery"}
+        with self._lock:
+            permission = self.current_recovery_payload()
+            if not permission["available"]:
+                return {"ok": False, "message": permission["reason"]}
+            binding = ArmBinding.from_description(ArmIdentity(permission["arm"]), self.urdf_text)
+            selection = self._hold_recovery_selection
+            description_sha = hashlib.sha256(self.urdf_text.encode()).hexdigest()
+            self._current_recovery_running = True
+            self._current_recovery_report = None
+            self._state = RUNNING
+            self._abort.clear()
+            self.progress = {**self.progress, "phase": "recovering", "recovery_required": True}
+            self._worker = threading.Thread(
+                target=self._run_position_recovery, args=(binding, selection, description_sha),
+                daemon=True, name="identification-position-recovery")
+            self._worker.start()
+        return {"ok": True, "message": "guarded position recovery requested"}
+
+    def _run_position_recovery(self, binding, selection, description_sha):
+        mode = self._activity
+        report = None
+        error = ""
+        try:
+            root = Path(self.config.output_directory)
+            root.mkdir(parents=True, exist_ok=True)
+            folder = Path(tempfile.mkdtemp(prefix="position_recovery-", dir=root))
+            output = folder / "recovery.json"
+            command = ["ros2", "run", "rm_control", "recover_position", "--arm",
+                       binding.identity.name, "--output", str(output),
+                       "--ack", GRAVITY_TEST_ACKNOWLEDGEMENT]
+            endpoint = getattr(self.bridge, "controller_state_url", None)
+            endpoint = endpoint() if callable(endpoint) else None
+            if isinstance(endpoint, str) and endpoint:
+                command.extend(["--controller-state-url", endpoint])
+            with self._lock:
+                if (selection != self._hold_recovery_selection or self._abort.is_set()
+                        or description_sha != hashlib.sha256(self.urdf_text.encode()).hexdigest()):
+                    raise ValueError("recovery selection changed or stop was requested")
+            process = self._process_launcher(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True)
+            with self._lock:
+                self._external_process = process
+                interrupted = self._abort.is_set()
+            if interrupted and process.poll() is None:
+                os.killpg(process.pid, signal.SIGINT)
+            if process.stdout is not None:
+                for line in process.stdout:
+                    self.publish_event(line.strip()[-500:], source="position_recovery")
+            exit_code = process.wait()
+            report = json.loads(output.read_text())
+            expected_robot = {"arm": binding.identity.name, "host": binding.host,
+                              "port": binding.port, "hardware": binding.hardware_name,
+                              "guard_port": binding.guard_port, "description_sha256": description_sha}
+            if (exit_code != 0 or report.get("result") != "PASS"
+                    or report.get("test") != "position_recovery"
+                    or report.get("stop_verified") is not True or report.get("restore_errors") != []
+                    or report.get("published_commands") != 0 or report.get("model") is not None
+                    or report.get("robot") != expected_robot
+                    or report.get("current_limits") != binding.current_limits
+                    or report.get("controller_final_states") != {
+                        binding.identity.trajectory_controller: "active",
+                        binding.identity.current_controller: "inactive"}
+                    or report.get("post_stop_still", {}).get("distinct_udp_samples", 0) < 20):
+                raise ValueError("position recovery did not return complete matching evidence")
+        except Exception as failure:
+            error = str(failure)
+            self.publish_event(f"position recovery failed: {error}", level="error", source=mode)
+        finally:
+            with self._lock:
+                self._current_recovery_running = False
+                self._current_recovery_report = {"report": report, "error": error}
+                self._finish_current_activity(mode, recovery_required=True)
+                self.progress["recovery_error"] = error
+
     def _gravity_source(self, identity: ArmIdentity | None = None, *, validate: bool = True) -> str:
         """Resolve and validate only the configured artifact for the selected arm."""
         selected = ArmIdentity.from_joint_names(
@@ -1675,6 +1804,9 @@ class IdentificationService:
             # sections would allow two hardware owners to launch together.
             self._state = RUNNING
             self._activity = mode
+            self._hold_recovery_selection = (
+                tuple(self.driven_joints or self.arm.joint_names),
+                self.config.commands.follow_joint_trajectory_action)
             self._abort.clear()
             self._started_at = time.monotonic()
             self._options = normalized
@@ -1917,15 +2049,34 @@ class IdentificationService:
                 self.result = {"mode": GRAVITY_HOLD_TEST, "result": "FAIL", "reason": str(error)}
                 self.progress = {"mode": GRAVITY_HOLD_TEST, "phase": "failed", "error": str(error)}
         finally:
-            with self._lock:
-                if self._hold_recovery_required:
-                    self._state = PAUSED
-                    self.progress["error"] = (
-                        "stop or recovery was not confirmed; operator recovery required")
-                else:
-                    self._state, self._activity = IDLE, ""
-                self._worker = None
-                self._hold_plan = {}
+            self._finish_current_activity(
+                GRAVITY_HOLD_TEST,
+                recovery_required=self._hold_current_started and (
+                    self.result is None or self.result.get("stop_verified") is not True
+                    or self.result.get("restore_errors") != []))
+
+    def _finish_current_activity(self, mode, *, recovery_required):
+        with self._lock:
+            self._hold_recovery_required |= recovery_required
+            if self._hold_recovery_required:
+                if self._hold_recovery_selection is None:
+                    self._hold_recovery_selection = (
+                        tuple(self.driven_joints or (
+                            self.arm.joint_names if self.arm else [])),
+                        self.config.commands.follow_joint_trajectory_action)
+                self._state, self._activity = PAUSED, mode
+                self.progress["recovery_required"] = True
+                self.progress["error"] = (
+                    "stop or recovery was not confirmed; operator recovery required")
+            else:
+                self._state, self._activity = IDLE, ""
+                self._hold_recovery_selection = None
+                self._hold_current_started = False
+            self._external_process = None
+            self._external_status_file = None
+            self._external_summary_file = None
+            self._worker = None
+            self._hold_plan = {}
 
     def _run_gravity_test(self, mode: str, process, summary_file: Path) -> None:
         try:
@@ -1986,14 +2137,10 @@ class IdentificationService:
                                  "error": str(error)}
             self.publish_event(f"{mode} failed: {error}", level="error", source=mode)
         finally:
-            with self._lock:
-                self._external_process = None
-                self._external_status_file = None
-                self._external_summary_file = None
-                self._state = IDLE
-                self._activity = ""
-                if self._worker is threading.current_thread():
-                    self._worker = None
+            self._finish_current_activity(
+                mode, recovery_required=(
+                    self.result is None or self.result.get("stop_verified") is not True
+                    or self.result.get("restore_errors") != []))
 
     def pause(self) -> dict:
         """Request a gravity hardware pause at the next safe JTC boundary."""
@@ -3584,7 +3731,8 @@ class IdentificationService:
     def _reconcile_hold_recovery(self) -> None:
         with self._lock:
             if (not self._hold_recovery_required or self._state != PAUSED
-                    or self._activity != GRAVITY_HOLD_TEST or self._worker is not None
+                    or self._activity not in (GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST)
+                    or self._worker is not None
                     or self.planning):
                 return
             if (self._external_process is not None
@@ -3603,7 +3751,8 @@ class IdentificationService:
                 isinstance(record, dict) and isinstance(record.get("move"), dict)
                 and record["move"].get("ok") is True for record in records)
             try:
-                evidence = reader(require_goal_status=not motion_completed)
+                evidence = reader(require_goal_status=(
+                    self._activity == GRAVITY_HOLD_TEST and not motion_completed))
             except Exception:
                 return
             if not isinstance(evidence, dict) or evidence.get("ready") is not True:
@@ -3615,12 +3764,14 @@ class IdentificationService:
             self._hold_plan = {}
             self.gravity_armed = ""
             self.rehearsal_passed = False
+            mode = self._activity
             self._state, self._activity = IDLE, ""
             self.progress = {**self.progress, "recovery_verified": True,
+                             "recovery_required": False,
                              "error": (self.result or {}).get("reason", "")}
             self.publish_event(
                 "robot recovery verified; previous run remains failed; ready for a new task",
-                source=GRAVITY_HOLD_TEST)
+                source=mode)
 
     def snapshot(self) -> dict:
         self._reconcile_hold_recovery()
@@ -3655,6 +3806,7 @@ class IdentificationService:
                 "control_ranges": self.control_ranges(),
                 "motion_speed_max_deg_s": self._motion_speed_limit(),
                 "gravity_test": self.gravity_test_capability(),
+                "current_recovery": self.current_recovery_payload(),
                 "hold_plan": self.hold_plan_payload(),
                 "workspace": self.workspace_payload(),
                 "preview_token": self.preview_token,

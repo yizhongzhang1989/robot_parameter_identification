@@ -254,6 +254,24 @@ const DICT = {
   },
   'gravtest.hold_started': { en: 'Pose-holding check started.', zh: '多位姿保持检查已启动。' },
   'gravtest.drag_started': { en: 'Hand-guided drag started.', zh: '手动拖动检查已启动。' },
+  'gravtest.recover': { en: 'Recover position', zh: '恢复位置控制' },
+  'gravtest.recover_hint': {
+    en: 'Recover position control. Hold the arm and keep the E-stop ready.',
+    zh: '恢复位置控制。请扶住机械臂并准备好急停。',
+  },
+  'gravtest.recover_confirm': {
+    en: 'Recover position control for the selected arm? Hold the arm now and '
+      + 'keep the E-stop ready. Continue only when the workspace is clear.',
+    zh: '确认恢复所选机械臂的位置控制？请立即扶住机械臂并准备好急停，确认工作区无障碍后再继续。',
+  },
+  'gravtest.recover_requested': {
+    en: 'Recovery requested. Keep holding the arm until live status verifies position control.',
+    zh: '已请求恢复。请继续扶住机械臂，直到实时状态确认位置控制已恢复。',
+  },
+  'gravtest.recover_unconfirmed': {
+    en: 'Recovery response unavailable. Keep holding the arm and wait for live recovery status.',
+    zh: '未能确认恢复请求的响应。请继续扶住机械臂，等待实时恢复状态。',
+  },
   'gravtest.result_title': { en: 'Latest validation', zh: '最近一次验证' },
   'gravtest.mode': { en: 'test', zh: '测试' },
   'gravtest.verdict': { en: 'verdict', zh: '结论' },

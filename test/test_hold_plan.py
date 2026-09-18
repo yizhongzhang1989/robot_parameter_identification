@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from fixtures import synthetic_urdf
+from robot_parameter_identification import gravity_current_model, hold_candidates
 from robot_parameter_identification.arm_identity import ArmIdentity
 from robot_parameter_identification.dashboard import hold_plan
 
@@ -200,8 +202,8 @@ class HoldPlanTest(unittest.TestCase):
         self.payload["joints"] = [
             {"columns": columns, "parameters": parameters} for _index in range(7)]
         self.source.write_text(json.dumps(self.payload))
-        self.model.update(joint_names=names, columns=[np.asarray(columns)] * 7,
-                          parameters=[np.asarray(parameters)] * 7)
+        self.model.update(joint_names=names, columns=[columns.copy() for _index in range(7)],
+                          parameters=[parameters.copy() for _index in range(7)])
         self.backend.identified.gravity_current = self.legacy.identified.gravity_current
         self.candidates = np.array([[7.0] * 7])
         predictions = []
@@ -274,6 +276,38 @@ class HoldPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "blocked"):
             self.build(count=1, exclude_poses_deg=[[0.0] * 7], collision_free=lambda _pose: False)
 
+    def test_instance_command_limits_control_candidate_admission_and_are_frozen(self):
+        self.candidates = np.array([[10.0] * 7])
+        for name in ("right", "left", "station_3"):
+            identity = ArmIdentity(name)
+            names = list(identity.joint_names)
+            self.payload["joint_names"] = names
+            self.source.write_text(json.dumps(self.payload))
+            self.model["joint_names"] = names
+            self.backend.arm_model.return_value.joint_names = names
+            limits = [0.2] * 7
+            with self.subTest(arm=name):
+                plan = self.build(count=1, joint_names=names, maximum_command_a=limits)
+                limits[0] = 0.05
+                self.assertEqual(plan["maximum_command_a"], [0.2] * 7)
+                with self.assertRaisesRegex(ValueError, "insufficient"):
+                    self.build(count=1, joint_names=names, maximum_command_a=limits)
+
+    def test_invalid_instance_limits_fail_before_model_loading(self):
+        for limits in ([], [0] * 7, [float("nan")] * 7, [4] * 7, [[1]] * 7):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                self.build(maximum_command_a=limits)
+        self.backend.identified.load_identification.assert_not_called()
+
+    def test_execution_refuses_a_prediction_above_frozen_limits_before_moving(self):
+        plan = self.build()
+        plan["maximum_command_a"] = [0.05] * 7
+        result = self.execute(plan)
+        self.assertEqual(result["result"], "FAIL")
+        self.assertIn("frozen instance", result["reason"])
+        self.assertFalse(self.moves)
+        self.assertFalse(self.commands)
+
     def test_malformed_exclusions_fail_before_backend_loading(self):
         for excluded in ("bad", {}, [[0] * 6], [[float("nan")] * 7], [[0] * 7] * 1001):
             with self.subTest(excluded=str(excluded)[:50]), self.assertRaises(ValueError):
@@ -304,20 +338,119 @@ class HoldPlanTest(unittest.TestCase):
 
     def test_import_adapter_and_arm_model_never_run_commands_or_sockets(self):
         import sys
+        import xacro
 
+        description = self.folder / "src" / "robot_description" / "urdf" / "robot.urdf.xacro"
+        description.parent.mkdir(parents=True)
+        description.write_text(synthetic_urdf(), encoding="utf-8")
         before = sys.path[:]
         bindings = {name: sys.modules.get(name) for name in (
             "identified_zero_force_drag", "identified_static_hold_campaign",
             "forward_current_controller_test", "subprocess")}
         with patch("subprocess.run", side_effect=AssertionError("no commands")), \
                 patch("subprocess.Popen", side_effect=AssertionError("no processes")), \
-                patch("socket.socket", side_effect=AssertionError("no sockets")):
+                patch("socket.socket", side_effect=AssertionError("no sockets")), \
+                patch.object(hold_plan, "_workspace_root", return_value=self.folder), \
+                patch.dict(sys.modules, {"common.workspace_utils": None}), \
+                patch.object(xacro, "process_file", wraps=xacro.process_file) as render:
             backend = hold_plan._load_backend()
-            arm = backend.arm_model()
+            with self.assertWarnsRegex(UserWarning, "default mounts"):
+                arm = backend.arm_model()
+        render.assert_called_once()
+        self.assertEqual(render.call_args.args, (str(description),))
+        self.assertEqual(render.call_args.kwargs["mappings"]["use_mock_hardware"], "true")
         self.assertGreater(arm.parameter_count, 0)
         self.assertEqual(sys.path, before)
         for name, module in bindings.items():
             self.assertIs(sys.modules.get(name), module)
+
+    def test_backend_exposes_shared_functions_and_isolated_compatibility_constants(self):
+        backend = hold_plan._load_backend()
+        self.assertIs(backend.identified.load_identification,
+                      gravity_current_model.load_identification)
+        self.assertIs(backend.identified.gravity_current, gravity_current_model.gravity_current)
+        self.assertIs(backend.campaign._executed_poses, hold_candidates.executed_poses)
+        for name in ("admissible", "random_then_order", "spread_then_order", "transit_clear"):
+            self.assertIs(getattr(backend.campaign, name), getattr(hold_candidates, name))
+        self.assertEqual(backend.current.DEFAULT_SOURCE, hold_plan._workspace_root() /
+                         "identification_results" /
+                         "optimal_excitation_regime_separated-20260825-232541")
+        self.assertEqual(backend.current.ACKNOWLEDGEMENT, "I_AM_HOLDING_ARM_AND_ESTOP_READY")
+        self.assertEqual(backend.current.DEFAULT_CORRIDOR_DEG, 5.0)
+        self.assertEqual(backend.current.MAXIMUM_TEMPERATURE_C, 40.0)
+        np.testing.assert_array_equal(backend.identified.CONTINUOUS_CURRENT_A,
+                                      hold_plan.DEFAULT_MAXIMUM_COMMAND_A)
+        backend.identified.CONTINUOUS_CURRENT_A[0] = 0.0
+        np.testing.assert_array_equal(hold_plan._load_backend().identified.CONTINUOUS_CURRENT_A,
+                                      hold_plan.DEFAULT_MAXIMUM_COMMAND_A)
+
+    def test_default_backend_builds_from_live_urdf_without_legacy_or_offline_geometry(self):
+        import sys
+
+        for name in ("right", "left", "station_3"):
+            with self.subTest(name=name):
+                identity = ArmIdentity(name)
+                names = list(identity.joint_names)
+                self.payload["joint_names"] = names
+                self.payload["joints"] = [
+                    {"columns": list(range(70)), "parameters": [0.001] * 70}
+                    for _index in range(7)]
+                self.source.write_text(json.dumps(self.payload))
+                with (self.folder / "observations.csv").open("w", newline="") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow([f"{joint}.position_deg" for joint in names])
+                    writer.writerows([[value] * 7 for value in (0, 7.04, 7.01)])
+                urdf = synthetic_urdf(prefix=identity.model_prefix)
+                with patch.dict(sys.modules, dict.fromkeys((
+                        "identified_static_hold_campaign", "identified_zero_force_drag",
+                        "forward_current_controller_test", "ament_index_python.packages",
+                        "generate_mjcf", "common.workspace_utils", "xacro", "rclpy"))), \
+                        patch.object(hold_plan, "_offline_arm_model",
+                                     side_effect=AssertionError("live URDF only")) as offline:
+                    plan = self.build(backend=None, joint_names=names, count=2,
+                                      urdf_text=urdf, maximum_command_a=[0.2] * 7)
+                offline.assert_not_called()
+                self.assertEqual(plan["maximum_command_a"], [0.2] * 7)
+                self.assertEqual({tuple(pose) for pose in plan["poses_deg"]},
+                                 {(0.0,) * 7, (7.0,) * 7})
+                model = gravity_current_model.load_identification(self.folder, identity.prefix)
+                arm = hold_plan.ArmModel.from_urdf_text(urdf, identity.model_prefix)
+                np.testing.assert_allclose(plan["predicted_current_a"], [
+                    gravity_current_model.gravity_current(model, arm, pose)
+                    for pose in plan["poses_deg"]], atol=1e-12)
+
+    def test_default_backend_requires_complete_pass_ampere_before_shared_loading(self):
+        for key, value in (("complete", False), ("verdict", {"state": "warn"}),
+                           ("effort_unit", "newton_metre")):
+            with self.subTest(key=key):
+                self.source.write_text(json.dumps({**self.payload, key: value}))
+                with patch.object(gravity_current_model, "load_identification") as load, \
+                        patch.object(hold_plan, "_offline_arm_model") as offline:
+                    with self.assertRaisesRegex(ValueError, "complete, passing ampere"):
+                        self.build(backend=None, count=1, urdf_text=synthetic_urdf())
+                load.assert_not_called()
+                offline.assert_not_called()
+
+    def test_offline_model_preserves_configured_mounts_and_unconfigured_fallbacks(self):
+        import sys
+        import xacro
+
+        (self.folder / "robot_mounts.yaml").write_text(json.dumps({
+            "right_arm": {"xyz": [1, 2, 3], "rpy": [0, 0.5, 0]},
+            "left_arm": {"xyz": [-1, -2, -3]},
+        }))
+        workspace_utils = SimpleNamespace(get_config_dir=lambda: str(self.folder))
+        with patch.dict(sys.modules, {"common.workspace_utils": workspace_utils}), \
+                patch.object(hold_plan, "_workspace_root", return_value=self.folder), \
+                patch.object(xacro, "process_file", return_value=SimpleNamespace(
+                    toxml=synthetic_urdf)) as render:
+            arm = hold_plan._load_backend().arm_model()
+        self.assertEqual(list(arm.joint_names), hold_plan.RIGHT_JOINTS)
+        self.assertEqual(render.call_args.kwargs["mappings"], {
+            "use_mock_hardware": "true", "right_arm_xyz": "1.0 2.0 3.0",
+            "right_arm_rpy": "0.0 0.5 0.0", "left_arm_xyz": "-1.0 -2.0 -3.0",
+            "left_arm_rpy": "0 0 0",
+        })
 
     def test_invalid_fits_and_nonfinite_inputs_refused(self):
         for fit in ({"columns": [], "parameters": []},
@@ -575,17 +708,30 @@ class HoldPlanTest(unittest.TestCase):
         self.assertTrue(result["stop_verified"])
 
     def test_importing_public_module_does_not_load_legacy_helpers(self):
-        import importlib.util
         import sys
 
-        with patch.dict(sys.modules, {"ament_index_python.packages": None}), \
+        code = compile(Path(hold_plan.__file__).read_text(encoding="utf-8"),
+                       hold_plan.__file__, "exec")
+        before = sys.path[:]
+        forbidden = dict.fromkeys((
+            "identified_static_hold_campaign", "identified_zero_force_drag",
+            "forward_current_controller_test", "identified_static_hold", "generate_mjcf",
+            "ament_index_python.packages", "common.workspace_utils", "xacro", "rclpy"))
+        namespace = {"__name__": "hold_plan_import_probe", "__file__": hold_plan.__file__}
+        with patch.dict(sys.modules, forbidden), \
+                patch("builtins.open", side_effect=AssertionError("no runtime file reads")), \
+                patch.object(Path, "open", side_effect=AssertionError("no runtime file reads")), \
                 patch("subprocess.run", side_effect=AssertionError("no commands")), \
-                patch("socket.socket", side_effect=AssertionError("no sockets")):
-            spec = importlib.util.spec_from_file_location(
-                "hold_plan_import_probe", hold_plan.__file__)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-        self.assertTrue(callable(module.build_hold_plan))
+                patch("subprocess.Popen", side_effect=AssertionError("no processes")), \
+                patch("socket.socket", side_effect=AssertionError("no sockets")), \
+                patch("socket.create_connection", side_effect=AssertionError("no network")):
+            exec(code, namespace)
+            backend = namespace["_load_backend"]()
+            for name in forbidden:
+                self.assertIsNone(sys.modules[name])
+        self.assertEqual(sys.path, before)
+        self.assertTrue(callable(namespace["build_hold_plan"]))
+        self.assertIs(backend.campaign._executed_poses, hold_candidates.executed_poses)
 
 
 if __name__ == "__main__":

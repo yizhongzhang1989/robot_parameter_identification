@@ -307,10 +307,16 @@
           <div class="gravity-test-run-actions">
             <button id="btn-gravtest-drag" class="danger" disabled
                     data-i18n="gravtest.drag_start">Start hand guiding</button>
-            <button id="btn-gravtest-stop" class="stop" disabled
-                    data-i18n="run.stop">Stop</button>
           </div>
         </div>
+
+          <div class="gravity-test-run-actions">
+            <button id="btn-gravtest-stop" class="stop" disabled
+              data-i18n="run.stop">Stop</button>
+            <button id="btn-gravtest-recover" class="danger hidden" disabled
+              data-i18n="gravtest.recover" data-i18n-title="gravtest.recover_hint"
+              title="Recover position control. Hold the arm and keep the E-stop ready.">Recover position</button>
+          </div>
 
         <div id="gravtest-result" class="gravity-test-result hidden"
              aria-live="polite">

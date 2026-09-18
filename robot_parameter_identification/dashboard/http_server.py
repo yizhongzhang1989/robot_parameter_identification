@@ -63,6 +63,7 @@ def build_routes(service, node=None) -> dict:
                               lambda body: service.start_gravity_test(
                                   str(body.get("mode", "")),
                                   body.get("options") or {})),
+        "/api/recover-position": ("POST", lambda body: service.recover_position(body)),
         "/api/home": ("POST", lambda body: service.home(body)),
         "/api/jog": ("POST", lambda body: service.jog(body)),
         "/api/pause": ("POST", lambda _body: service.pause()),

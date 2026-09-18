@@ -32,7 +32,8 @@ const state = { snapshot: null, selected: null, frames: [], unit: 'A',
                 flyOptOut: false, flyAuto: false, sceneActivityId: '',
                 sceneActivity: null,
                 localEvents: [], gravityStatus: null, gravityStatusKey: '',
-                polling: false,
+                polling: false, snapshotOnline: false,
+                recoveryPending: false, recoveryRequestSnapshot: null,
                 // The envelope the server last confirmed, so a value being
                 // typed is not overwritten by the next poll.
                 spaceApplied: '' };
@@ -336,11 +337,37 @@ async function startGravityTest(mode) {
   }
 }
 
+async function recoverPosition() {
+  const snapshot = state.snapshot;
+  if (recoveryBlocked(snapshot)) return;
+  const prompt = [recoveryArmText(snapshot), t('gravtest.recover_confirm')]
+    .filter(Boolean).join('\n\n');
+  if (!window.confirm(prompt)) return;
+  if (state.snapshot !== snapshot || recoveryBlocked(snapshot)) return;
+  state.recoveryPending = true;
+  renderPositionRecovery(snapshot);
+  try {
+    const answer = await post('/api/recover-position', {
+      acknowledgement: GRAVITY_TEST_ACKNOWLEDGEMENT,
+    });
+    if (answer.ok) {
+      publishLocalEvent(t('gravtest.recover_requested'), 'info', 'recover_position');
+    }
+  } catch (error) {
+    toast(t('gravtest.recover_unconfirmed'), 'err');
+  } finally {
+    state.recoveryPending = false;
+    state.recoveryRequestSnapshot = state.snapshot;
+    renderPositionRecovery(state.snapshot);
+  }
+}
+
 $('btn-gravtest-hold').addEventListener(
   'click', () => startGravityTest(GRAVITY_HOLD_TEST));
 $('btn-gravtest-drag').addEventListener(
   'click', () => startGravityTest(GRAVITY_DRAG_TEST));
 $('btn-gravtest-stop').addEventListener('click', () => post('/api/stop', {}));
+$('btn-gravtest-recover').addEventListener('click', recoverPosition);
 
 $('gravtest-poses').addEventListener('input', () => {
   if (state.snapshot) renderGravity(state.snapshot);
@@ -432,6 +459,7 @@ function renderGravity(snapshot) {
   $('btn-gravtest-drag').disabled = busy || planning || !gravityTestReady;
   $('btn-gravtest-stop').disabled = snapshot.state !== 'running'
     || ![GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST].includes(snapshot.activity);
+  renderPositionRecovery(snapshot);
   const capability = $('gravtest-capability');
   const capabilityKey = gravityTest.reason_code
     ? `gravtest.${gravityTest.reason_code}` : '';
@@ -496,6 +524,37 @@ function renderGravity(snapshot) {
   $('grav-table').innerHTML = rows.map(
     ([k, v]) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
   renderGravityTestResult(snapshot);
+}
+
+function recoveryBlocked(snapshot) {
+  const recovery = snapshot?.current_recovery;
+  return state.snapshotOnline !== true || !!state.recoveryPending
+    || snapshot === state.recoveryRequestSnapshot
+    || !['idle', 'paused'].includes(snapshot?.state)
+    || snapshot?.connection?.description_ok !== true
+    || snapshot?.connection?.telemetry_ok !== true
+    || !!snapshot?.jogging || !!snapshot?.planning || !!state.planPending
+    || !recovery || typeof recovery !== 'object' || Array.isArray(recovery)
+    || recovery.required !== true || recovery.available !== true
+    || recovery.running !== false || typeof recovery.reason !== 'string'
+    || (recovery.arm !== undefined && (typeof recovery.arm !== 'string'
+      || !recovery.arm.trim()));
+}
+
+function recoveryArmText(snapshot) {
+  const arm = snapshot?.current_recovery?.arm ?? snapshot?.gravity_test?.arm;
+  return typeof arm === 'string' && arm.trim()
+    ? t('gravtest.selected_arm', { arm }) : '';
+}
+
+function renderPositionRecovery(snapshot) {
+  const recovery = snapshot?.current_recovery;
+  const button = $('btn-gravtest-recover');
+  button.classList.toggle('hidden', recovery?.required !== true);
+  button.disabled = recoveryBlocked(snapshot);
+  button.title = [recoveryArmText(snapshot), t('gravtest.recover_hint'),
+    typeof recovery?.reason === 'string' ? recovery.reason : '',
+  ].filter(Boolean).join('\n');
 }
 
 function renderGravityTestResult(snapshot) {
@@ -1684,9 +1743,13 @@ async function poll() {
     const response = await fetch('/api/state', { cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const snapshot = await response.json();
+    state.snapshotOnline = true;
     state.snapshot = snapshot;
     renderAll(snapshot);
   } catch (error) {
+    state.snapshotOnline = false;
+    const recoveryButton = $('btn-gravtest-recover');
+    if (recoveryButton) recoveryButton.disabled = true;
     if (state.snapshot?.connection) {
       state.snapshot.connection.controllers = undefined;
     }

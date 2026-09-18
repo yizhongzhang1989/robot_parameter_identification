@@ -101,8 +101,10 @@ profile_derivation:
 
 保持/拖动的每次运行目录会保存独立的 `system_config.yaml` 快照，并通过 `--system-config` 传给
 `rm_control hold_check` / `manual_drag`，两端使用同一组范围。子程序缺少指定快照时会拒绝启动。
-单独运行旧工具、不传该参数时保留原 CLI 默认行为，历史 `tools/` 入口不自动采用 dashboard 配置。
-因此部署本改动需要同时更新辨识包和 `rm_control` 的 Python 入口；不要把新面板与不支持该参数的旧入口混用。
+共享 CLI 不传该参数时使用自身默认值。已安装的 `gravity_compensation_test`、
+`forward_current_controller_test`、`identified_static_hold_campaign` 旧入口现已 fail closed，
+只提示转向 Dashboard 多位姿保持或共享 `hold_check` / `manual_drag`；保留的纯函数仅供离线使用。
+不要继续把旧入口作为硬件执行路径。部署需同时更新辨识包与 `rm_control`，不能混用新旧入口。
 
 本改动不修改硬件插件限流、实际限速、停流确认或急停约束。例如当前共享硬件接口的电流模式
 仍有独立的 120 度/秒限速；更改软件阈值不等于提高了硬件允许值。端口范围、关节数量、单位、
@@ -247,7 +249,9 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 
 ## 它不会下发什么
 
-只下发位置，且只通过轨迹 action。力矩本身正是被测量的对象，去指令它就成了循环论证。模块也绝不会自作主张切换控制器。
+辨识、标定、归零与点动只通过轨迹 action 下发位置，不指令被辨识的力矩或电流。
+另行确认的保持与手动拖动使用共享 `rm_control` runtime 切换控制器并发送电流；
+Dashboard 本身不创建第二个电流发送器，也不自动启流或自动重试失败任务。
 
 ## 机器人档案
 
@@ -432,7 +436,7 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
   每次移动前通过 `scene_activity` 发布下一目标，完成后更新已完成索引；不新增 canvas 绘制分支。
   真机活动期间禁用预览巡游与手动选点，避免动画覆盖实际目标。
 - **任意位置手动拖动**：原子切换到同一个 forward current controller，连续发送辨识出的
-  重力补偿电流；用户可在设定时间内手动移动机械臂，结束后原子切回 JTC。
+  重力补偿电流；会话不设固定时长，操作员点击停止后由共享 runtime 验证停流并恢复 JTC。
 
 两个按钮都会先要求操作员确认已经扶住机械臂、工作区无障碍且急停可用；只有确认后前端才会
 提交精确的 `I_AM_HOLDING_ARM_AND_ESTOP_READY`，服务端还会独立复核。两项验证与标定、归零、
@@ -440,7 +444,9 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 **停止** 使用同一路径：位置运动请求取消并确认 action 的终态；电流保持向所属进程组发送
 `SIGINT`，由执行程序完成停流和恢复。若取消或停流恢复证据缺失，任务保留故障占用，
 但历史错误本身不禁用按钮：检查失败且停流恢复已确认时，直接回到空闲，保留 FAIL 结果。
-保持任务退出后的故障占用会随状态轮询自动复核，无需为了清除旧错误再次重启 Dashboard。
+保持与手动拖动共用 `_finish_current_activity()` 收尾；停流未确认或 `restore_errors` 非空
+都会保留故障占用。状态轮询中的 `_reconcile_hold_recovery()` 对两者被动复核，
+无需为了清除旧错误再次重启 Dashboard。
 复核要求控制器清单新鲜、所选臂 JTC 持有位置接口且 active、对应电流控制器 inactive，七关节
 已使能、无故障、电流模式退出且停机确认；硬件遥测序号必须持续推进并新鲜，至少连续
 1 秒速度不超过 1 度/秒且各关节累计移动不超过 0.5 度。已观察到的非终态 JTC 目标会
@@ -448,6 +454,34 @@ extra_telemetry_topics:="['/right_arm/motor_currents']" signal.current:=motor_cu
 发布过目标状态时，只有全部历史 JTC 移动都已确认完成的保持任务可使用硬件状态复核。
 复核通过只释放旧占用、保留失败记录并作废旧计划和预演授权，不自动续跑、切控制器或发运动命令。
 关闭 dashboard 节点同样会请求停止并有界等待 worker 退出。
+
+#### Explicit Position Recovery
+
+When passive checks cannot prove position ownership, the operator can request
+guarded recovery for the original selected arm after supporting it and checking
+E-stop readiness. The [HTTP route](robot_parameter_identification/dashboard/http_server.py)
+accepts this exact body, not an `ack` field or a model source:
+
+```http
+POST /api/recover-position
+Content-Type: application/json
+
+{"acknowledgement": "I_AM_HOLDING_ARM_AND_ESTOP_READY"}
+```
+
+`GET /api/state` exposes `current_recovery`: `required`, `available` and `running`
+are booleans; `reason` is a string; `arm` is the original instance name when its
+binding can be resolved, and is omitted otherwise. Availability requires the
+previous owner to have exited, the original selection/live binding, fresh
+telemetry and controller inventory, and exclusive inactive current ownership.
+The request starts the installed `rm_control recover_position`; it needs no
+calibration source, loads no gravity model, publishes no current and never
+activates the current controller. See the [runtime usage](../../src/rm_control/runtime/README.md).
+
+An accepted request is not proof of recovery. Its report is separate from the
+original failed hold/drag result, and even a successful recovery child leaves the
+activity pending until fresh passive proof passes. Reconciliation releases the
+lock but never rewrites the failed result or resumes the old task.
 
 直接电流期间，所选臂 JTC 暂时 inactive，但 `ros2_control_node`、`RMSystemHardware`、其他臂 JTC、
 joint/F/T broadcaster、TF 和其它 ROS node 全部保持运行。Dashboard 的 sample/history 只有 ROS
@@ -459,6 +493,11 @@ topic callback 可以写入，不再接受 subprocess stdout 遥测；`/dynamic_
 每点的 `hold_XX.json` 保留底层证据；拖动的 `status.json` 是运行中的原子状态，
 `gravity_test_summary.json` 是最终 `PASS`、`FAIL` 或 `STOPPED` 结论。卡片会显示实际使用的
 辨识模型 source、原因、退出码和输出路径，并通过受结果目录约束的 `/runs/...` 链接打开 summary。
+
+**本次共享重构的完整真机验收：PENDING。** 两条已安装手臂都需要各自独立完成新的
+24 个训练位姿 + 8 个验证位姿标定，以及各 50 个不同位姿的保持验收（10 组，每组 5 点）。
+本次文档更新未运行程序或硬件测试；下面的旧报告保留其历史结论，不代表重构后的新一轮通过。
+
 2026-09-16 的漂移标准真机验收已完成一轮连续 10 组 × 5 个位姿，每点保持 3 秒，
 转场设置在 5–20°/秒范围随机；50 点均通过且无服务重试或恢复错误，最大关节漂移约 0.160°。
 证据位于工作区 `test_data/hold_acceptance_20260916/attempt07/campaign.json`；此前失败轮次
@@ -496,19 +535,46 @@ one owning seven-joint `RMSystemHardware` with acknowledged direct current,
 `read_only=false`, position/current interfaces, and valid independent endpoint
 and guard bindings. Existing ACKs and all safety thresholds remain in force.
 
+#### Shared Core And Hardware Boundary
+
+| Layer | Shared owner | Contract |
+| --- | --- | --- |
+| Gravity-current model | [gravity_current_model.py](robot_parameter_identification/gravity_current_model.py) | `load_identification()` and `gravity_current()` accept arbitrary joint counts with exact ordered names. |
+| Hold candidates | [hold_candidates.py](robot_parameter_identification/hold_candidates.py) | Measured-pose loading, selection, current admissibility and callback-only transit screening. |
+| RM instance binding | [arm_identity.py](robot_parameter_identification/arm_identity.py) | `ArmIdentity` names seven axes; `ArmBinding.from_description()` validates their exclusive RM hardware owner, interfaces, endpoint, guard and limits. |
+| Current lifecycle | [current_session.py](../../src/rm_control/runtime/current_session.py) | One implementation for hold, manual drag and recovery-only execution. |
+| Dashboard lifecycle | [service.py](robot_parameter_identification/dashboard/service.py) | Shared finalization and passive reconciliation for both hold and manual drag. |
+
+The model and candidate helpers do not create ROS nodes, processes or hardware
+connections. The loader reads top-level joint fits from `result.json`; prediction
+sums only rigid columns in their stored order, preserving the existing numerical
+calculation exactly. It adds no offset or friction and does not substitute the
+paired predictor in `gravity_model.json`. Complete/pass validation is optional
+for pure offline loading and mandatory at the production hardware boundary.
+
 Hold planning builds `ArmModel` from the live URDF using the instance's
 `<name>_arm_` prefix and checks its joint order against the calibration. It does
-not reuse stored-source geometry across mounts. Source bytes are pinned in the
-plan digest; source, description, selection and scene changes require replanning.
-Changing the selection discards sequence, position and timing evidence for
+not reuse stored-source geometry across mounts. The service passes the live
+`ArmBinding.maximum_command_a` into `build_hold_plan(..., maximum_command_a=...)`;
+the planner copies that ordered vector into the frozen plan and its digest, and
+execution checks predictions against it again. Measured continuous/peak limits
+are not command caps. Source, description (including limits), selection and scene
+changes require replanning. Existing cap values and their commissioning basis are
+unchanged. Changing the selection discards sequence, position and timing evidence for
 recovery. A failed hold remains tied to its original joints and trajectory action;
 healthy evidence from another arm cannot release it.
+
+Generic numeric helpers do not make arbitrary hardware plug-compatible. A new
+instance needs its own explicit kinematics/mounts, hardware interfaces, exclusive
+joints, endpoint, guard, profiles and accepted source; see the
+[bringup extension process](../../src/robot_bringup/README.md). The current RM
+runtime remains seven-axis and the public launch/URDF topology remains dual RM75.
 
 Live acceptance requires the coordinated `rm_control` current-session version
 that accepts the selected `--arm`, independently validates the explicit source,
 and binds its model and endpoints to live `/robot_description`. These dashboard
-changes are offline-verified only; they do not commission another arm or authorize
-hardware use. Do not deploy the dashboard alone against a right-only current runtime.
+changes do not commission another arm or establish a new full physical PASS.
+Do not deploy the dashboard alone against a right-only current runtime.
 
 正常的位置控制器与电流控制器切换不退出 ROS node。电流接管前必须预热新命令；退出时确认
 电流已关闭、取得停流后的新 UDP 反馈，再用当前角度初始化位置控制，避免跳回旧目标。
@@ -553,7 +619,9 @@ Pinocchio 回归量，再跨速度平均，最后只用 `A_gravity` 位姿拟合
 仍从 URDF 计算重力，尚无 `gravity_model.json` 加载器；报告中的“通过”只表示该经验预测器
 通过独立位姿验证，不表示已经部署到控制器。
 
-## 状态
+## 历史状态
+
+以下是早期功能与测试计数记录，不是本次重构的测试结果或真机验收结论。
 
 已工作并经过测试：
 

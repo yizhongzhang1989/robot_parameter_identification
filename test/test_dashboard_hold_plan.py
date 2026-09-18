@@ -17,7 +17,7 @@ from unittest import mock
 import numpy as np
 
 from dashboard_gravity_fixtures import gravity_source, gravity_urdf
-from robot_parameter_identification.arm_identity import ArmIdentity
+from robot_parameter_identification.arm_identity import ArmBinding, ArmIdentity
 from test_dashboard import (
     DashboardConfig, IdentificationService, GRAVITY_HOLD_TEST, GRAVITY_DRAG_TEST,
     GRAVITY_TEST_ACKNOWLEDGEMENT, RUNNING, PAUSED, build_routes, dashboard_service,
@@ -138,6 +138,9 @@ class HoldPlanServiceTest(unittest.TestCase):
         answer = self.preview()
         self.builder.assert_called_once()
         self.assertEqual(self.builder.call_args.kwargs["urdf_text"], self.service.urdf_text)
+        binding = ArmBinding.from_description(ArmIdentity("right"), self.service.urdf_text)
+        self.assertEqual(self.builder.call_args.kwargs["maximum_command_a"],
+                 binding.maximum_command_a)
         source, names, start, count, clear = self.builder.call_args.args
         self.assertEqual(source, self.plan["source"])
         self.assertEqual(names, self.plan["joint_names"])
@@ -782,7 +785,7 @@ class HoldPlanServiceTest(unittest.TestCase):
         self.assertTrue(self.service.start_gravity_test(
             GRAVITY_HOLD_TEST, self.options())["ok"])
         self.wait()
-        self.assertTrue(self.service._hold_current_started)
+        self.assertFalse(self.service._hold_current_started)
         self.assertFalse(self.service._hold_recovery_required)
         self.assertEqual(self.service._activity, "")
         self.assertIsNone(self.service._worker)
