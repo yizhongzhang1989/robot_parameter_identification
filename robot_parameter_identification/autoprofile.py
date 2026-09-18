@@ -3,17 +3,12 @@
 Asking an operator to hand-write a profile before anything works is a poor
 first experience, and most of it is already stated in the URDF. So: take the
 joint list from the trajectory controller, the position and speed limits from
-the URDF, and be explicit about the one thing that cannot be derived.
+the URDF. Current is a measured outcome of position control, not a profile limit.
 
 Position and speed margins come from the system configuration's
 ``profile_derivation`` policy, optionally supplied for each call. Written
 robot profiles are independent of this automatic derivation policy.
 
-**Current ceilings are not derivable.** The URDF states effort in newton-metres;
-converting that to a drive current needs the torque constant, which is one of
-the quantities being identified. Inventing a number is wrong in both directions
--- too low aborts good runs, too high protects nothing -- so a derived profile
-leaves the current guard off and says so. Supply a written profile to turn it on.
 """
 
 from __future__ import annotations
@@ -124,9 +119,6 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
         "joints": {"names": names},
         "limits": {
             "position_deg": positions,
-            # Infinity, not a guess: see the module docstring.
-            "continuous_current_a": [math.inf] * len(names),
-            "peak_current_a": [math.inf] * len(names),
         },
         "envelope": {
             "sustained_speed_deg_s": sustained,
@@ -135,9 +127,8 @@ def derive_profile(urdf_text: str, joint_names, name: str = "derived",
         "notes": {
             "derived": "Built from /robot_description and the trajectory "
                        "controller's joint list. Position and speed limits come "
-                       "from the URDF; current ceilings are NOT set, so the "
-                       "current guard is off. Supply a written profile to "
-                       "enable it.",
+                       "from the URDF. Position-controlled motion records "
+                       "current without software current limits.",
         },
     }
     if workspace:
@@ -234,9 +225,3 @@ def _speed_for(velocity_rad_s, requested: float | None, *,
     return _positive_finite(
         min(requested, rated * derivation["requested_speed_fraction"]),
         "derived requested speed")
-
-
-def current_guard_active(profile: RobotProfile) -> bool:
-    """False when the profile carries no usable current ceiling."""
-    values = list(profile.continuous_current_a) + list(profile.peak_current_a)
-    return bool(values) and all(math.isfinite(value) for value in values)

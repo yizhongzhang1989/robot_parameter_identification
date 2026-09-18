@@ -73,7 +73,7 @@ def write_run(directory, payload: dict, observations=None,
 def joint_names(payload: dict) -> list[str]:
     """URDF joint names, falling back to positional labels."""
     names = [str(name) for name in (payload.get("joint_names") or [])]
-    count = len(payload.get("joints") or [])
+    count = max(len(names), len(payload.get("joints") or []))
     if len(names) >= count:
         return names[:count]
     return names + [f"joint{index + 1}" for index in range(len(names), count)]
@@ -203,6 +203,19 @@ def _plain(value):
 # Both languages live together so a term cannot be updated in one and left
 # stale in the other.
 TEXT = {
+    "current.head": {"en": "Measured calibration current", "zh": "标定实测电流"},
+    "current.policy": {
+    "en": "Position-controlled calibration: current is recorded, not used to stop "
+      "or reduce excitation. Statistics include transit telemetry and rejected "
+      "sampling windows; the raw CSV contains captured windows only. "
+      "These measurements are not approved current-drive safety limits.",
+    "zh": "位置控制标定：电流仅记录，不据此停机或缩减激励。统计包含转场遥测和被舍弃的"
+      "采集窗口；原始 CSV 仅包含已保存的采集窗口。实测结果不等于已验证的电流驱动安全限值。"},
+    "current.empty": {"en": "No current telemetry recorded.", "zh": "未记录到电流遥测。"},
+    "current.samples": {"en": "Valid / invalid frames", "zh": "有效 / 无效帧"},
+    "current.range": {"en": "Min / max (A)", "zh": "最小 / 最大 (A)"},
+    "current.peak": {"en": "Absolute peak (A)", "zh": "绝对峰值 (A)"},
+    "current.rms": {"en": "Sample RMS (A)", "zh": "采样 RMS (A)"},
     "title": {"en": "Identification report", "zh": "参数辨识报告"},
   "title.gravity": {"en": "Gravity effort model report",
             "zh": "重力驱动量模型报告"},
@@ -1007,6 +1020,24 @@ function summarySection() {
     ${cells.map(([k, v]) => `<div class="kv"><div class="k">${t(k)}</div>
       <div class="v mono">${esc(v)}</div></div>`).join('')}
   </div></section>`;
+}
+
+function currentSection() {
+  const measured = P.current_measurements;
+  if (!measured || measured.policy !== 'record_only') return '';
+  const rows = (measured.joints || []).map((entry) => `<tr>
+    <td>${esc(entry.joint)}</td>
+    <td class="n">${entry.samples} / ${entry.invalid_samples}</td>
+    <td class="n">${num(entry.minimum_a, 3)} / ${num(entry.maximum_a, 3)}</td>
+    <td class="n">${num(entry.peak_abs_a, 3)}</td>
+    <td class="n">${num(entry.rms_a, 3)}</td>
+  </tr>`).join('');
+  return `<section id="current-measurements"><h2>${t('current.head')}</h2>
+    <p class="say">${t('current.policy')}</p>
+    ${rows ? `<table><thead><tr>${['col.joint', 'current.samples', 'current.range',
+      'current.peak', 'current.rms'].map((key) =>
+        `<th>${t(key)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`
+      : `<p>${t('current.empty')}</p>`}</section>`;
 }
 
 function jointSection() {
@@ -1816,7 +1847,7 @@ function render() {
   document.getElementById('root').innerHTML = [
     `<p class="say" data-i18n="${P.gravity_model ? 'subtitle.gravity' : 'subtitle'}"></p>`,
     provenanceSection(), verdictSection(), gravityModelSection(),
-    summarySection(), jointSection(), formulaSection(),
+    summarySection(), currentSection(), jointSection(), formulaSection(),
     steadyFrictionSection(), comparisonSection(), chartSection(),
     phaseSection(), rehearsalSection(), planSection(), fileSection(),
     glossarySection(),

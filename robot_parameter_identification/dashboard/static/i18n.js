@@ -476,42 +476,21 @@ const DICT = {
     en: 'A run is going. The envelope is shown but cannot change until it ends.',
     zh: '正在运行中。档案只读，运行结束后才能修改。',
   },
-  'profile.guard_on': {
-    en: 'Current ceilings are set, so the current guard is armed.',
-    zh: '电流上限已设定，电流保护已生效。',
-  },
-  'profile.guard_off': {
-    en: 'No current ceiling is set, so the current guard is off. That is the '
-      + 'honest state until somebody measures one.',
-    zh: '未设定电流上限，因此电流保护未生效。在有人实测出来之前，这就是如实的状态。',
-  },
   'profile.name': { en: 'name', zh: '名称' },
   'profile.limits': { en: 'Per joint', zh: '逐关节' },
   'profile.envelope': { en: 'Envelope', zh: '包络' },
   'profile.joint': { en: 'joint', zh: '关节' },
   'profile.position': { en: 'reach', zh: '机械限位' },
   'profile.workspace': { en: 'workspace cap', zh: '工作空间限位' },
-  'profile.continuous': { en: 'continuous', zh: '连续电流' },
-  'profile.peak': { en: 'peak', zh: '峰值电流' },
-  'profile.current_hint': {
-    en: 'Leave a current ceiling blank when nobody has measured it. Blank '
-      + 'means no limit, and the current guard stays off rather than trip on '
-      + 'a guess.',
-    zh: '没实测过的电流上限就留空。留空表示无上限，电流保护宁可不生效，'
-      + '也不拿一个猜出来的阈值去跳闸。',
-  },
   'profile.temperature_c': { en: 'temperature ceiling', zh: '温度上限' },
   'profile.sustained_speed_deg_s': { en: 'campaign speed ceiling', zh: '实验速度上限' },
   'profile.peak_speed_deg_s': { en: 'overspeed trip', zh: '超速跳闸' },
   'profile.position_margin_deg': { en: 'limit margin', zh: '限位余量' },
   'profile.minimum_voltage_v': { en: 'minimum bus voltage', zh: '母线电压下限' },
   'profile.maximum_voltage_v': { en: 'maximum bus voltage', zh: '母线电压上限' },
-  'profile.sustained_current_window_s': { en: 'continuous-current window', zh: '连续电流窗口' },
   'profile.sustained_speed_window_s': { en: 'sustained-speed window', zh: '持续速度窗口' },
-  'profile.current_slew_a_s': { en: 'current slew', zh: '电流变化率' },
   'profile.sender_gap_s': { en: 'sender gap', zh: '发送间隔' },
   'profile.telemetry_stale_s': { en: 'telemetry stale after', zh: '遥测过期时间' },
-  'profile.probe_current_fraction': { en: 'probe current fraction', zh: '试探电流比例' },
   'profile.apply': { en: 'Apply', zh: '应用' },
   'profile.reset': { en: 'Reset', zh: '还原' },
   'profile.save': { en: 'Save file', zh: '保存为文件' },

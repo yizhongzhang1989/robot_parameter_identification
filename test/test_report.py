@@ -135,6 +135,36 @@ class RunFolderTest(unittest.TestCase):
         self.assertEqual(loaded["joint_names"],
                          ["right_arm_joint1", "right_arm_joint2"])
 
+    def test_current_measurements_survive_failed_fit_and_reach_both_reports(self):
+        from robot_parameter_identification.current_measurements import CurrentMeasurements
+
+        payload = sample_payload()
+        payload.update(joints=[], complete=False, aborted="temperature ceiling")
+        measured = CurrentMeasurements(channel="current_a")
+        measured.observe({"stamp_s": 1.0, "current_a": [-4.0, 3.0]})
+        payload["current_measurements"] = measured.as_dict(payload["joint_names"])
+        first_joint = payload["current_measurements"]["joints"][0]
+        self.assertEqual(set(first_joint), {
+            "samples", "invalid_samples", "minimum_a", "maximum_a",
+            "peak_abs_a", "rms_a", "peak_stamp_s", "joint",
+        })
+        self.assertEqual(first_joint["minimum_a"], -4.0)
+        self.assertEqual(first_joint["peak_abs_a"], 4.0)
+        self.assertEqual(first_joint["rms_a"], 4.0)
+        folder = report.write_run(self.temp.name, payload, observations(1), stamp="current")
+        saved = json.loads((folder / report.RESULT_NAME).read_text())
+        self.assertEqual(saved["current_measurements"], payload["current_measurements"])
+        page = (folder / report.REPORT_NAME).read_text()
+        document = json.loads(re.search(
+            r'<script id="data" type="application/json">(.*?)</script>', page, re.S)[1])
+        self.assertEqual(document["payload"]["current_measurements"],
+                         payload["current_measurements"])
+        self.assertEqual(document["names"], payload["joint_names"])
+        self.assertIn('currentSection()', page)
+        with (folder / report.OBSERVATIONS_NAME).open() as handle:
+            row = next(csv.DictReader(handle))
+        self.assertEqual(row["right_arm_joint1.effort"], "0.5")
+
     def test_every_observation_reaches_the_csv(self):
         with open(self.folder / report.OBSERVATIONS_NAME, encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
@@ -234,6 +264,25 @@ class ReportPageTest(unittest.TestCase):
         self.assertIn("参数辨识报告", self.html)
         self.assertIn("Identification report", self.html)
 
+    def test_current_report_has_measured_statistics_without_references(self):
+        for key in ("current.samples", "current.range", "current.peak", "current.rms"):
+            self.assertIn(key, self.html)
+        for token in ("current.reference", "current.exceeded", "peak_reference_a",
+                      "continuous_reference_a", "above_peak_reference_samples",
+                      "above_continuous_reference_samples"):
+            self.assertNotIn(token, self.html)
+
+    def test_profile_ui_has_no_current_limits_or_guard_state(self):
+        for filename in ("dashboard.js", "i18n.js", "index.html"):
+            source = (STATIC / filename).read_text(encoding="utf-8")
+            for token in ("continuous_current_a", "peak_current_a", "BLANKABLE",
+                          "current_guard", "profile.guard_on", "profile.guard_off",
+                          "profile.current_hint", "profile.continuous", "profile.peak",
+                          "sustained_current_window_s", "current_slew_a_s",
+                          "probe_current_fraction"):
+                with self.subTest(filename=filename, token=token):
+                    self.assertNotRegex(source, rf"\b{re.escape(token)}\b")
+
     def test_the_joint_names_are_shown_not_indices(self):
         self.assertIn("right_arm_joint1", self.html)
 
@@ -262,7 +311,7 @@ class ReportPageTest(unittest.TestCase):
         self.assertIn("function provenanceSection()", page)
         self.assertIn("function gravityModelSection()", page)
         self.assertLess(page.index("provenanceSection(), verdictSection()"),
-                        page.index("summarySection(), jointSection()"))
+                        page.index("summarySection(), currentSection(), jointSection()"))
         self.assertIn("verdict.gravity.pass.say", page)
         self.assertIn("gravity.physical.missing", page)
         self.assertIn("gravity.runtime.missing", page)

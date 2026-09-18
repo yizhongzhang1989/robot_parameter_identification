@@ -63,7 +63,6 @@ class SelectedCampaignDefaultsTest(unittest.TestCase):
         self.profile = RobotProfile(
             name="offline-config-test", joint_names=("joint1", "joint2"),
             position_limit_deg=(120.0, 120.0), workspace_limit_deg=(90.0, 45.0),
-            continuous_current_a=(1.0, 1.0), peak_current_a=(2.0, 2.0),
             sustained_speed_deg_s=6.0, temperature_c=38.0, position_margin_deg=7.0)
         self.defaults = system_defaults()["campaign"]
 

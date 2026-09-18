@@ -23,8 +23,7 @@ class ProfileError(ValueError):
     """Raised when a profile is missing or internally inconsistent."""
 
 
-def _sequence(payload: dict, key: str, count: int, name: str,
-              allow_unbounded: bool = False) -> tuple[float, ...]:
+def _sequence(payload: dict, key: str, count: int, name: str) -> tuple[float, ...]:
     value = payload.get(key)
     if value is None:
         raise ProfileError(f"{name}: '{key}' is required")
@@ -39,11 +38,6 @@ def _sequence(payload: dict, key: str, count: int, name: str,
             number = float(entry)
         except (TypeError, ValueError) as error:
             raise ProfileError(f"{name}: '{key}[{index}]' is not a number") from error
-        # Infinity is the honest value for a ceiling nobody has supplied; it
-        # reads as "this guard is off", which callers can then report.
-        if math.isinf(number) and allow_unbounded and number > 0.0:
-            out.append(number)
-            continue
         if not math.isfinite(number):
             raise ProfileError(f"{name}: '{key}[{index}]' is not finite")
         out.append(number)
@@ -114,21 +108,16 @@ class RobotProfile:
     # Calibration may be confined inside the mechanical limits when the
     # cell contains obstacles the collision model does not describe.
     workspace_limit_deg: tuple[float, ...] = ()
-    continuous_current_a: tuple[float, ...] = ()
-    peak_current_a: tuple[float, ...] = ()
 
     temperature_c: float = 45.0
     sustained_speed_deg_s: float = 15.0
     peak_speed_deg_s: float = 30.0
-    current_slew_a_s: float = 4.0
     sender_gap_s: float = 0.02
     telemetry_stale_s: float = 0.25
     position_margin_deg: float = 5.0
     minimum_voltage_v: float = 20.0
     maximum_voltage_v: float = 30.0
     sustained_speed_window_s: float = 0.1
-    sustained_current_window_s: float = 0.5
-    probe_current_fraction: float = 0.5
 
     source: str = "<built-in>"
     notes: dict = field(default_factory=dict)
@@ -137,29 +126,16 @@ class RobotProfile:
     def joint_count(self) -> int:
         return len(self.joint_names)
 
-    @property
-    def probe_current_a(self) -> tuple[float, ...]:
-        return tuple(
-            round(value * self.probe_current_fraction, 4)
-            for value in self.continuous_current_a
-        )
-
     def __post_init__(self) -> None:
         count = len(self.joint_names)
         if count == 0:
             raise ProfileError(f"{self.name}: joint_names must not be empty")
-        for label in ("position_limit_deg", "continuous_current_a", "peak_current_a"):
+        for label in ("position_limit_deg",):
             values = getattr(self, label)
             if len(values) != count:
                 raise ProfileError(
                     f"{self.name}: '{label}' has {len(values)} entries but there "
                     f"are {count} joints")
-        for index in range(count):
-            if self.peak_current_a[index] < self.continuous_current_a[index]:
-                raise ProfileError(
-                    f"{self.name}: joint{index + 1} peak current "
-                    f"{self.peak_current_a[index]} is below its continuous "
-                    f"{self.continuous_current_a[index]}")
         if self.peak_speed_deg_s < self.sustained_speed_deg_s:
             raise ProfileError(
                 f"{self.name}: peak speed is below the sustained speed")
@@ -192,10 +168,9 @@ class RobotProfile:
             key: float(envelope[key])
             for key in (
                 "temperature_c", "sustained_speed_deg_s", "peak_speed_deg_s",
-                "current_slew_a_s", "sender_gap_s", "telemetry_stale_s",
+                "sender_gap_s", "telemetry_stale_s",
                 "position_margin_deg", "minimum_voltage_v", "maximum_voltage_v",
-                "sustained_speed_window_s", "sustained_current_window_s",
-                "probe_current_fraction",
+                "sustained_speed_window_s",
             )
             if key in envelope
         }
@@ -207,11 +182,6 @@ class RobotProfile:
             workspace_limit_deg=(
                 _sequence(limits, "workspace_deg", count, source)
                 if limits.get("workspace_deg") is not None else ()),
-            continuous_current_a=_sequence(
-                limits, "continuous_current_a", count, source,
-                allow_unbounded=True),
-            peak_current_a=_sequence(limits, "peak_current_a", count, source,
-                                     allow_unbounded=True),
             source=source,
             notes=dict(payload.get("notes") or {}),
             **optional,
@@ -228,7 +198,7 @@ class RobotProfile:
 
         Provenance and the joint count are dropped: one says where this copy
         came from rather than what the arm is, and the other is implied by the
-        names. An unset current ceiling stays ``.inf``, which round-trips.
+        names.
         """
         payload = self.as_dict()
         payload.pop("source", None)
@@ -251,8 +221,6 @@ class RobotProfile:
             },
             "limits": {
                 "position_deg": list(self.position_limit_deg),
-                "continuous_current_a": list(self.continuous_current_a),
-                "peak_current_a": list(self.peak_current_a),
                 **({"workspace_deg": list(self.workspace_limit_deg)}
                    if self.workspace_limit_deg else {}),
             },
@@ -260,15 +228,12 @@ class RobotProfile:
                 "temperature_c": self.temperature_c,
                 "sustained_speed_deg_s": self.sustained_speed_deg_s,
                 "peak_speed_deg_s": self.peak_speed_deg_s,
-                "current_slew_a_s": self.current_slew_a_s,
                 "sender_gap_s": self.sender_gap_s,
                 "telemetry_stale_s": self.telemetry_stale_s,
                 "position_margin_deg": self.position_margin_deg,
                 "minimum_voltage_v": self.minimum_voltage_v,
                 "maximum_voltage_v": self.maximum_voltage_v,
                 "sustained_speed_window_s": self.sustained_speed_window_s,
-                "sustained_current_window_s": self.sustained_current_window_s,
-                "probe_current_fraction": self.probe_current_fraction,
             },
             "notes": dict(self.notes),
         }
@@ -281,7 +246,7 @@ class RobotProfile:
         """
         stricter = {
             "temperature_c": min, "sustained_speed_deg_s": min,
-            "peak_speed_deg_s": min, "current_slew_a_s": min,
+            "peak_speed_deg_s": min,
             "position_margin_deg": max, "maximum_voltage_v": min,
             "minimum_voltage_v": max,
         }

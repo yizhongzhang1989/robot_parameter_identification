@@ -46,8 +46,6 @@ name: tri-arm
 joints: {names: [ax1, ax2, ax3]}
 limits:
   position_deg: 149.0
-  continuous_current_a: [2.0, 1.5, 1.0]
-  peak_current_a: [3.0, 2.0, 1.4]
 envelope: {temperature_c: 50.0, sustained_speed_deg_s: 12.0}
 """
 
@@ -77,7 +75,17 @@ class ConfigurationTest(unittest.TestCase):
     def test_unstated_envelope_fields_are_inherited(self):
         self.assertEqual(self.profile.minimum_voltage_v, 20.0)
         self.assertEqual(self.profile.maximum_voltage_v, 30.0)
-        self.assertEqual(self.profile.probe_current_fraction, 0.5)
+        self.assertEqual(self.profile.peak_speed_deg_s, 30.0)
+
+    def test_other_robot_needs_no_current_limits_or_probe_settings(self):
+        payload = self.profile.as_dict()
+        self.assertEqual(payload["limits"], {"position_deg": [149.0] * JOINTS})
+        for field in ("continuous_current_a", "peak_current_a",
+                      "sustained_current_window_s", "current_slew_a_s",
+                      "probe_current_fraction", "probe_current_a"):
+            with self.subTest(field=field):
+                self.assertFalse(hasattr(self.profile, field))
+                self.assertNotIn(field, payload["envelope"])
 
     def test_campaign_bounds_follow_this_arm(self):
         bounds = ri.campaign_bounds(self.profile)
@@ -244,8 +252,7 @@ class ModelTest(unittest.TestCase):
         broken = ri.RobotProfile.from_dict({
             "schema_version": 1, "name": "wrong",
             "joints": {"names": ["ax1", "nope"]},
-            "limits": {"position_deg": 90.0, "continuous_current_a": 1.0,
-                       "peak_current_a": 2.0},
+            "limits": {"position_deg": 90.0},
         })
         with self.assertRaises(ValueError) as caught:
             ri.ArmModel.from_profile(three_joint_urdf(), broken)

@@ -71,21 +71,30 @@ class DeriveTest(unittest.TestCase):
             autoprofile.derive_profile(
                 synthetic_urdf(), NAMES, speed_limit_deg_s=0.0)
 
-    def test_current_ceilings_are_left_unset_rather_than_invented(self):
+    def test_current_limits_are_absent_rather_than_invented(self):
         """The URDF states newton-metres; converting needs what we are fitting."""
         profile = autoprofile.derive_profile(synthetic_urdf(), NAMES)
-        self.assertTrue(all(math.isinf(v) for v in profile.continuous_current_a))
-        self.assertFalse(autoprofile.current_guard_active(profile))
+        payload = profile.as_dict()
+        for field in ("continuous_current_a", "peak_current_a",
+                      "sustained_current_window_s", "current_slew_a_s",
+                      "probe_current_fraction", "probe_current_a"):
+            with self.subTest(field=field):
+                self.assertFalse(hasattr(profile, field))
+                self.assertNotIn(field, payload["limits"])
+                self.assertNotIn(field, payload["envelope"])
 
-    def test_a_written_profile_keeps_its_current_guard(self):
+    def test_fixture_has_motion_limits_without_a_current_guard(self):
         from fixtures import test_profile
 
-        self.assertTrue(autoprofile.current_guard_active(test_profile()))
+        profile = test_profile()
+        self.assertEqual(profile.joint_count, len(NAMES))
+        self.assertEqual(set(profile.as_dict()["limits"]), {"position_deg"})
+        self.assertFalse(hasattr(autoprofile, "current_guard_active"))
 
     def test_the_profile_says_it_was_derived(self):
         profile = autoprofile.derive_profile(synthetic_urdf(), NAMES)
         self.assertIn("derived", profile.notes)
-        self.assertIn("current guard is off", profile.notes["derived"])
+        self.assertIn("current without software current limits", profile.notes["derived"])
 
     def test_a_joint_without_limits_is_refused_by_name(self):
         urdf = synthetic_urdf().replace(

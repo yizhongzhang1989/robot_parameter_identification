@@ -15,8 +15,6 @@ def payload(**overrides):
         "joints": {"prefix": "arm_", "count": 3},
         "limits": {
             "position_deg": [170.0, 120.0, 170.0],
-            "continuous_current_a": [2.0, 3.0, 1.0],
-            "peak_current_a": [3.0, 4.0, 1.5],
         },
         "envelope": {"temperature_c": 40.0},
     }
@@ -53,12 +51,10 @@ class LoadTest(unittest.TestCase):
                 joints: {prefix: "j", count: 2}
                 limits:
                   position_deg: [90.0, 90.0]
-                  continuous_current_a: 1.0
-                  peak_current_a: 2.0
             """))
             arm = profile.RobotProfile.from_yaml(path)
         self.assertEqual(arm.joint_count, 2)
-        self.assertEqual(arm.continuous_current_a, (1.0, 1.0))
+        self.assertEqual(arm.position_limit_deg, (90.0, 90.0))
 
     def test_missing_file_is_reported(self):
         with self.assertRaises(profile.ProfileError):
@@ -68,16 +64,21 @@ class LoadTest(unittest.TestCase):
 class ValidationTest(unittest.TestCase):
     def test_wrong_length_vector_is_rejected(self):
         broken = payload()
-        broken["limits"]["peak_current_a"] = [1.0, 2.0]
+        broken["limits"]["position_deg"] = [1.0, 2.0]
         with self.assertRaises(profile.ProfileError):
             profile.RobotProfile.from_dict(broken)
 
-    def test_peak_below_continuous_is_rejected(self):
-        broken = payload()
-        broken["limits"]["peak_current_a"] = [1.0, 1.0, 1.0]
-        with self.assertRaises(profile.ProfileError) as caught:
-            profile.RobotProfile.from_dict(broken)
-        self.assertIn("peak current", str(caught.exception))
+    def test_legacy_current_limits_are_not_loaded_or_serialized(self):
+        legacy = payload()
+        legacy["limits"].update(continuous_current_a=[99.0], peak_current_a=[1.0])
+        legacy["envelope"].update(sustained_current_window_s=0.5,
+                                  current_slew_a_s=4.0, probe_current_fraction=0.5)
+        arm = profile.RobotProfile.from_dict(legacy)
+        saved = arm.as_dict()
+        self.assertFalse(hasattr(arm, "peak_current_a"))
+        self.assertFalse(hasattr(arm, "continuous_current_a"))
+        self.assertFalse(any("current" in key for key in saved["limits"]))
+        self.assertFalse(any("current" in key for key in saved["envelope"]))
 
     def test_peak_speed_below_sustained_is_rejected(self):
         broken = payload()
@@ -151,8 +152,6 @@ class InheritanceTest(unittest.TestCase):
                 joints: {prefix: "j", count: 2}
                 limits:
                   position_deg: 90.0
-                  continuous_current_a: 1.0
-                  peak_current_a: 2.0
                 envelope:
                   temperature_c: 35.0
             """)
@@ -169,12 +168,10 @@ class InheritanceTest(unittest.TestCase):
                 joints: {prefix: "j", count: 2}
                 limits:
                   position_deg: 90.0
-                  continuous_current_a: 1.0
-                  peak_current_a: 2.0
             """)
             arm = profile.RobotProfile.from_yaml(child)
         self.assertEqual(arm.temperature_c, 45.0)
-        self.assertEqual(arm.probe_current_fraction, 0.5)
+        self.assertEqual(arm.position_margin_deg, 5.0)
 
     def test_lists_are_replaced_not_concatenated(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,8 +185,6 @@ class InheritanceTest(unittest.TestCase):
                 joints: {names: [x, y]}
                 limits:
                   position_deg: 90.0
-                  continuous_current_a: 1.0
-                  peak_current_a: 2.0
             """)
             arm = profile.RobotProfile.from_yaml(child)
         self.assertEqual(arm.joint_names, ("x", "y"))

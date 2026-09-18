@@ -16,8 +16,6 @@ joints:
 limits:
   # One value per joint, or a single scalar applied to every joint.
   position_deg: [170.0, 120.0, 170.0, 170.0, 120.0, 360.0]
-  continuous_current_a: 2.0
-  peak_current_a: 3.0
 
 envelope:
   # Only what differs from the template; the rest is inherited.

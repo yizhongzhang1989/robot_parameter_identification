@@ -5,13 +5,14 @@ anything works would be a poor first experience. So the module derives one and
 the panel edits that; saving is where the answer goes, not a precondition.
 """
 
-import math
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 try:
-    from robot_parameter_identification import autoprofile
     from robot_parameter_identification.dashboard.http_server import build_routes
     from robot_parameter_identification.dashboard.service import (
         DashboardConfig, IdentificationService)
@@ -21,6 +22,10 @@ except ImportError as error:
     raise unittest.SkipTest(f"needs pinocchio: {error}") from error
 
 JOINTS = [f"{PREFIX}joint{index}" for index in range(1, 8)]
+REMOVED_CURRENT_FIELDS = (
+    "continuous_current_a", "peak_current_a", "sustained_current_window_s",
+    "current_slew_a_s", "probe_current_fraction", "probe_current_a",
+)
 
 
 def derived_service(directory: str = "") -> IdentificationService:
@@ -40,17 +45,23 @@ class NoFileYetTest(unittest.TestCase):
         self.assertEqual(payload["source"], "derived")
         self.assertEqual(len(payload["profile"]["joints"]["names"]), 7)
 
-    def test_a_ceiling_nobody_supplied_travels_as_null_not_infinity(self):
-        # JSON.parse rejects Infinity, so the wire form has to be null.
+    def test_profile_api_omits_removed_current_settings_and_policies(self):
         payload = derived_service().profile_payload()
-        self.assertEqual(
-            payload["profile"]["limits"]["continuous_current_a"], [None] * 7)
-        self.assertFalse(payload["current_guard"])
+        self.assertEqual(json.loads(json.dumps(payload, allow_nan=False)), payload)
+        for field in REMOVED_CURRENT_FIELDS:
+            with self.subTest(field=field):
+                self.assertNotIn(field, payload["profile"]["limits"])
+                self.assertNotIn(field, payload["profile"]["envelope"])
+        self.assertNotIn("current_guard", payload)
+        self.assertNotIn("calibration_current_policy", payload)
+        self.assertIn("hardware_current_limits", payload)
 
     def test_nothing_to_edit_before_the_robot_says_who_it_is(self):
         payload = IdentificationService(DashboardConfig()).profile_payload()
         self.assertFalse(payload["have_profile"])
         self.assertIsNone(payload["profile"])
+        self.assertNotIn("current_guard", payload)
+        self.assertNotIn("calibration_current_policy", payload)
 
 
 class ApplyTest(unittest.TestCase):
@@ -64,32 +75,47 @@ class ApplyTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(self.service.profile.temperature_c, 38.0)
 
-    def test_typing_current_ceilings_arms_the_current_guard(self):
+    def test_legacy_current_settings_are_ignored_when_applying_a_profile(self):
         self.payload["limits"]["continuous_current_a"] = [3.0] * 7
         self.payload["limits"]["peak_current_a"] = [4.0] * 7
-        applied = self.service.apply_profile(self.payload)["profile"]
-        self.assertTrue(applied["current_guard"])
-        self.assertTrue(autoprofile.current_guard_active(self.service.profile))
+        self.payload["envelope"].update({
+            "sustained_current_window_s": 0.5, "current_slew_a_s": 0.1,
+            "probe_current_fraction": 0.5, "probe_current_a": [0.1] * 7,
+        })
+        result = self.service.apply_profile(self.payload)
+        self.assertTrue(result["ok"])
+        applied = result["profile"]
+        for field in REMOVED_CURRENT_FIELDS:
+            with self.subTest(field=field):
+                self.assertFalse(hasattr(self.service.profile, field))
+                self.assertNotIn(field, applied["profile"]["limits"])
+                self.assertNotIn(field, applied["profile"]["envelope"])
+        self.assertEqual(applied["profile"]["limits"]["position_deg"],
+                         self.payload["limits"]["position_deg"])
+        self.assertNotIn("current_guard", applied)
+        self.assertNotIn("calibration_current_policy", applied)
 
     def test_an_edited_envelope_counts_as_the_operator_s_own(self):
-        # The guards a derived profile leaves off are on once a human applies
-        # the numbers, because that is the same claim a written file makes.
         applied = self.service.apply_profile(self.payload)["profile"]
         self.assertEqual(applied["source"], "configured")
         self.assertTrue(applied["edited"])
 
-    def test_a_blank_ceiling_stays_unset_rather_than_becoming_zero(self):
-        self.payload["limits"]["peak_current_a"] = [None] * 7
-        self.service.apply_profile(self.payload)
-        self.assertTrue(
-            all(math.isinf(v) for v in self.service.profile.peak_current_a))
+    def test_blank_and_inconsistent_legacy_current_ceilings_are_ignored(self):
+        for peak in ([None] * 7, [1.0] * 7):
+            with self.subTest(peak=peak):
+                self.payload["limits"]["continuous_current_a"] = [5.0] * 7
+                self.payload["limits"]["peak_current_a"] = peak
+                result = self.service.apply_profile(self.payload)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["profile"]["profile"]["limits"],
+                                 {"position_deg": self.payload["limits"]["position_deg"]})
 
     def test_an_impossible_envelope_is_refused_with_a_sentence(self):
-        self.payload["limits"]["continuous_current_a"] = [5.0] * 7
-        self.payload["limits"]["peak_current_a"] = [1.0] * 7
+        self.payload["envelope"]["sustained_speed_deg_s"] = 20.0
+        self.payload["envelope"]["peak_speed_deg_s"] = 10.0
         with self.assertRaises(ProfileError) as caught:
             self.service.apply_profile(self.payload)
-        self.assertIn("peak current", str(caught.exception))
+        self.assertIn("peak speed", str(caught.exception))
 
     def test_the_envelope_cannot_change_mid_run(self):
         self.service._state = "running"
@@ -116,21 +142,34 @@ class SaveTest(unittest.TestCase):
             payload = made.profile_payload()["profile"]
             payload["limits"]["continuous_current_a"] = [3.0] * 7
             payload["limits"]["peak_current_a"] = [4.0] * 7
+            payload["envelope"].update(dict.fromkeys(REMOVED_CURRENT_FIELDS[2:], 0.5))
+            payload["envelope"]["temperature_c"] = 39.0
             made.apply_profile(payload)
             written = made.save_profile("my_arm.yaml")
             self.assertTrue(written["ok"])
             again = RobotProfile.from_yaml(written["path"])
             self.assertEqual(again.joint_names, made.profile.joint_names)
-            self.assertEqual(again.continuous_current_a,
-                             made.profile.continuous_current_a)
+            self.assertEqual(again.position_limit_deg, made.profile.position_limit_deg)
+            self.assertEqual(again.temperature_c, 39.0)
+            saved = yaml.safe_load(Path(written["path"]).read_text())
+            self.assertEqual(saved["envelope"], made.profile.as_dict()["envelope"])
+            for field in REMOVED_CURRENT_FIELDS:
+                with self.subTest(field=field):
+                    self.assertNotIn(field, saved["limits"])
+                    self.assertNotIn(field, saved["envelope"])
+                    self.assertFalse(hasattr(again, field))
 
-    def test_an_unset_ceiling_survives_the_round_trip(self):
+    def test_a_derived_profile_round_trip_does_not_add_current_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             made = derived_service(directory)
             path = made.save_profile("derived.yaml")["path"]
             again = RobotProfile.from_yaml(path)
-            self.assertTrue(all(math.isinf(v) for v in again.peak_current_a))
-            self.assertFalse(autoprofile.current_guard_active(again))
+            expected = made.profile.as_dict()
+            actual = again.as_dict()
+            expected.pop("source")
+            actual.pop("source")
+            self.assertEqual(actual, expected)
+            self.assertEqual(set(actual["limits"]), {"position_deg"})
 
     def test_a_save_lands_beside_the_results_and_nowhere_else(self):
         # The web surface listens on every interface, so a path from a request

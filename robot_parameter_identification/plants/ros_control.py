@@ -289,6 +289,9 @@ class HardwarePlant:
             if self._first_trip is not None else {})
 
     def _check_monitor(self, sample: dict, now: float | None = None) -> None:
+        measurements = getattr(self.monitor, "current_measurements", None)
+        if measurements is not None:
+            measurements.observe(sample)
         if self.monitor is None or self._monitor_trip is not None:
             return
         received_at = time.monotonic() if now is None else float(now)

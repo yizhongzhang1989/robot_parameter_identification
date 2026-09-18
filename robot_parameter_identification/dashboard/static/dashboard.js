@@ -916,9 +916,6 @@ function renderConnection(snapshot) {
     .join('');
 
   const missing = (connection.missing_guards || []).slice();
-  if (snapshot.profile_source === 'derived' && !snapshot.current_guard) {
-    missing.push('current ceiling (derived profile)');
-  }
   if (snapshot.profile_source === 'none') {
     $('guards').textContent = t('conn.noprofile');
     $('guards').style.color = 'var(--bad)';
@@ -1584,19 +1581,13 @@ $('friction-joint').addEventListener('change', () => renderResult(state.snapshot
 const JOINT_COLUMNS = [
   { key: 'position_deg', label: 'profile.position', unit: '°' },
   { key: 'workspace_deg', label: 'profile.workspace', unit: '°' },
-  { key: 'continuous_current_a', label: 'profile.continuous', unit: 'A' },
-  { key: 'peak_current_a', label: 'profile.peak', unit: 'A' },
 ];
-// Blank means "nobody measured this", which is a live distinction only for the
-// current ceilings; every other number always has a value.
-const BLANKABLE = new Set(['continuous_current_a', 'peak_current_a']);
 const ENVELOPE_KEYS = [
   ['temperature_c', '°C'], ['sustained_speed_deg_s', '°/s'],
   ['peak_speed_deg_s', '°/s'], ['position_margin_deg', '°'],
   ['minimum_voltage_v', 'V'], ['maximum_voltage_v', 'V'],
-  ['sustained_current_window_s', 's'], ['sustained_speed_window_s', 's'],
-  ['current_slew_a_s', 'A/s'], ['sender_gap_s', 's'],
-  ['telemetry_stale_s', 's'], ['probe_current_fraction', ''],
+  ['sustained_speed_window_s', 's'], ['sender_gap_s', 's'],
+  ['telemetry_stale_s', 's'],
 ];
 
 function openProfile() {
@@ -1619,9 +1610,7 @@ function renderProfile(data) {
     $('profile-envelope').innerHTML = '';
     return;
   }
-  $('profile-state').textContent = data.editable
-    ? t(data.current_guard ? 'profile.guard_on' : 'profile.guard_off')
-    : t('profile.busy');
+  $('profile-state').textContent = data.editable ? '' : t('profile.busy');
   $('profile-name').value = profile.name || '';
 
   const names = profile.joints.names || [];
@@ -1631,8 +1620,7 @@ function renderProfile(data) {
     (column) => {
       const value = (profile.limits[column.key] || [])[index];
       return `<td><input type="number" step="any" data-limit="${column.key}"`
-        + ` data-index="${index}" value="${value == null ? '' : value}"`
-        + `${BLANKABLE.has(column.key) ? ' placeholder="∞"' : ''}/></td>`;
+        + ` data-index="${index}" value="${value == null ? '' : value}"/></td>`;
     }).join('') + '</tr>');
   $('profile-joints').innerHTML =
     `<tr><th>${t('profile.joint')}</th>${head.join('')}</tr>${rows.join('')}`;

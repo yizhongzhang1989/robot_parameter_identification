@@ -1209,7 +1209,8 @@ class HomingTest(unittest.TestCase):
         made.home()
         self.wait(made)
         self.assertIsNotNone(plant.monitor)
-        self.assertIn("peak-current ceiling", plant.monitor.guards())
+        self.assertNotIn("peak-current ceiling", plant.monitor.guards())
+        self.assertIsNotNone(plant.monitor.current_measurements)
         self.assertIn("position-rate ceiling", plant.monitor.guards())
 
     def test_homing_reports_where_it_started_and_ended(self):
@@ -2708,11 +2709,11 @@ class GuardTest(unittest.TestCase):
         made.profile_source = "derived"
         self.assertNotIn("bus-voltage window", made._monitor().guards())
 
-    def test_a_written_current_profile_arms_both_current_limits(self):
+    def test_a_written_profile_does_not_arm_current_limits(self):
         made = IdentificationService(DashboardConfig(), profile=test_profile())
         guards = made._monitor().guards()
-        self.assertIn("peak-current ceiling", guards)
-        self.assertIn("sustained-current ceiling", guards)
+        self.assertNotIn("peak-current ceiling", guards)
+        self.assertNotIn("sustained-current ceiling", guards)
 
     def test_an_unmapped_signal_reports_its_guard_dark(self):
         made = IdentificationService(

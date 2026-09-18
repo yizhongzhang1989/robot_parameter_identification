@@ -109,12 +109,13 @@ def test_profile() -> profile_module.RobotProfile:
             },
             "limits": {
                 "position_deg": [177.6, 129.9, 177.6, 134.9, 177.6, 127.9, 359.8],
-                "continuous_current_a": [3.0, 4.1, 3.0, 3.1, 1.1, 1.15, 0.6],
-                "peak_current_a": [4.0, 5.0, 4.0, 4.0, 1.5, 1.5, 0.8],
             },
             "envelope": {"temperature_c": 45.0, "sustained_speed_deg_s": 15.0},
         }, source="<test fixture>")
     return _CACHE["profile"]
+
+
+test_profile.__test__ = False
 
 
 # The moved tests refer to this by its former name.

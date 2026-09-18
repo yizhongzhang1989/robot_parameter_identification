@@ -30,13 +30,20 @@ def policy_with(**overrides):
 
 
 class AutoprofileRangesTest(unittest.TestCase):
-    def test_default_profile_remains_twenty_degrees_per_second(self):
+    def setUp(self):
+        self.defaults = system_defaults()["profile_derivation"]
+        self.default_speed = min(
+            300.0 * self.defaults["default_speed_fraction"],
+            self.defaults["maximum_default_speed_deg_s"])
+
+    def test_default_profile_uses_template_speed_policy(self):
         profile = autoprofile.derive_profile(simple_urdf(), JOINT_NAMES)
-        self.assertEqual(profile.sustained_speed_deg_s, 20.0)
-        self.assertEqual(profile.peak_speed_deg_s, 40.0)
+        self.assertEqual(profile.sustained_speed_deg_s, self.default_speed)
+        self.assertEqual(profile.peak_speed_deg_s,
+                         self.default_speed * self.defaults["peak_speed_multiplier"])
         self.assertEqual(profile.position_limit_deg, (108.0,))
         self.assertEqual(profile.joint_names, tuple(JOINT_NAMES))
-        self.assertFalse(autoprofile.current_guard_active(profile))
+        self.assertEqual(profile.as_dict()["limits"], {"position_deg": [108.0]})
 
     def test_default_speed_uses_custom_fraction_and_maximum(self):
         cases = ((0.2, 90.0, 60.0), (0.5, 75.0, 75.0))
@@ -65,7 +72,7 @@ class AutoprofileRangesTest(unittest.TestCase):
         profile = autoprofile.derive_profile(
             simple_urdf(), JOINT_NAMES,
             policy=policy_with(peak_speed_multiplier=1.5))
-        self.assertEqual(profile.peak_speed_deg_s, 30.0)
+        self.assertEqual(profile.peak_speed_deg_s, self.default_speed * 1.5)
 
     def test_policies_are_independent_and_not_mutated(self):
         first_policy = policy_with(
@@ -73,7 +80,7 @@ class AutoprofileRangesTest(unittest.TestCase):
         second_policy = policy_with(
             default_speed_fraction=0.5, maximum_default_speed_deg_s=75.0)
         for policy, expected in ((first_policy, 60.0), (second_policy, 75.0),
-                                 (first_policy, 60.0), (None, 20.0)):
+                                 (first_policy, 60.0), (None, self.default_speed)):
             with self.subTest(policy=policy):
                 original = None if policy is None else policy.copy()
                 profile = autoprofile.derive_profile(
@@ -107,7 +114,7 @@ class AutoprofileRangesTest(unittest.TestCase):
         self.assertEqual(profile.peak_speed_deg_s, 90.0)
         self.assertEqual(profile.position_limit_deg, (60.0,))
         self.assertEqual(requested.sustained_speed_deg_s, 120.0)
-        self.assertEqual(default.sustained_speed_deg_s, 20.0)
+        self.assertEqual(default.sustained_speed_deg_s, self.default_speed)
 
     def test_existing_positional_arguments_and_keyword_only_policy(self):
         profile = autoprofile.derive_profile(
@@ -136,8 +143,10 @@ class AutoprofileRangesTest(unittest.TestCase):
                     simple_urdf(velocity), JOINT_NAMES,
                     speed_limit_deg_s=requested, policy=policy)
                 self.assertEqual(profile.sustained_speed_deg_s, expected)
-                self.assertFalse(autoprofile.current_guard_active(profile))
-        self.assertEqual(autoprofile._speed_for(None, None), 20.0)
+                self.assertNotIn("continuous_current_a", profile.as_dict()["limits"])
+                self.assertNotIn("peak_current_a", profile.as_dict()["limits"])
+        self.assertEqual(autoprofile._speed_for(None, None),
+                         self.defaults["maximum_default_speed_deg_s"])
         self.assertEqual(autoprofile._speed_for(None, 200.0), 200.0)
 
     def test_unit_fractions_do_not_exceed_urdf_bounds(self):
@@ -168,8 +177,9 @@ class AutoprofileRangesTest(unittest.TestCase):
         profile = autoprofile.derive_profile(
             simple_urdf(), JOINT_NAMES, policy={"position_fraction": 0.5})
         self.assertEqual(profile.position_limit_deg, (60.0,))
-        self.assertEqual(profile.sustained_speed_deg_s, 20.0)
-        self.assertEqual(profile.peak_speed_deg_s, 40.0)
+        self.assertEqual(profile.sustained_speed_deg_s, self.default_speed)
+        self.assertEqual(profile.peak_speed_deg_s,
+                         self.default_speed * self.defaults["peak_speed_multiplier"])
 
     def test_malformed_values_reject_before_profile_construction(self):
         invalid = (math.nan, math.inf, -math.inf, 0.0, -1.0, True, False,
@@ -240,7 +250,7 @@ class AutoprofileRangesTest(unittest.TestCase):
                             simple_urdf(), JOINT_NAMES, policy=policy)
                     construct.assert_not_called()
 
-    def test_written_profile_keeps_its_explicit_limits(self):
+    def test_written_profile_keeps_motion_limits_but_ignores_legacy_current_limits(self):
         profile = autoprofile.RobotProfile.from_dict({
             "schema_version": 1,
             "name": "written_profile",
@@ -256,7 +266,9 @@ class AutoprofileRangesTest(unittest.TestCase):
         self.assertEqual(profile.position_limit_deg, (150.0,))
         self.assertEqual(profile.sustained_speed_deg_s, 200.0)
         self.assertEqual(profile.peak_speed_deg_s, 350.0)
-        self.assertTrue(autoprofile.current_guard_active(profile))
+        self.assertEqual(profile.as_dict()["limits"], {"position_deg": [150.0]})
+        self.assertFalse(hasattr(profile, "continuous_current_a"))
+        self.assertFalse(hasattr(profile, "peak_current_a"))
 
 
 if __name__ == "__main__":

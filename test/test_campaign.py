@@ -76,32 +76,16 @@ class ScriptedPlant:
             yield frame
 
 
-class StubLimits:
-    """The envelope a monitor enforces, in the generic form the campaign sees."""
+class StubMonitor(campaign.DriveMonitor):
+    """Count checked frames while retaining the production guards."""
 
-    def __init__(self, peak=5.0, continuous=2.0, joints=7):
-        self.peak_current_a = [peak] * joints
-        self.continuous_current_a = [continuous] * joints
-
-
-class StubMonitor:
-    """Minimal EnvelopeMonitor: trips on instantaneous over-current."""
-
-    def __init__(self, limits):
-        self.limits = limits
+    def __init__(self):
+        super().__init__(maximum_speed_deg_s=60.0)
         self.checked = 0
-        self.last_trip = None
 
     def check(self, sample, now):
         self.checked += 1
-        for index, value in enumerate(sample["current_a"]):
-            if abs(value) > self.limits.peak_current_a[index]:
-                message = (f"joint{index + 1} peak current {abs(value):.2f} A "
-                           f"exceeded {self.limits.peak_current_a[index]:.2f} A")
-                self.last_trip = {"joint": index, "kind": "peak_current",
-                                  "message": message}
-                return message
-        return None
+        return super().check(sample, now)
 
 
 def small_plan(**overrides):
@@ -252,9 +236,9 @@ class TripRecoveryTest(unittest.TestCase):
                 position, velocity, acceleration = trajectory.sample(step * 0.1)
                 frame = self._frame(position, velocity)
                 frame["acceleration_deg_s2"] = acceleration.tolist()
-                frame["current_a"] = list(frame["current_a"])
+                frame["safety_speed_deg_s"] = [0.0] * self.joints
                 if swing > self.ceiling_deg:
-                    frame["current_a"][self.joint] = 99.0
+                    frame["safety_speed_deg_s"][self.joint] = 99.0
                 yield frame
 
     def plan(self, **overrides):
@@ -268,25 +252,28 @@ class TripRecoveryTest(unittest.TestCase):
         values.update(overrides)
         return small_plan(**values)
 
-    def test_an_over_current_trip_does_not_end_the_run(self):
-        # Losing the validation phase to one trajectory's swing throws away
-        # every hour already spent, which is what the trip was meant to avoid.
+    def test_a_speed_trip_does_not_end_the_run(self):
         plant = self.TrippingPlant()
         run = campaign.OptimalExcitationCampaign(
             arm_model(), plant, self.plan(),
-            monitor=StubMonitor(StubLimits(peak=5.0)))
+            monitor=StubMonitor())
+        report, _ = run._open(campaign.PHASE_INERTIA)
 
-        result = run.run()
+        def overspeed():
+            raise campaign.DriveTrip("position-derived speed exceeded", joint=6,
+                                     kind="speed")
 
-        self.assertIsNone(result.aborted)
-        phases = [report.phase for report in run.reports]
-        self.assertIn(campaign.PHASE_VALIDATION, phases)
+        self.assertFalse(run._attempt(report, "overspeed", overspeed))
+        self.assertTrue(run._attempt(report, "next motion", lambda: None))
+        self.assertIsNone(run.aborted)
+        self.assertEqual(len(run.skipped), 1)
+        self.assertLess(run.joint_amplitude_scale[6], 1.0)
 
     def test_the_tripping_joint_is_backed_off_and_the_motion_retried(self):
         plant = self.TrippingPlant()
         run = campaign.OptimalExcitationCampaign(
             arm_model(), plant, self.plan(),
-            monitor=StubMonitor(StubLimits(peak=5.0)))
+            monitor=StubMonitor())
 
         run.run()
 
@@ -303,7 +290,7 @@ class TripRecoveryTest(unittest.TestCase):
         plant = self.TrippingPlant(ceiling_deg=0.0)
         run = campaign.OptimalExcitationCampaign(
             arm_model(), plant, self.plan(skip_budget=4),
-            monitor=StubMonitor(StubLimits(peak=5.0)))
+            monitor=StubMonitor())
 
         result = run.run()
 
@@ -315,8 +302,8 @@ class TripRecoveryTest(unittest.TestCase):
                                   kind="fault")
         self.assertFalse(trip.recoverable)
         self.assertTrue(campaign.DriveTrip(
-            "joint7 peak current 0.884 A exceeded 0.800 A", joint=6,
-            kind="peak_current").recoverable)
+            "joint7 position-derived speed exceeded 60 deg/s", joint=6,
+            kind="speed").recoverable)
 
 
 class OptimalExcitationCampaignTest(unittest.TestCase):
@@ -711,68 +698,46 @@ class MonitorTest(unittest.TestCase):
 
     def setUp(self):
         self.arm = arm_model()
-        self.limits = StubLimits()
 
-    def test_measured_current_above_the_envelope_aborts(self):
-        over = max(self.limits.peak_current_a) + 1.0
-        plant = ScriptedPlant(current_a=over, instrumented=True)
+    def test_large_measured_current_does_not_abort(self):
+        plant = ScriptedPlant(current_a=99.0, instrumented=True)
         result = campaign.Campaign(
             self.arm, plant, small_plan(),
-            monitor=StubMonitor(self.limits)).run()
-        self.assertIsNotNone(result.aborted)
-        self.assertIn("current", result.aborted)
-
-    def test_current_inside_the_envelope_does_not_abort(self):
-        plant = ScriptedPlant(
-            current_a=min(self.limits.continuous_current_a) * 0.5,
-            instrumented=True)
-        result = campaign.Campaign(
-            self.arm, plant, small_plan(),
-            monitor=StubMonitor(self.limits)).run()
+            monitor=StubMonitor()).run()
         self.assertIsNone(result.aborted)
 
-    def test_a_measured_over_current_trips_even_when_other_signals_are_missing(self):
-        """The current reading is real whether or not the bus voltage is
-        published, and this arm does not publish it. Standing the over-current
-        guard down because an unrelated channel is absent would disable it on
-        exactly the hardware it is there to protect."""
+    def test_negative_measured_current_does_not_abort(self):
+        plant = ScriptedPlant(current_a=-99.0, instrumented=True)
+        result = campaign.Campaign(
+            self.arm, plant, small_plan(),
+            monitor=StubMonitor()).run()
+        self.assertIsNone(result.aborted)
+
+    def test_large_current_without_optional_signals_does_not_abort(self):
         plant = ScriptedPlant(current_a=99.0, instrumented=False)
         result = campaign.Campaign(
             self.arm, plant, small_plan(),
-            monitor=StubMonitor(self.limits)).run()
-        self.assertIsNotNone(result.aborted)
-        self.assertIn("current", result.aborted)
+            monitor=StubMonitor()).run()
+        self.assertIsNone(result.aborted)
 
     def test_monitor_sees_every_instrumented_frame(self):
-        monitor = StubMonitor(self.limits)
+        monitor = StubMonitor()
         plant = ScriptedPlant(current_a=0.1, instrumented=True)
         campaign.Campaign(self.arm, plant, small_plan(), monitor=monitor).run()
         self.assertGreater(monitor.checked, 0)
 
-    def test_peak_current_trips_immediately(self):
-        monitor = campaign.DriveMonitor(
-            peak_current_a=(2.0, 3.0), continuous_current_a=(1.0, 1.5))
-        trip = monitor.check({"current_a": [1.0, 3.1]}, 0.0)
-        self.assertIn("joint2 peak current", trip)
+    def test_current_does_not_trip_or_advertise_current_guards(self):
+        monitor = campaign.DriveMonitor()
+        for moment in (0.0, 0.6, 10.0):
+            self.assertIsNone(monitor.check({"current_a": [-9.0]}, moment))
+        self.assertIsNone(monitor.last_trip)
+        self.assertNotIn("peak-current ceiling", monitor.guards())
+        self.assertNotIn("sustained-current ceiling", monitor.guards())
 
-    def test_continuous_current_only_trips_after_its_window(self):
-        monitor = campaign.DriveMonitor(
-            peak_current_a=(3.0,), continuous_current_a=(1.0,),
-            sustained_current_window_s=0.5)
-        self.assertIsNone(monitor.check({"current_a": [1.2]}, 10.0))
-        self.assertIsNone(monitor.check({"current_a": [1.2]}, 10.49))
-        self.assertIn(
-            "continuous current",
-            monitor.check({"current_a": [1.2]}, 10.51))
-
-    def test_continuous_current_timer_resets_below_the_limit(self):
-        monitor = campaign.DriveMonitor(
-            peak_current_a=(3.0,), continuous_current_a=(1.0,),
-            sustained_current_window_s=0.5)
-        self.assertIsNone(monitor.check({"current_a": [1.2]}, 1.0))
-        self.assertIsNone(monitor.check({"current_a": [0.8]}, 1.4))
-        self.assertIsNone(monitor.check({"current_a": [1.2]}, 1.6))
-        self.assertIsNone(monitor.check({"current_a": [1.2]}, 2.0))
+    def test_large_current_does_not_mask_drive_fault_guard(self):
+        monitor = campaign.DriveMonitor()
+        self.assertIn("fault code", monitor.check(
+            {"current_a": [9.0], "fault_code": [12]}, 0.0))
 
     def test_position_rate_trips_the_speed_ceiling(self):
         monitor = campaign.DriveMonitor(maximum_speed_deg_s=60.0)

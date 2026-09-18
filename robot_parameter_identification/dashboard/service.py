@@ -68,8 +68,6 @@ STANDING_QUANTUM_DEG = system_default("runtime", "standing_quantum_deg")
 # Sample points the canvas may ask for along one transit. A ceiling because
 # the request comes off a web surface listening on every interface.
 MAXIMUM_ANIMATION_STEPS = system_default("runtime", "maximum_animation_steps")
-# A ceiling nobody supplied is infinite, and JSON has no way to say so.
-UNBOUNDED_LIMITS = ("continuous_current_a", "peak_current_a")
 PINOCCHIO_INERTIAL_TERMS = (
     "mass", "first_moment_x", "first_moment_y", "first_moment_z",
     "inertia_xx", "inertia_xy", "inertia_yy", "inertia_xz",
@@ -86,19 +84,6 @@ def _without_infinities(value):
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
-
-
-def _with_infinities(payload: dict) -> dict:
-    """A blank ceiling comes back from the panel as null; restore what it means."""
-    document = dict(payload or {})
-    limits = dict(document.get("limits") or {})
-    for key in UNBOUNDED_LIMITS:
-        values = limits.get(key)
-        if isinstance(values, (list, tuple)):
-            limits[key] = [math.inf if entry is None or entry == "" else entry
-                           for entry in values]
-    document["limits"] = limits
-    return document
 
 
 def parse_gravity_terms(urdf_text: str) -> list[dict]:
@@ -1006,8 +991,6 @@ class IdentificationService:
             "edited": profile is not None and profile.source == EDITED_SOURCE,
             "save_target": str(self._save_target()),
             "editable": self._state == IDLE,
-            "current_guard": (profile is not None
-                              and autoprofile.current_guard_active(profile)),
             "dark_guards": list(self._dark_guards()),
             "hardware_current_limits": hardware_limits,
             "profile": (_without_infinities(profile.as_dict())
@@ -1019,14 +1002,10 @@ class IdentificationService:
 
         A number shown in a form and applied by an operator is that operator's
         number, which is the standard a hand-written file is held to as well.
-        The one ceiling nobody can guess still gates on its own value: leave a
-        current limit at infinity and the current guard stays off regardless.
         """
         self._require_idle("the envelope cannot change while a run is going")
-        document = _with_infinities(payload)
+        document = dict(payload or {})
         notes = dict(document.get("notes") or {})
-        # The derivation's note says the current ceilings are unset, which an
-        # edit may have just made untrue.
         notes.pop("derived", None)
         notes["edited"] = ("Applied from the dashboard. Every value here was "
                            "entered by an operator.")
@@ -2464,6 +2443,7 @@ class IdentificationService:
             return
         plant = None
         run = None
+        monitor = None
         previous_report = self._reports.get(mode)
         failure = None
         gravity = mode in (GRAVITY_MODE, GRAVITY_REHEARSAL)
@@ -2537,6 +2517,13 @@ class IdentificationService:
                             "mode": mode, "complete": False, "aborted": failure})
                     if evidence or failure or payload.get("aborted"):
                         payload["failure_evidence"] = evidence
+                        if isinstance(monitor, campaign_module.DriveMonitor):
+                            measurements = monitor.current_measurements
+                            if measurements is not None:
+                                payload["joint_names"] = list(self.driven_joints) or (
+                                    list(self.profile.joint_names) if self.profile else [])
+                                payload["current_measurements"] = measurements.as_dict(
+                                    payload["joint_names"])
                         observations = getattr(run, "observations", None) or []
                         raw_frames = getattr(plant, "raw_frames", None) or []
                         if folder is None:
@@ -3091,9 +3078,6 @@ class IdentificationService:
         checking; the panel says which guards are live either way.
         """
         written = self.profile is not None and self.profile_source == "configured"
-        current = (written
-                   and self.config.telemetry.signals.effort_source == "current"
-                   and autoprofile.current_guard_active(self.profile))
         return campaign_module.DriveMonitor(
             minimum_voltage_v=self.profile.minimum_voltage_v if written else None,
             maximum_voltage_v=self.profile.maximum_voltage_v if written else None,
@@ -3101,13 +3085,9 @@ class IdentificationService:
                                  if self.profile is not None else None),
             maximum_temperature_c=(self.profile.temperature_c
                                    if self.profile is not None else None),
-            peak_current_a=(tuple(self.profile.peak_current_a)
-                            if current else ()),
-            continuous_current_a=(tuple(self.profile.continuous_current_a)
-                                  if current else ()),
-            sustained_current_window_s=(
-                self.profile.sustained_current_window_s
-                if current else 0.5))
+            current_channel=("current_a"
+                             if self.config.telemetry.signals.effort_source == "current"
+                             else "drive_current_a"))
 
     def _dark_guards(self) -> tuple[str, ...]:
         """Guards that will not fire, and why is not the operator's problem."""
@@ -3787,10 +3767,6 @@ class IdentificationService:
                 "profile_source": self.profile_source,
                 "profile_edited": (self.profile is not None
                                    and self.profile.source == EDITED_SOURCE),
-                "current_guard": (
-                    self.profile is not None
-                    and self.config.telemetry.signals.effort_source == "current"
-                    and autoprofile.current_guard_active(self.profile)),
                 "driven_joints": list(self.driven_joints),
                 "reach_deg": self.jog_limits_deg(),
                 "reach_range_deg": self.jog_range_deg(),

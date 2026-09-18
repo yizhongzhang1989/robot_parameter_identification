@@ -30,6 +30,7 @@ import time
 import numpy as np
 
 from . import excitation, identification as ident
+from .current_measurements import CurrentMeasurements
 from .interfaces import DriveLimitExceeded, MotionFailed, MotionPaused
 from .model import ModelComponents
 from .profile import RobotProfile
@@ -119,7 +120,7 @@ class EnvelopeMonitor(Protocol):
     """Anything that can veto a telemetry frame.
 
     A monitor that also fills ``last_trip`` with the joint and the kind lets
-    the campaign answer a trip it can answer -- too much current for one joint
+    the campaign answer a trip it can answer -- excessive speed for one joint
     -- instead of only reporting it. Without that detail every trip stops the
     run, which is the safe reading of an unattributed veto.
     """
@@ -146,17 +147,17 @@ class DriveMonitor:
     maximum_voltage_v: float | None = None
     maximum_speed_deg_s: float | None = None
     maximum_temperature_c: float | None = None
-    peak_current_a: tuple[float, ...] = ()
-    continuous_current_a: tuple[float, ...] = ()
-    sustained_current_window_s: float = 0.5
-    _over_current_since: list[float | None] = field(
-        default_factory=list, init=False, repr=False)
+    current_channel: str = "current_a"
+    current_measurements: CurrentMeasurements = field(init=False)
     # Campaign frames are pulled synchronously, so a gap between them is
     # deliberate dwell rather than lost telemetry; kept for protocol parity.
     last_sample_at: float | None = None
     # Which joint tripped and why, so a caller can answer it rather than only
     # report it. Set by every trip; the message alone would have to be parsed.
     last_trip: dict | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        self.current_measurements = CurrentMeasurements(channel=self.current_channel)
 
     def _trip(self, joint: int | None, kind: str, message: str) -> str:
         self.last_trip = {"joint": joint, "kind": kind, "message": message}
@@ -189,46 +190,6 @@ class DriveMonitor:
                         index, "temperature",
                         f"joint{index + 1} temperature {float(value):.1f} C "
                         f"reached {self.maximum_temperature_c:.1f} C")
-        currents = sample.get("current_a") or []
-        if currents and self.peak_current_a:
-            if len(currents) != len(self.peak_current_a):
-                return self._trip(
-                    None, "envelope",
-                    f"current telemetry has {len(currents)} joints, "
-                    f"the envelope has {len(self.peak_current_a)}")
-            for index, (value, ceiling) in enumerate(
-                    zip(currents, self.peak_current_a)):
-                if abs(float(value)) > ceiling:
-                    return self._trip(
-                        index, "peak_current",
-                        f"joint{index + 1} peak current "
-                        f"{abs(float(value)):.3f} A exceeded "
-                        f"{ceiling:.3f} A")
-        if currents and self.continuous_current_a:
-            if len(currents) != len(self.continuous_current_a):
-                return self._trip(
-                    None, "envelope",
-                    f"current telemetry has {len(currents)} joints, "
-                    f"the continuous envelope has "
-                    f"{len(self.continuous_current_a)}")
-            if len(self._over_current_since) != len(currents):
-                self._over_current_since = [None] * len(currents)
-            for index, (value, ceiling) in enumerate(
-                    zip(currents, self.continuous_current_a)):
-                if abs(float(value)) <= ceiling:
-                    self._over_current_since[index] = None
-                    continue
-                since = self._over_current_since[index]
-                if since is None or now < since:
-                    self._over_current_since[index] = now
-                    continue
-                if now - since >= self.sustained_current_window_s:
-                    return self._trip(
-                        index, "continuous_current",
-                        f"joint{index + 1} continuous current "
-                        f"{abs(float(value)):.3f} A exceeded "
-                        f"{ceiling:.3f} A for "
-                        f"{self.sustained_current_window_s:.3f} s")
         if self.minimum_voltage_v is None or self.maximum_voltage_v is None:
             return None
         for index, volts in enumerate(sample.get("voltage_v") or []):
@@ -247,10 +208,6 @@ class DriveMonitor:
             active.append("position-rate ceiling")
         if self.maximum_temperature_c is not None:
             active.append("temperature ceiling")
-        if self.peak_current_a:
-            active.append("peak-current ceiling")
-        if self.continuous_current_a:
-            active.append("sustained-current ceiling")
         if self.minimum_voltage_v is not None:
             active.append("bus-voltage window")
         return tuple(active)
@@ -501,6 +458,7 @@ class CampaignResult:
     data_quality: dict = field(default_factory=dict)
     steady_friction_audit: dict = field(default_factory=dict)
     gravity_compensation: dict = field(default_factory=dict)
+    current_measurements: dict = field(default_factory=dict)
     # Motions the arm refused. A run with gaps in it is still a run, but the
     # report must not present it as one that measured everything it planned to.
     skipped: list = field(default_factory=list)
@@ -548,6 +506,7 @@ class CampaignResult:
             "data_quality": dict(self.data_quality),
             "steady_friction_audit": dict(self.steady_friction_audit),
             "gravity_compensation": dict(self.gravity_compensation),
+            "current_measurements": dict(self.current_measurements),
             "skipped": self.skipped,
             "complete": self.complete,
             "verdict": self.verdict(),
@@ -560,7 +519,7 @@ class Abort(RuntimeError):
 
 # Amplitude can answer these; it cannot answer a fault word, a disabled drive,
 # a bus outside its window, or heat already in the joint.
-RECOVERABLE_TRIPS = frozenset({"peak_current", "continuous_current", "speed"})
+RECOVERABLE_TRIPS = frozenset({"speed"})
 
 
 class DriveTrip(Abort):
@@ -996,8 +955,6 @@ class Campaign:
         # Where the last tour left the arm, so the next one screens its first
         # transit from there rather than from wherever the run began.
         self._left_at: list[float] | None = None
-        # Shrunk for a joint that drew more than its drive would give, so the
-        # next design asks that joint for less instead of tripping again.
         self.joint_amplitude_scale = np.ones(arm.joint_count)
         self.aborted: str | None = None
         self._started = self.clock()
@@ -1061,9 +1018,6 @@ class Campaign:
         if self.should_stop():
             raise Abort("operator stop")
 
-        # Current is an outcome here, not a command: phases A to C are position
-        # controlled, so the only honest current limit is the measured one.
-        # The commissioned monitor owns those thresholds.
         if self.monitor is not None:
             # The stall detector belongs to the streaming current-control loop.
             # Campaign frames are pulled synchronously, so the gap between them
@@ -1135,8 +1089,8 @@ class Campaign:
         are counted, and enough of them still stops the run: an arm refusing
         everything is not producing a dataset, it is producing a log.
 
-        A drive that asked for more current than it may draw is the same kind
-        of problem when amplitude can answer it: the joint gives up some swing
+        Excessive speed is the same kind of problem when amplitude can answer
+        it: the joint gives up some swing
         and the run carries on. A fault word or a disabled drive cannot be
         answered that way and still stops everything.
         """
@@ -1557,6 +1511,9 @@ class Campaign:
                 "excluded_acceleration_outliers": len(excluded),
                 "acceleration_exclusion_deg_s2": acceleration_ceiling,
             })
+        measurements = getattr(self.monitor, "current_measurements", None)
+        if isinstance(measurements, CurrentMeasurements):
+            result.current_measurements = measurements.as_dict(self.arm.joint_names)
 
         training = self._main_training_observations(usable)
         training_ids = {id(record) for record in training}
